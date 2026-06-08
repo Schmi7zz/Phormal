@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.2-7aa2f7">
+  <img alt="version" src="https://img.shields.io/badge/version-2.1.3-7aa2f7">
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux-78dba9">
   <img alt="shell" src="https://img.shields.io/badge/made%20with-Bash-f7768e">
   <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-c0caf5">
@@ -121,7 +121,7 @@ Use when the path is **lossy, filtered, or unreliable** (typical Iran ↔ foreig
 | Link port | `8531` | Entry ↔ Exit only (UDP) |
 | User port | `5151` | Your VPN clients |
 
-**Relay features:** Salamander obfuscation, bandwidth shaping, optional UDP port hopping, built-in link speedtest, BBR/fq tuning.
+**Relay features:** Salamander obfuscation, bandwidth shaping, optional UDP port hopping, BBR/fq tuning.
 
 ---
 
@@ -175,12 +175,12 @@ Complete step 2 within ~30 seconds of step 1.
 
 ### Relay
 
-Runs from the **entry node only** — no manual listener on exit.
+Two steps — run on **both** nodes:
 
-1. **Exit (once):** Relay Manage → **8 Speedtest** — enables built-in speedtest support
-2. **Entry:** Relay Manage → **8 Speedtest** — tests upload/download through the link (~10s each direction)
+1. **Exit (Kharej)** → Relay Manage → **8 Speedtest** → step **1** (starts listener)
+2. **Entry (Iran)** → Relay Manage → **8 Speedtest** → step **2** (runs test)
 
-Both nodes must keep `phormal-relay` running during the test.
+Complete step 2 within ~30 seconds of step 1. Both nodes must keep `phormal-relay` running.
 
 ---
 

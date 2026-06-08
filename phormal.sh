@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="2.1.2"
+readonly PHORMAL_VERSION="2.1.3"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -743,8 +743,6 @@ bandwidth:
   up: ${RELAY_UP_MBPS} mbps
   down: ${RELAY_DOWN_MBPS} mbps
 
-speedTest: true
-
 $(relay_engine_block)
 EOF
 }
@@ -1197,49 +1195,45 @@ relay_remove_port() {
   good "Port ${rem} removed."
 }
 
-relay_enable_speedtest_server() {
-  [[ "$(conf_get RELAY_ROLE)" != "exit" ]] && return 1
-  if grep -qE '^speedTest:\s*true' "${RELAY_CONF}" 2>/dev/null; then
-    good "Speedtest support already enabled on exit."
-    return 0
-  fi
-  info "Enabling built-in speedtest on exit…"
-  write_relay_exit_config
-  write_relay_systemd server || return 1
-  good "Exit ready for entry-node speedtests."
-}
-
 relay_speedtest() {
-  install_relay_engine || return 1
-  local role; role="$(conf_get RELAY_ROLE)"
+  install_speed_tool || return 1
   rule
   info "Phormal Relay — speedtest"
+  info "Order: run step 1 on exit, then step 2 on entry (within ~30s)."
   rule
-
-  if [[ "${role}" == "exit" ]]; then
-    info "Speedtest runs from the entry node — nothing to start here."
-    relay_enable_speedtest_server || return 1
-    info "Now run Speedtest on the entry node (Manage → 8)."
-    return 0
-  fi
-
-  if [[ "${role}" != "entry" ]]; then
-    fail "Phormal Relay role unknown."
-    return 1
-  fi
-
-  if ! "${RELAY_BIN}" speedtest --help >/dev/null 2>&1; then
-    fail "Relay engine too old for built-in speedtest (need 2.3+)."
-    return 1
-  fi
-
-  info "Testing link to exit node (10s each direction)…"
-  info "Both nodes must keep phormal-relay running."
-  if ! "${RELAY_BIN}" speedtest -c "${RELAY_CONF}" --duration 10s; then
-    fail "Speedtest failed."
-    warn "On exit: Manage → 8 Speedtest once to enable support, then retry here."
-    return 1
-  fi
+  printf '  %s1%s  Exit node — start listener\n' "${ACC}" "${RST}"
+  printf '  %s2%s  Entry node — run test\n' "${ACC}" "${RST}"
+  local step; step="$(ask 'Step')"
+  case "${step}" in
+    1)
+      [[ "$(conf_get RELAY_ROLE)" != "exit" ]] && { fail "Run step 1 on exit node."; return 1; }
+      info "Listening on 127.0.0.1:${PHORMAL_SPEED_PORT} — waiting for entry…"
+      iperf3 -s -B 127.0.0.1 -p "${PHORMAL_SPEED_PORT}" -1 \
+        || { fail "Speed listener failed."; return 1; }
+      ;;
+    2)
+      [[ "$(conf_get RELAY_ROLE)" != "entry" ]] && { fail "Run step 2 on entry node."; return 1; }
+      warn "Step 1 must be running on the exit node before you continue."
+      local ready; ready="$(ask 'Exit listener running? (y/n)')"
+      [[ "${ready}" =~ ^[Yy] ]] || { info "Cancelled."; return 0; }
+      local ports; ports="$(conf_get RELAY_PORTS)"
+      if [[ ",${ports}," != *",${PHORMAL_SPEED_PORT},"* ]]; then
+        info "Adding speed port ${PHORMAL_SPEED_PORT} to relay…"
+        conf_set RELAY_PORTS "$(merge_port_list "${ports}" "${PHORMAL_SPEED_PORT}")"
+        local hop; hop="$(conf_get RELAY_HOP_INTERVAL)"; hop="${hop:-30s}"
+        write_relay_entry_config "$(conf_get REMOTE_V4)" "$(conf_get RELAY_LISTEN)" "$(conf_get RELAY_PORTS)" "${hop}"
+        write_relay_systemd client || return 1
+        info "Waiting for relay to settle…"
+        sleep 3
+      fi
+      info "Testing through Phormal Relay for 10s…"
+      if ! iperf3 -c 127.0.0.1 -p "${PHORMAL_SPEED_PORT}" -t 10 -f m; then
+        fail "Speedtest failed — is step 1 still running on the exit node?"
+        return 1
+      fi
+      ;;
+    *) fail "Invalid step." ;;
+  esac
 }
 
 manage_relay_menu() {
