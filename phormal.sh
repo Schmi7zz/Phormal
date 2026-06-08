@@ -2,12 +2,12 @@
 # ==============================================================================
 #  Phormal Tunnel
 #  A fast, resilient tunneling layer for bridging two servers across hostile
-#  networks. Builds an encrypted-friendly core link between an entry node and an
-#  exit node, then multiplexes your service ports across it.
+#  networks. Builds a resilient core link between an entry node and an exit
+#  node, then multiplexes your service ports across it.
 #
 #  Author   : Schmi7z  (github.com/Schmi7zz)
 #  Channel  : @SchmitzWS
-#  Contact   : @Schmi7zz
+#  Contact  : @Schmi7zz
 #  License  : GPL-3.0
 # ==============================================================================
 
@@ -16,7 +16,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="1.0.0"
+readonly PHORMAL_VERSION="1.1.1"
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
 readonly PHORMAL_LOG="/var/log/phormal.log"
@@ -27,6 +27,7 @@ readonly FWD_BIN="/usr/local/bin/phormal-fwd"
 readonly CLI_LINK="/usr/local/bin/phormal"
 readonly MAX_PORTS_PER_UNIT=12000
 readonly CORE_IFACE="phormal0"
+readonly DEFAULT_MTU=1360
 
 # ------------------------------------------------------------------------------
 #  Presentation
@@ -77,9 +78,7 @@ need_root() {
 }
 
 ensure_dirs() { mkdir -p "${PHORMAL_HOME}"; touch "${PHORMAL_LOG}" 2>/dev/null || true; }
-
 have()        { command -v "$1" >/dev/null 2>&1; }
-
 valid_ipv4()  { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 
 random_core_prefix() {
@@ -90,12 +89,122 @@ random_core_prefix() {
 
 conf_get() { [[ -f "${PHORMAL_CONF}" ]] && grep -E "^${1}=" "${PHORMAL_CONF}" | head -n1 | cut -d= -f2- || true; }
 
+# Detect the primary egress interface (for qdisc tuning)
+primary_iface() {
+  ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'
+}
+
+# ------------------------------------------------------------------------------
+#  NETWORK TUNING  (BBR + queue discipline)  — applied automatically on deploy
+# ------------------------------------------------------------------------------
+apply_tuning() {
+  local qdisc="${1:-fq}"   # fq (default) or cake
+  info "Applying network tuning (BBR + ${qdisc})…"
+
+  cat > /etc/sysctl.d/98-phormal-tuning.conf <<EOF
+# Phormal network tuning
+net.core.default_qdisc = ${qdisc}
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+net.ipv4.tcp_notsent_lowat = 16384
+EOF
+  modprobe tcp_bbr 2>/dev/null || true
+  sysctl --system >/dev/null 2>&1 || true
+
+  # Apply qdisc live on the egress interface as well (sysctl covers new ifaces)
+  local egress; egress="$(primary_iface)"
+  if [[ -n "${egress}" ]]; then
+    tc qdisc replace dev "${egress}" root "${qdisc}" 2>/dev/null \
+      && good "Queue discipline '${qdisc}' active on ${egress}." \
+      || warn "Could not set '${qdisc}' on ${egress} (kernel may lack the module)."
+  fi
+
+  if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+    good "BBR active."
+  else
+    warn "BBR not confirmed — a reboot may be required."
+  fi
+}
+
+tune_menu() {
+  rule
+  info "Network tuning"
+  rule
+  printf '  %s1%s  fq    %s(balanced, recommended)%s\n' "${ACC}" "${RST}" "${MUT}" "${RST}"
+  printf '  %s2%s  cake  %s(best against latency spikes / bufferbloat)%s\n' "${ACC}" "${RST}" "${MUT}" "${RST}"
+  local q; q="$(ask 'Queue discipline')"
+  case "${q}" in
+    1) apply_tuning fq ;;
+    2) apply_tuning cake ;;
+    *) fail "Invalid selection." ;;
+  esac
+}
+
 # ------------------------------------------------------------------------------
 #  CORE LINK  (entry <-> exit transport)
 # ------------------------------------------------------------------------------
+write_core_files() {
+  # args: role local_v4 remote_v4 self_core peer_core mtu
+  local role="$1" local_v4="$2" remote_v4="$3" self_core="$4" peer_core="$5" mtu="$6"
+
+  cat > "${CORE_UP_SCRIPT}" <<EOF
+#!/usr/bin/env bash
+# Phormal core bring-up (generated)
+ip link del ${CORE_IFACE} 2>/dev/null || true
+ip tunnel add ${CORE_IFACE} mode sit remote ${remote_v4} local ${local_v4} ttl 255
+ip link set ${CORE_IFACE} up
+ip link set dev ${CORE_IFACE} mtu ${mtu}
+ip -6 addr add ${self_core}/64 dev ${CORE_IFACE}
+
+# MSS clamping to path MTU — keeps upload from stalling on fragmented TCP
+ip6tables -t mangle -C FORWARD -o ${CORE_IFACE} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+  || ip6tables -t mangle -A FORWARD -o ${CORE_IFACE} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+ip6tables -t mangle -C OUTPUT  -o ${CORE_IFACE} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+  || ip6tables -t mangle -A OUTPUT  -o ${CORE_IFACE} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+EOF
+  chmod +x "${CORE_UP_SCRIPT}"
+
+  cat > "${CORE_UNIT}" <<EOF
+[Unit]
+Description=Phormal Core link
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${CORE_UP_SCRIPT}
+ExecStop=/sbin/ip link del ${CORE_IFACE}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > "${GUARD_UNIT}" <<EOF
+[Unit]
+Description=Phormal Core guardian (keepalive)
+After=phormal-core.service
+Requires=phormal-core.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env bash -c 'while :; do ping6 -c1 -W2 ${peer_core} >/dev/null 2>&1; sleep 15; done'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 deploy_core() {
   rule
-  info "Phormal Core — secure link between your entry and exit nodes"
+  info "Phormal Core — resilient link between your entry and exit nodes"
   rule
 
   local mode
@@ -134,6 +243,11 @@ deploy_core() {
   prefix="$(ask 'Core key [Enter for suggested]')"
   prefix="${prefix:-${suggested}}"
 
+  local mtu
+  info "Link MTU. Lower = more resilient on congested paths. Default ${DEFAULT_MTU}."
+  mtu="$(ask "MTU [Enter for ${DEFAULT_MTU}]")"
+  [[ "${mtu}" =~ ^[0-9]+$ ]] || mtu="${DEFAULT_MTU}"
+
   local self_core peer_core
   self_core="${prefix}${self_suffix}"
   peer_core="${prefix}${peer_suffix}"
@@ -146,61 +260,41 @@ REMOTE_V4=${remote_v4}
 CORE_KEY=${prefix}
 SELF_CORE=${self_core}
 PEER_CORE=${peer_core}
+CORE_MTU=${mtu}
 EOF
 
-  cat > "${CORE_UP_SCRIPT}" <<EOF
-#!/usr/bin/env bash
-ip link del ${CORE_IFACE} 2>/dev/null || true
-ip tunnel add ${CORE_IFACE} mode sit remote ${remote_v4} local ${local_v4} ttl 255
-ip link set ${CORE_IFACE} up
-ip link set dev ${CORE_IFACE} mtu 1400
-ip -6 addr add ${self_core}/64 dev ${CORE_IFACE}
-EOF
-  chmod +x "${CORE_UP_SCRIPT}"
-
-  cat > "${CORE_UNIT}" <<EOF
-[Unit]
-Description=Phormal Core link
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=${CORE_UP_SCRIPT}
-ExecStop=/sbin/ip link del ${CORE_IFACE}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  cat > "${GUARD_UNIT}" <<EOF
-[Unit]
-Description=Phormal Core guardian (keepalive)
-After=phormal-core.service
-Requires=phormal-core.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/env bash -c 'while :; do ping6 -c1 -W2 ${peer_core} >/dev/null 2>&1; sleep 15; done'
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+  apt-get install -y iptables >/dev/null 2>&1 || true
+  write_core_files "${role}" "${local_v4}" "${remote_v4}" "${self_core}" "${peer_core}" "${mtu}"
 
   systemctl daemon-reload
   systemctl enable --now phormal-core.service  >/dev/null 2>&1
   systemctl enable --now phormal-guard.service >/dev/null 2>&1
 
-  good "Core link established."
+  # Tuning is now part of standard deployment, on every node.
+  apply_tuning fq
+
+  good "Core link established (MTU ${mtu})."
   info "  local  : ${self_core}"
   info "  peer   : ${peer_core}"
   if ping6 -c2 -W3 "${peer_core}" >/dev/null 2>&1; then
     good "Peer reachable across the Core link."
   else
     warn "Peer not answering yet — bring up the other node, then re-check status."
+  fi
+}
+
+# Re-apply MTU to a live link without full redeploy
+retune_mtu() {
+  local mtu; mtu="$(ask "New MTU (try 1360, then 1280 if uploads still stall)")"
+  [[ "${mtu}" =~ ^[0-9]+$ ]] || { fail "Not a number."; return 1; }
+  ip link set dev "${CORE_IFACE}" mtu "${mtu}" 2>/dev/null \
+    && good "Live MTU set to ${mtu} on ${CORE_IFACE}." \
+    || { fail "Could not set MTU (is the Core link up?)"; return 1; }
+  # Persist into the bring-up script
+  if [[ -f "${CORE_UP_SCRIPT}" ]]; then
+    sed -i "s/mtu [0-9]\+/mtu ${mtu}/" "${CORE_UP_SCRIPT}"
+    sed -i "s/^CORE_MTU=.*/CORE_MTU=${mtu}/" "${PHORMAL_CONF}" 2>/dev/null || true
+    good "Persisted across reboots."
   fi
 }
 
@@ -317,22 +411,8 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-#  TUNING / OPS
+#  OPS
 # ------------------------------------------------------------------------------
-enable_bbr() {
-  info "Enabling BBR congestion control…"
-  cat > /etc/sysctl.d/98-phormal-bbr.conf <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-  sysctl --system >/dev/null 2>&1 || true
-  if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
-    good "BBR active."
-  else
-    warn "BBR could not be confirmed (kernel may need a reboot)."
-  fi
-}
-
 schedule_refresh() {
   local hrs; hrs="$(ask 'Auto-refresh interval in hours (0 to disable)')"
   crontab -l 2>/dev/null | grep -v 'phormal-refresh' | crontab - 2>/dev/null || true
@@ -356,17 +436,26 @@ status() {
   rule
   info "CORE LINK"
   if [[ -f "${PHORMAL_CONF}" ]]; then
-    local role self peer
-    role="$(conf_get ROLE)"; self="$(conf_get SELF_CORE)"; peer="$(conf_get PEER_CORE)"
+    local role self peer mtu
+    role="$(conf_get ROLE)"; self="$(conf_get SELF_CORE)"; peer="$(conf_get PEER_CORE)"; mtu="$(conf_get CORE_MTU)"
     printf '    role    : %s\n' "${role:-?}"
     [[ -n "${self}" ]] && printf '    local   : %s\n' "${self}"
     [[ -n "${peer}" ]] && printf '    peer    : %s\n' "${peer}"
+    [[ -n "${mtu}"  ]] && printf '    mtu     : %s\n' "${mtu}"
     if [[ -n "${peer}" ]]; then
-      if ping6 -c1 -W2 "${peer}" >/dev/null 2>&1; then good "peer reachable"; else warn "peer unreachable"; fi
+      # Send several pings; the first packet on an idle link often drops during
+      # neighbor-discovery warm-up, so a single ping gives false negatives.
+      local rx
+      rx="$(ping6 -c5 -i0.3 -W2 "${peer}" 2>/dev/null | grep -oE '[0-9]+ received' | grep -oE '^[0-9]+' || echo 0)"
+      if [[ "${rx:-0}" -gt 0 ]]; then good "peer reachable (${rx}/5)"; else warn "peer unreachable (0/5)"; fi
     fi
   else
     warn "no Core link configured"
   fi
+  echo
+  info "TUNING"
+  printf '    cc      : %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
+  printf '    qdisc   : %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
   echo
   info "FORWARDER WORKERS"
   local found=0 u name st
@@ -391,7 +480,8 @@ purge() {
     systemctl disable "${s}.service" 2>/dev/null || true
   done
   ip link del "${CORE_IFACE}" 2>/dev/null || true
-  rm -f "${CORE_UNIT}" "${GUARD_UNIT}" /etc/sysctl.d/99-phormal.conf /etc/sysctl.d/98-phormal-bbr.conf
+  rm -f "${CORE_UNIT}" "${GUARD_UNIT}"
+  rm -f /etc/sysctl.d/99-phormal.conf /etc/sysctl.d/98-phormal-tuning.conf
   rm -f /usr/bin/phormal-refresh.sh
   crontab -l 2>/dev/null | grep -v 'phormal-refresh' | crontab - 2>/dev/null || true
   rm -rf "${PHORMAL_HOME}"
@@ -415,7 +505,6 @@ quick_deploy() {
 }
 
 install_cli() {
-  # Make `phormal` runnable from anywhere after first run
   local src; src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
   if [[ "${src}" != "${CLI_LINK}" ]]; then
     cp -f "${src}" "${CLI_LINK}" 2>/dev/null && chmod +x "${CLI_LINK}" 2>/dev/null || true
@@ -435,10 +524,11 @@ menu() {
     printf '\n  %sMANAGE%s\n' "${BOLD}" "${RST}"
     printf '    %s4%s  Add / publish more ports\n' "${ACC}" "${RST}"
     printf '    %s5%s  Status\n' "${ACC}" "${RST}"
-    printf '    %s6%s  Enable BBR\n' "${ACC}" "${RST}"
-    printf '    %s7%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
-    printf '    %s8%s  Uninstall\n' "${ACC}" "${RST}"
-    printf '    %s9%s  Exit\n\n' "${ACC}" "${RST}"
+    printf '    %s6%s  Network tuning      %s(BBR + fq/cake)%s\n' "${ACC}" "${RST}" "${MUT}" "${RST}"
+    printf '    %s7%s  Adjust link MTU\n' "${ACC}" "${RST}"
+    printf '    %s8%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
+    printf '    %s9%s  Uninstall\n' "${ACC}" "${RST}"
+    printf '    %s0%s  Exit\n\n' "${ACC}" "${RST}"
 
     local choice; choice="$(ask 'Select')"
     echo
@@ -448,10 +538,11 @@ menu() {
       3) deploy_forwarder ;;
       4) deploy_forwarder ;;
       5) status ;;
-      6) enable_bbr ;;
-      7) schedule_refresh ;;
-      8) purge ;;
-      9) good "Goodbye — @SchmitzWS"; exit 0 ;;
+      6) tune_menu ;;
+      7) retune_mtu ;;
+      8) schedule_refresh ;;
+      9) purge ;;
+      0) good "Goodbye — @SchmitzWS"; exit 0 ;;
       *) fail "Invalid selection." ;;
     esac
     echo; read -n1 -s -r -p "  ${MUT}Press any key to continue…${RST}"; echo
