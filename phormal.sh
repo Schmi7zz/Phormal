@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="3.2.8"
+readonly PHORMAL_VERSION="3.2.9"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -714,7 +714,7 @@ EOF
 bridge_start_instance() {
   local name="$1" role; role="$(bmeta_get "${name}" ROLE)"
   bridge_install_runtime
-  if [[ "$(bmeta_get "${name}" LEGACY)" == "1" || bridge_link_running_legacy "${name}" ]]; then
+  if [[ "$(bmeta_get "${name}" LEGACY)" == "1" ]] || bridge_link_running_legacy "${name}"; then
     info "Migrating legacy bridge '${name}' to multi-instance services…"
     bridge_stop_legacy_procs
   fi
