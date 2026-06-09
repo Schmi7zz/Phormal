@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="3.2.7"
+readonly PHORMAL_VERSION="3.2.8"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -485,6 +485,7 @@ bridge_import_legacy() {
   bmeta_set "${name}" MTU "${mtu:-${DEFAULT_MTU}}"
   bmeta_set "${name}" PROTO "${proto:-tcp}"
   [[ -n "${ports}" ]] && bmeta_set "${name}" PORTS "${ports}"
+  bmeta_set "${name}" LEGACY "1"
 
   warn "Imported legacy bridge setup as link '${name}' (old install — not multi-instance yet)."
 }
@@ -569,7 +570,38 @@ bmeta_set() {
 bcore_svc()  { printf 'phormal-core@%s.service' "$1"; }
 bguard_svc() { printf 'phormal-guard@%s.service' "$1"; }
 bfwd_svc()   { printf 'phormal-bfwd@%s.service' "$1"; }
-bcore_state(){ systemctl is-active "$(bcore_svc "$1")" 2>/dev/null || echo unknown; }
+
+bridge_link_running_legacy() {
+  local name="$1" iface role
+  iface="$(bmeta_get "${name}" IFACE)"
+  role="$(bmeta_get "${name}" ROLE)"
+  [[ -n "${iface}" ]] || return 1
+  ip link show "${iface}" 2>/dev/null | grep -q 'state UP' || return 1
+  if [[ "${role}" == "entry" ]]; then
+    pgrep -f "${FWD_BIN}" >/dev/null 2>&1 || systemctl is-active phormal-fwd.service &>/dev/null
+  else
+    return 0
+  fi
+}
+
+bcore_state() {
+  local name="$1" st
+  st="$(systemctl is-active "$(bcore_svc "${name}")" 2>/dev/null || true)"
+  [[ "${st}" == "active" ]] && { printf 'active'; return 0; }
+  if [[ "${name}" == "main" ]] && systemctl is-active phormal-core.service &>/dev/null; then
+    printf 'active'; return 0
+  fi
+  if bridge_link_running_legacy "${name}"; then
+    printf 'running'; return 0
+  fi
+  [[ -n "${st}" && "${st}" != "unknown" ]] && printf '%s' "${st}" || printf 'inactive'
+}
+
+bridge_stop_legacy_procs() {
+  systemctl stop phormal-fwd.service phormal-guard.service phormal-core.service 2>/dev/null || true
+  pkill -f "${FWD_BIN}" 2>/dev/null || true
+  sleep 1
+}
 
 # interface names are capped at 15 chars by the kernel (IFNAMSIZ)
 bridge_make_iface() { local n="phm-$1"; printf '%s' "${n:0:15}"; }
@@ -681,6 +713,11 @@ EOF
 # ------------------------------------------------------------------------------
 bridge_start_instance() {
   local name="$1" role; role="$(bmeta_get "${name}" ROLE)"
+  bridge_install_runtime
+  if [[ "$(bmeta_get "${name}" LEGACY)" == "1" || bridge_link_running_legacy "${name}" ]]; then
+    info "Migrating legacy bridge '${name}' to multi-instance services…"
+    bridge_stop_legacy_procs
+  fi
   systemctl daemon-reload
   systemctl enable "$(bcore_svc "${name}")"  >/dev/null 2>&1
   systemctl enable "$(bguard_svc "${name}")" >/dev/null 2>&1
@@ -692,6 +729,7 @@ bridge_start_instance() {
   fi
   sleep 1
   if systemctl is-active "$(bcore_svc "${name}")" >/dev/null 2>&1; then
+    bmeta_set "${name}" LEGACY "0"
     good "Bridge link '${name}' is up."
   else
     fail "Bridge link '${name}' failed to come up. Recent log:"
