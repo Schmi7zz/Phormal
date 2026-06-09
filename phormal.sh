@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="3.2.2"
+readonly PHORMAL_VERSION="3.2.3"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -408,12 +408,145 @@ gather_ports() {
 # ------------------------------------------------------------------------------
 bridge_idir() { printf '%s/%s' "${BRIDGE_DIR}" "$1"; }
 
+bridge_systemd_names() {
+  local seen="" u name
+  while read -r u; do
+    [[ "${u}" == phormal-core@*.service ]] && continue
+    name="${u#phormal-core@}"
+    name="${name%.service}"
+    [[ -n "${name}" ]] || continue
+    [[ ",${seen}," == *",${name},"* ]] && continue
+    seen="${seen:+${seen},}${name}"
+    printf '%s\n' "${name}"
+  done < <(
+    {
+      systemctl list-unit-files 'phormal-core@*' --no-legend --no-pager 2>/dev/null | awk '{print $1}'
+      systemctl list-units 'phormal-core@*' --all --no-legend --no-pager 2>/dev/null | awk '{print $1}'
+    } | sort -u
+  )
+}
+
+bridge_legacy_iface() {
+  ip link show "${CORE_IFACE}" &>/dev/null && { printf '%s' "${CORE_IFACE}"; return 0; }
+  ip -o link show type sit 2>/dev/null | awk -F': ' '{print $2}' | head -n1
+}
+
+bridge_import_legacy() {
+  local name="main" iface gost_ps proto ports peer_core self_core core_key role
+  local local_v4 remote_v4 mtu
+
+  bridge_instances | grep -q . && return 0
+  [[ -f "$(bridge_idir "${name}")/meta.conf" ]] && return 0
+
+  gost_ps="$(ps -eo args 2>/dev/null | grep -E "${FWD_BIN}|/[g]ost" | grep -v grep | head -n1 || true)"
+  iface="$(bridge_legacy_iface)"
+  [[ -n "${gost_ps}" || -n "${iface}" || -f "${PHORMAL_CONF}" ]] || return 0
+
+  proto="tcp"; ports=""; peer_core=""; self_core=""; role="entry"
+  if [[ -n "${gost_ps}" ]]; then
+    proto="$(printf '%s' "${gost_ps}" | grep -oE '\-L=[a-z0-9]+://' | head -n1 | sed 's/-L=//;s|://||')"
+    ports="$(printf '%s' "${gost_ps}" | grep -oE ':[0-9]+/\[' | sed 's/[:/\[]//g' | paste -sd, -)"
+    peer_core="$(printf '%s' "${gost_ps}" | grep -oE '\[[^]]+\]' | head -n1 | tr -d '[]')"
+  fi
+
+  if [[ -n "${iface}" ]]; then
+    local_v4="$(ip -d link show "${iface}" 2>/dev/null | sed -n 's/.* local \([^ ]*\).*/\1/p' | head -n1)"
+    remote_v4="$(ip -d link show "${iface}" 2>/dev/null | sed -n 's/.* remote \([^ ]*\).*/\1/p' | head -n1)"
+    self_core="$(ip -6 -o addr show dev "${iface}" scope global 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1)"
+    mtu="$(ip -o link show "${iface}" 2>/dev/null | awk '{print $5}')"
+  fi
+
+  if [[ -f "${PHORMAL_CONF}" ]]; then
+    [[ -n "$(conf_get ROLE)" ]]       && role="$(conf_get ROLE)"
+    [[ -n "$(conf_get LOCAL_V4)" ]]   && local_v4="$(conf_get LOCAL_V4)"
+    [[ -n "$(conf_get REMOTE_V4)" ]]  && remote_v4="$(conf_get REMOTE_V4)"
+    [[ -n "$(conf_get SELF_CORE)" ]]  && self_core="$(conf_get SELF_CORE)"
+    [[ -n "$(conf_get PEER_CORE)" ]]  && peer_core="$(conf_get PEER_CORE)"
+    [[ -n "$(conf_get PORTS)" ]]      && ports="$(conf_get PORTS)"
+    [[ -n "$(conf_get PROTO)" ]]      && proto="$(conf_get PROTO)"
+    [[ -n "$(conf_get MTU)" ]]        && mtu="$(conf_get MTU)"
+    [[ -n "$(conf_get IFACE)" ]]      && iface="$(conf_get IFACE)"
+  fi
+
+  [[ -n "${peer_core}" || -n "${self_core}" ]] || return 0
+  [[ -n "${self_core}" ]] || self_core="${peer_core%::[12]}::2"
+  core_key="${self_core%::[12]}"
+  [[ -n "${peer_core}" ]] || { [[ "${role}" == "exit" ]] && peer_core="${core_key}::2" || peer_core="${core_key}::1"; }
+  [[ -n "${iface}" ]] || iface="${CORE_IFACE}"
+
+  mkdir -p "$(bridge_idir "${name}")"
+  bmeta_set "${name}" ROLE "${role}"
+  bmeta_set "${name}" IFACE "${iface}"
+  bmeta_set "${name}" LOCAL_V4 "${local_v4:-}"
+  bmeta_set "${name}" REMOTE_V4 "${remote_v4:-}"
+  bmeta_set "${name}" CORE_KEY "${core_key}"
+  bmeta_set "${name}" SELF_CORE "${self_core}"
+  bmeta_set "${name}" PEER_CORE "${peer_core}"
+  bmeta_set "${name}" MTU "${mtu:-${DEFAULT_MTU}}"
+  bmeta_set "${name}" PROTO "${proto:-tcp}"
+  [[ -n "${ports}" ]] && bmeta_set "${name}" PORTS "${ports}"
+
+  warn "Imported legacy bridge setup as link '${name}' (old install — not multi-instance yet)."
+}
+
+bridge_recover_from_runtime() {
+  local name iface local_v4 remote_v4 self_core peer_core role mtu proto ports core_key gost_ps
+  while read -r name; do
+    [[ -n "${name}" ]] || continue
+    [[ -f "$(bridge_idir "${name}")/meta.conf" ]] && continue
+
+    iface="$(bridge_make_iface "${name}")"
+    ip link show "${iface}" &>/dev/null \
+      || systemctl is-active "$(bcore_svc "${name}")" &>/dev/null \
+      || continue
+
+    local_v4="$(ip -d link show "${iface}" 2>/dev/null | sed -n 's/.* local \([^ ]*\).*/\1/p' | head -n1)"
+    remote_v4="$(ip -d link show "${iface}" 2>/dev/null | sed -n 's/.* remote \([^ ]*\).*/\1/p' | head -n1)"
+    self_core="$(ip -6 -o addr show dev "${iface}" scope global 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1)"
+    mtu="$(ip -o link show "${iface}" 2>/dev/null | awk '{print $5}')"
+    [[ -n "${self_core}" && -n "${remote_v4}" ]] || continue
+
+    core_key="${self_core%::[12]}"
+    if [[ "${self_core}" == *::2 ]] \
+       || systemctl is-enabled "$(bfwd_svc "${name}")" &>/dev/null \
+       || systemctl is-active "$(bfwd_svc "${name}")" &>/dev/null; then
+      role="entry"; peer_core="${core_key}::1"
+    else
+      role="exit"; peer_core="${core_key}::2"
+    fi
+
+    proto="tcp"; ports=""
+    gost_ps="$(ps -eo args 2>/dev/null | grep -E "${FWD_BIN}|/[g]ost" | head -n1 || true)"
+    if [[ -n "${gost_ps}" ]]; then
+      proto="$(printf '%s' "${gost_ps}" | grep -oE '\-L=[a-z0-9]+://' | head -n1 | sed 's/-L=//;s|://||')"
+      ports="$(printf '%s' "${gost_ps}" | grep -oE ':[0-9]+/\[' | sed 's/[:/\[]//g' | paste -sd, -)"
+    fi
+
+    mkdir -p "$(bridge_idir "${name}")"
+    bmeta_set "${name}" ROLE "${role}"
+    bmeta_set "${name}" IFACE "${iface}"
+    bmeta_set "${name}" LOCAL_V4 "${local_v4:-}"
+    bmeta_set "${name}" REMOTE_V4 "${remote_v4}"
+    bmeta_set "${name}" CORE_KEY "${core_key}"
+    bmeta_set "${name}" SELF_CORE "${self_core}"
+    bmeta_set "${name}" PEER_CORE "${peer_core}"
+    bmeta_set "${name}" MTU "${mtu:-${DEFAULT_MTU}}"
+    bmeta_set "${name}" PROTO "${proto:-tcp}"
+    [[ -n "${ports}" ]] && bmeta_set "${name}" PORTS "${ports}"
+
+    warn "Recovered bridge link '${name}' from running services (meta.conf was missing)."
+  done < <(bridge_systemd_names)
+}
+
 bridge_instances() {
   local d
+  mkdir -p "${BRIDGE_DIR}"
+  shopt -s nullglob
   for d in "${BRIDGE_DIR}"/*/; do
     [[ -f "${d}meta.conf" ]] || continue
     basename "${d}"
   done
+  shopt -u nullglob
 }
 
 bmeta_get() {
@@ -700,6 +833,8 @@ create_bridge_entry() {
 #  Per-link management
 # ------------------------------------------------------------------------------
 bridge_list() {
+  bridge_import_legacy
+  bridge_recover_from_runtime
   rule
   info "Phormal Bridge — links"
   rule
