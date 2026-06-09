@@ -23,7 +23,7 @@
 
 **Phormal** connects an **entry node** (restricted / local uplink) to an **exit node** (clean foreign uplink), then publishes your service ports so end users connect to the **entry node's public IP** — never the exit.
 
-Two modes are built in:
+Two modes, both **multi-tunnel** — one box can run many independent links/tunnels at once:
 
 | Mode | Best for | How it works |
 | ---- | -------- | ------------ |
@@ -54,13 +54,14 @@ flowchart LR
 
 ---
 
-## 🆕 What's new in 3.1.1
+## 🆕 What's new
 
-- **Multi-tunnel Relay.** Every tunnel is now a **named instance** with its own config, ports, credentials, and systemd service (`phormal-relay@<name>.service`).
-  - One Kharej can serve **many** Iran nodes — each Iran box runs its own entry tunnel with its own ports.
+- **Multi-tunnel everywhere.** Both **Bridge** and **Relay** are now built around **named instances**, each with its own config, ports, credentials, and systemd service.
+  - **One Kharej → many Iran.** A single exit server can serve any number of Iran nodes. For Relay it's one shared exit tunnel; for Bridge you add one exit *link* per Iran peer (SIT is point-to-point).
   - One box can host **several tunnels at once** (e.g. entry to three different exits).
-- **Per-tunnel management.** List, restart, stop, start, diagnose, tail live logs, edit ports, change exit IP, change link port, edit credentials, edit raw config, or delete — **each scoped to one tunnel**.
-- **No more "restart on both sides" bug.** The client now connects eagerly and keeps the tunnel warm with keepalive (previously it started lazily and the first handshake often failed). Added `fastOpen` and a short start delay for reliable boot ordering.
+- **Per-instance management.** List, restart, stop, start, diagnose, tail logs, edit ports, change peer/exit IP, change link port or bridge key, edit MTU, edit raw config, or delete — **each scoped to one tunnel**.
+- **No more "restart both sides" bug (Relay).** The client now connects eagerly and keeps the tunnel warm with keepalive, instead of starting lazily and failing the first handshake. Added `fastOpen` and a short boot delay.
+- **Robust menu.** A failing action no longer aborts the whole tool — it just reports and returns to the menu.
 
 ---
 
@@ -68,7 +69,7 @@ flowchart LR
 
 - **OS:** Linux (Debian / Ubuntu recommended)
 - **Access:** root (`sudo phormal`)
-- **Nodes:** two servers — one entry, one exit
+- **Nodes:** two or more servers — entries and exits
 - **Network:** UDP reachability between nodes (for the Relay link port)
 
 ---
@@ -93,21 +94,17 @@ sudo phormal
 
 > One exit (Kharej) tunnel can be shared by **any number** of entry (Iran) tunnels — same link port, same passwords, different user ports per entry.
 
-### 1. On the exit (Kharej) — menu **5** · *Add exit tunnel*
-
-- Give the tunnel a **name** (e.g. `kharej-de`)
-- Choose a **link port** (UDP, e.g. `8531`) — *not* a user port
-- Note the **auth** and **obfuscation** passwords it prints
-- Open the link port in the firewall: `ufw allow 8531/udp`
+**1. On the exit (Kharej) — menu `5` · Add exit tunnel**
+- Name the tunnel (e.g. `kharej-de`), pick a **link port** (UDP, e.g. `8531`)
+- Note the **auth** + **obfuscation** passwords it prints
+- Open it in the firewall: `ufw allow 8531/udp`
 - Run your real service (Xray / 3x-ui) locally on the user port (e.g. `5151`)
 
-### 2. On each entry (Iran) — menu **6** · *Add entry tunnel*
-
-- Give it a **name** (e.g. `iran1`)
-- Enter the **exit IP**, the **same link port**, and the **same two passwords**
+**2. On each entry (Iran) — menu `6` · Add entry tunnel**
+- Name it (e.g. `iran1`), enter the **exit IP**, the **same link port**, and the **same two passwords**
 - Enter the **user ports** to publish (e.g. `5151`)
 
-### 3. Point users at the entry
+**3. Point users at the entry**
 
 ```text
   Client  →  Entry:5151  →  [ QUIC link :8531 ]  →  Exit:5151  →  Xray
@@ -122,52 +119,60 @@ sudo phormal
 
 ---
 
-## 🌉 Phormal Bridge — for stable paths
+## 🌉 Phormal Bridge — multi-tunnel, for stable paths
 
-1. **Exit node** → menu **1** (Quick deploy) or **2** (Link only)
-2. **Entry node** → same, using the **same bridge key** and peer addresses
-3. **Entry node** → menu **3** (Port publisher) or finish Quick deploy to publish ports
-4. Run your service on the **exit** on the ports you publish
-5. Point users at **entry IP : published port**
+A SIT tunnel is point-to-point, so **one Kharej serves N Iran nodes by adding one exit link per peer** — each with its own bridge key.
 
-**Publisher transports:** `tcp` · `udp` · `grpc`
-**Defaults:** SIT interface `phormal0`, MTU `1360`, BBR + `fq` tuning, MSS clamping.
+**1. On the exit (Kharej) — menu `1` · Add exit link** *(repeat per Iran node)*
+- Name it (e.g. `iran1`), enter this exit's IP and the Iran peer's IP
+- Note the **bridge key** it prints
+- Run your service locally on the ports you'll publish
+
+**2. On each entry (Iran) — menu `2` · Add entry link**
+- Name it, enter this node's IP and the exit IP
+- Enter the **same bridge key** as the matching exit link
+- Choose transport (`tcp` / `udp` / `grpc`) and the **user ports** to publish
+
+**3. Point users at `entry IP : published port`.**
+
+**Defaults:** per-link interface `phm-<name>`, MTU `1360`, BBR + `fq` tuning, MSS clamping.
 
 ---
 
 ## 🧭 Menu reference
 
-### 🌉 Phormal Bridge
+### 🌉 Phormal Bridge (multi-tunnel)
 
 | # | Action |
 | - | ------ |
-| 1 | Quick deploy — link + optional port publisher |
-| 2 | Link only — SIT tunnel between nodes |
-| 3 | Port publisher only — expose ports to users |
-| 4 | Manage — restart · rewrite · rebuild · add/remove ports · change addresses · speedtest |
+| 1 | Add exit link (this server = Kharej) — one per Iran peer |
+| 2 | Add entry link (this server = Iran) |
+| 3 | Manage links — list / edit / delete / restart each |
+| 4 | Speedtest |
 
 ### 🛰️ Phormal Relay (multi-tunnel)
 
 | # | Action |
 | - | ------ |
-| 5 | **Add exit tunnel** (this server = Kharej) |
-| 6 | **Add entry tunnel** (this server = Iran) |
-| 7 | **Manage tunnels** — list / edit / delete / restart each |
+| 5 | Add exit tunnel (this server = Kharej) |
+| 6 | Add entry tunnel (this server = Iran) |
+| 7 | Manage tunnels — list / edit / delete / restart each |
 | 8 | Speedtest |
 
-**Manage tunnels (7)** lists every tunnel, then per tunnel offers:
-restart · stop · start · diagnostics · live log · edit ports · change exit IP · change link port · edit auth/obfs/bandwidth · edit raw config · delete.
+**Manage** (links or tunnels) lists every instance, then per instance offers:
+restart · stop · start · diagnostics / ping · live log · edit ports · change peer/exit IP · change link port or bridge key · change MTU · edit raw config · delete.
 
 ### 🛠️ Global
 
 | # | Action |
 | - | ------ |
-| 9 | Status — Bridge link, forwarders, and all Relay tunnels |
+| 9 | Status — all bridge links and relay tunnels |
 | 10 | Phormal tuning — BBR + `fq` (balanced) or `cake` (low-latency) |
-| 11 | Adjust Bridge MTU — live + persistent (try `1360`, then `1280` if uploads stall) |
-| 12 | Auto-refresh schedule — periodic service restart via cron |
-| 13 | Uninstall |
+| 11 | Auto-refresh schedule — periodic service restart via cron |
+| 12 | Uninstall |
 | 0 | Exit |
+
+> MTU is now adjusted **per link** inside Manage → Change MTU (try `1360`, then `1280` if uploads stall).
 
 ---
 
@@ -175,8 +180,8 @@ restart · stop · start · diagnostics · live log · edit ports · change exit
 
 Two steps, run on **both** nodes within ~30 seconds of each other.
 
-**Relay:** Exit → menu **8** → step **1** (listener), then Entry → menu **8** → step **2** (test, pick the tunnel).
-**Bridge:** Exit → Bridge Manage → **7** → step **1**, then Entry → step **2**.
+- **Relay:** Exit → menu **8** → step **1** (listener), then Entry → menu **8** → step **2** (pick the tunnel).
+- **Bridge:** Exit → menu **4** → pick link → step **1**, then Entry → menu **4** → pick link → step **2**.
 
 ---
 
@@ -184,18 +189,17 @@ Two steps, run on **both** nodes within ~30 seconds of each other.
 
 | Path | Purpose |
 | ---- | ------- |
-| `/etc/phormal/phormal.conf` | Bridge settings |
-| `/etc/phormal/core-up.sh` | Bridge SIT bring-up script |
-| `/etc/phormal/relay/<name>/meta.conf` | Per-tunnel settings (role, IP, ports, credentials) |
-| `/etc/phormal/relay/<name>/config.yaml` | Per-tunnel engine config |
+| `/etc/phormal/bridge/<name>/meta.conf` | Per-bridge-link settings |
+| `/etc/phormal/relay/<name>/meta.conf` | Per-relay-tunnel settings |
+| `/etc/phormal/relay/<name>/config.yaml` | Per-relay-tunnel engine config |
 | `/etc/phormal/tls/` | Shared self-signed certificate |
 | `/var/log/phormal.log` | Phormal log file |
 
 | Service | Mode |
 | ------- | ---- |
-| `phormal-core.service` | Bridge SIT link |
-| `phormal-guard.service` | Bridge keepalive |
-| `phormal-fwd@*.service` | Bridge port publishers |
+| `phormal-core@<name>.service` | One Bridge SIT link each |
+| `phormal-guard@<name>.service` | Bridge keepalive (per link) |
+| `phormal-bfwd@<name>.service` | Bridge port publisher (per entry link) |
 | `phormal-relay@<name>.service` | One Relay tunnel each |
 
 ---
@@ -213,15 +217,13 @@ Two steps, run on **both** nodes within ~30 seconds of each other.
 
 **`connection refused` on the exit** — the tunnel works, but your service isn't listening on that port. Start Xray / 3x-ui on the user port (bind to `0.0.0.0` or `127.0.0.1`).
 
-**`connection reset by peer` in logs** — usually normal as clients reconnect; ignore if traffic flows.
-
-**Bridge: peer unreachable** — bring up the other node with the same bridge key, check **9 Status**, lower MTU via **11** if uploads stall.
+**Bridge: peer unreachable** — bring up the matching link on the other node with the **same bridge key**, then **Manage links → pick link → Ping peer**. Lower MTU if uploads stall.
 
 **View logs**
 ```bash
 journalctl -u 'phormal-relay@*' -f
-journalctl -u phormal-core -f
-journalctl -u 'phormal-fwd@*' -f
+journalctl -u 'phormal-core@*' -f
+journalctl -u 'phormal-bfwd@*' -f
 ```
 
 ---

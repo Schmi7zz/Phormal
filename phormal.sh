@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="3.1.2"
+readonly PHORMAL_VERSION="3.1.1"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -236,157 +236,26 @@ tune_menu() {
   esac
 }
 
-# ------------------------------------------------------------------------------
-#  PHORMAL BRIDGE
-# ------------------------------------------------------------------------------
-write_core_files() {
-  local local_v4="$1" remote_v4="$2" self_core="$3" peer_core="$4" mtu="$5"
-
-  cat > "${CORE_UP_SCRIPT}" <<EOF
-#!/usr/bin/env bash
-ip link del ${CORE_IFACE} 2>/dev/null || true
-ip tunnel add ${CORE_IFACE} mode sit remote ${remote_v4} local ${local_v4} ttl 255
-ip link set ${CORE_IFACE} up
-ip link set dev ${CORE_IFACE} mtu ${mtu}
-ip -6 addr add ${self_core}/64 dev ${CORE_IFACE}
-
-ip6tables -t mangle -C FORWARD -o ${CORE_IFACE} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
-  || ip6tables -t mangle -A FORWARD -o ${CORE_IFACE} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-ip6tables -t mangle -C OUTPUT  -o ${CORE_IFACE} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
-  || ip6tables -t mangle -A OUTPUT  -o ${CORE_IFACE} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-EOF
-  chmod +x "${CORE_UP_SCRIPT}"
-
-  cat > "${CORE_UNIT}" <<EOF
-[Unit]
-Description=Phormal Bridge link
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=${CORE_UP_SCRIPT}
-ExecStop=/sbin/ip link del ${CORE_IFACE}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  cat > "${GUARD_UNIT}" <<EOF
-[Unit]
-Description=Phormal Bridge guardian (keepalive)
-After=phormal-core.service
-Requires=phormal-core.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/env bash -c 'while :; do ping6 -c1 -W2 ${peer_core} >/dev/null 2>&1; sleep 15; done'
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-deploy_bridge_core() {
-  rule
-  info "Phormal Bridge — link between entry and exit"
-  rule
-
-  local mode
-  printf '  %s1%s  Provision a new link\n' "${ACC}" "${RST}"
-  printf '  %s2%s  Attach to an existing link\n' "${ACC}" "${RST}"
-  mode="$(ask 'Select')"
-
-  if [[ "${mode}" == "2" ]]; then
-    local peer; peer="$(ask 'Existing peer Phormal address')"
-    ensure_dirs
-    { echo "TRANSPORT=bridge"; echo "ROLE=entry"; echo "PEER_CORE=${peer}"; } > "${PHORMAL_CONF}"
-    good "Attached. Phormal Bridge will route through ${peer}."
-    return 0
-  fi
-
-  local role role_choice self_suffix peer_suffix
-  printf '  %s1%s  Exit node     %s(foreign / clean uplink)%s\n' "${ACC}" "${RST}" "${MUT}" "${RST}"
-  printf '  %s2%s  Entry node    %s(local / restricted uplink)%s\n' "${ACC}" "${RST}" "${MUT}" "${RST}"
-  role_choice="$(ask 'Node role')"
-  case "${role_choice}" in
-    1) role="exit";  self_suffix="::1"; peer_suffix="::2" ;;
-    2) role="entry"; self_suffix="::2"; peer_suffix="::1" ;;
-    *) fail "Unknown role."; return 1 ;;
-  esac
-
-  local local_v4 remote_v4
-  local_v4="$(ask 'This node public IPv4')"
-  remote_v4="$(ask 'Peer node public IPv4')"
-  if ! valid_ipv4 "${local_v4}" || ! valid_ipv4 "${remote_v4}"; then
-    fail "Invalid IPv4 address."; return 1
-  fi
-
-  local suggested prefix
-  suggested="$(random_core_prefix)"
-  info "Bridge key (must match on both nodes). Suggested: ${BOLD}${suggested}${RST}"
-  prefix="$(ask 'Bridge key [Enter for suggested]')"
-  prefix="${prefix:-${suggested}}"
-
-  local mtu
-  info "Link MTU. Lower = more resilient on congested paths. Default ${DEFAULT_MTU}."
-  mtu="$(ask "MTU [Enter for ${DEFAULT_MTU}]")"
-  [[ "${mtu}" =~ ^[0-9]+$ ]] || mtu="${DEFAULT_MTU}"
-
-  local self_core peer_core
-  self_core="${prefix}${self_suffix}"
-  peer_core="${prefix}${peer_suffix}"
-
-  ensure_dirs
-  cat > "${PHORMAL_CONF}" <<EOF
-TRANSPORT=bridge
-ROLE=${role}
-LOCAL_V4=${local_v4}
-REMOTE_V4=${remote_v4}
-CORE_KEY=${prefix}
-SELF_CORE=${self_core}
-PEER_CORE=${peer_core}
-CORE_MTU=${mtu}
-EOF
-
-  apt-get install -y iptables >/dev/null 2>&1 || true
-  write_core_files "${local_v4}" "${remote_v4}" "${self_core}" "${peer_core}" "${mtu}"
-
-  systemctl daemon-reload
-  systemctl enable --now phormal-core.service  >/dev/null 2>&1
-  systemctl enable --now phormal-guard.service >/dev/null 2>&1
-  apply_tuning fq
-
-  good "Bridge link established (MTU ${mtu})."
-  info "  local  : ${self_core}"
-  info "  peer   : ${peer_core}"
-  local rx
-  rx="$(ping6 -c5 -i0.3 -W2 "${peer_core}" 2>/dev/null | grep -oE '[0-9]+ received' | grep -oE '^[0-9]+' || echo 0)"
-  if [[ "${rx:-0}" -gt 0 ]]; then
-    good "Peer reachable (${rx}/5)."
-  else
-    warn "Peer not answering yet — bring up the other node, then check status."
-  fi
-}
-
-retune_mtu() {
-  local mtu; mtu="$(ask "New MTU (try ${DEFAULT_MTU}, then 1280 if uploads stall)")"
-  [[ "${mtu}" =~ ^[0-9]+$ ]] || { fail "Not a number."; return 1; }
-  ip link set dev "${CORE_IFACE}" mtu "${mtu}" 2>/dev/null \
-    && good "Live MTU set to ${mtu} on ${CORE_IFACE}." \
-    || { fail "Could not set MTU (is the Bridge link up?)"; return 1; }
-  if [[ -f "${CORE_UP_SCRIPT}" ]]; then
-    sed -i "s/mtu [0-9]\+/mtu ${mtu}/" "${CORE_UP_SCRIPT}"
-    conf_set CORE_MTU "${mtu}"
-    good "Persisted across reboots."
-  fi
-}
+# ==============================================================================
+#  PHORMAL BRIDGE  (multi-instance)
+#
+#  Each link is a named instance living in:   /etc/phormal/bridge/<name>/
+#    - meta.conf   key=val metadata for this link
+#  A SIT tunnel is point-to-point, so ONE exit (kharej) serves N entries by
+#  creating one exit link per Iran peer (each with its own iface + bridge key).
+#  Services per link (systemd templates):
+#    phormal-core@<name>   SIT bring-up/down       (oneshot)
+#    phormal-guard@<name>  keepalive ping          (entry + exit)
+#    phormal-bfwd@<name>   port publisher (gost)   (entry only)
+# ==============================================================================
+readonly BRIDGE_DIR="${PHORMAL_HOME}/bridge"
+readonly BRIDGE_RUN="/usr/local/bin/phormal-bridge-run"
+readonly BCORE_TMPL="/etc/systemd/system/phormal-core@.service"
+readonly BGUARD_TMPL="/etc/systemd/system/phormal-guard@.service"
+readonly BFWD_TMPL="/etc/systemd/system/phormal-bfwd@.service"
 
 # ------------------------------------------------------------------------------
-#  PHORMAL BRIDGE — port publisher
+#  Publisher engine (gost) — shared by every entry link
 # ------------------------------------------------------------------------------
 install_engine() {
   if [[ -x "${FWD_BIN}" ]] && "${FWD_BIN}" -V >/dev/null 2>&1; then
@@ -394,7 +263,7 @@ install_engine() {
     return 0
   fi
   info "Installing Phormal publisher engine…"
-  apt_install_quiet curl wget tar gzip
+  apt_install_quiet curl wget tar gzip iptables
 
   if bash <(curl -fsSL --connect-timeout 20 --max-time 180 \
       https://github.com/go-gost/gost/raw/master/install.sh) --install >/dev/null 2>&1 \
@@ -429,65 +298,136 @@ gather_ports() {
   printf '%s' "${merged}" | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -
 }
 
-deploy_bridge_forwarder() {
-  rule
-  info "Phormal Bridge — publish ports"
-  rule
+# ------------------------------------------------------------------------------
+#  Instance registry helpers
+# ------------------------------------------------------------------------------
+bridge_idir() { printf '%s/%s' "${BRIDGE_DIR}" "$1"; }
 
-  local peer; peer="$(conf_get PEER_CORE)"
-  if [[ -n "${peer}" ]]; then
-    info "Destination from config: ${BOLD}${peer}${RST}"
-    local keep; keep="$(ask 'Use this destination? (y/n)')"
-    [[ "${keep}" != "y" ]] && peer="$(ask 'Destination Phormal address')"
-  else
-    peer="$(ask 'Destination Phormal address')"
-  fi
-  [[ -z "${peer}" ]] && { fail "No destination supplied."; return 1; }
-
-  local proto pc
-  printf '  %s1%s  tcp   %s2%s  udp   %s3%s  grpc\n' "${ACC}" "${RST}" "${ACC}" "${RST}" "${ACC}" "${RST}"
-  pc="$(ask 'Transport')"
-  case "${pc}" in 1) proto=tcp ;; 2) proto=udp ;; 3) proto=grpc ;; *) fail "Invalid transport."; return 1 ;; esac
-
-  local ports; ports="$(gather_ports)"
-  [[ -z "${ports}" ]] && { fail "No valid ports provided."; return 1; }
-
-  conf_set BRIDGE_PROTO "${proto}"
-  conf_set BRIDGE_PORTS "${ports}"
-  apply_bridge_publisher "${peer}" "${proto}" "${ports}"
+bridge_instances() {
+  local d
+  for d in "${BRIDGE_DIR}"/*/; do
+    [[ -f "${d}meta.conf" ]] || continue
+    basename "${d}"
+  done
 }
 
-apply_bridge_publisher() {
-  local peer="$1" proto="$2" ports="$3"
+bmeta_get() {
+  local name="$1" key="$2" f
+  f="$(bridge_idir "${name}")/meta.conf"
+  [[ -f "${f}" ]] && grep -E "^${key}=" "${f}" | head -n1 | cut -d= -f2- || true
+}
 
-  install_engine || return 1
+bmeta_set() {
+  local name="$1" key="$2" val="$3" f
+  f="$(bridge_idir "${name}")/meta.conf"
+  mkdir -p "$(dirname "${f}")"; touch "${f}"
+  if grep -qE "^${key}=" "${f}" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "${f}"
+  else
+    echo "${key}=${val}" >> "${f}"
+  fi
+}
 
-  sysctl -w net.ipv4.ip_local_port_range="1024 65535" >/dev/null 2>&1 || true
-  echo 'net.ipv4.ip_local_port_range = 1024 65535' > /etc/sysctl.d/99-phormal.conf
+bcore_svc()  { printf 'phormal-core@%s.service' "$1"; }
+bguard_svc() { printf 'phormal-guard@%s.service' "$1"; }
+bfwd_svc()   { printf 'phormal-bfwd@%s.service' "$1"; }
+bcore_state(){ systemctl is-active "$(bcore_svc "$1")" 2>/dev/null || echo unknown; }
 
-  IFS=',' read -ra parr <<< "${ports}"
-  local count=${#parr[@]}
-  local units=$(( (count + MAX_PORTS_PER_UNIT - 1) / MAX_PORTS_PER_UNIT ))
-  info "Publishing ${BOLD}${count}${RST} port(s) over ${units} worker(s)…"
+# interface names are capped at 15 chars by the kernel (IFNAMSIZ)
+bridge_make_iface() { local n="phm-$1"; printf '%s' "${n:0:15}"; }
 
-  local u
-  for ((u=0; u<units; u++)); do
-    local unit="/etc/systemd/system/phormal-fwd@${u}.service"
-    local exec="ExecStart=${FWD_BIN}"
-    local i
-    for ((i=u*MAX_PORTS_PER_UNIT; i<(u+1)*MAX_PORTS_PER_UNIT && i<count; i++)); do
-      exec+=" -L=${proto}://:${parr[i]}/[${peer}]:${parr[i]}"
+# ------------------------------------------------------------------------------
+#  systemd templates + dispatcher (installed once)
+# ------------------------------------------------------------------------------
+bridge_install_runtime() {
+  cat > "${BRIDGE_RUN}" <<EOF
+#!/usr/bin/env bash
+# Phormal bridge launcher — up/down/guard/fwd for a named SIT link.
+set -e
+cmd="\$1"; name="\$2"
+dir="${BRIDGE_DIR}/\${name}"
+[[ -f "\${dir}/meta.conf" ]] || { echo "no such bridge link: \${name}" >&2; exit 1; }
+get(){ grep -E "^\$1=" "\${dir}/meta.conf" | head -n1 | cut -d= -f2-; }
+IFACE="\$(get IFACE)"; LOCAL_V4="\$(get LOCAL_V4)"; REMOTE_V4="\$(get REMOTE_V4)"
+SELF_CORE="\$(get SELF_CORE)"; PEER_CORE="\$(get PEER_CORE)"
+MTU="\$(get MTU)"; MTU="\${MTU:-${DEFAULT_MTU}}"
+PROTO="\$(get PROTO)"; PROTO="\${PROTO:-tcp}"; PORTS="\$(get PORTS)"
+FWD_BIN="${FWD_BIN}"
+case "\${cmd}" in
+  up)
+    ip link del "\${IFACE}" 2>/dev/null || true
+    ip tunnel add "\${IFACE}" mode sit remote "\${REMOTE_V4}" local "\${LOCAL_V4}" ttl 255
+    ip link set "\${IFACE}" up
+    ip link set dev "\${IFACE}" mtu "\${MTU}"
+    ip -6 addr add "\${SELF_CORE}/64" dev "\${IFACE}"
+    ip6tables -t mangle -C FORWARD -o "\${IFACE}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \\
+      || ip6tables -t mangle -A FORWARD -o "\${IFACE}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+    ip6tables -t mangle -C OUTPUT  -o "\${IFACE}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \\
+      || ip6tables -t mangle -A OUTPUT  -o "\${IFACE}" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+    ;;
+  down)
+    ip link del "\${IFACE}" 2>/dev/null || true
+    ;;
+  guard)
+    while :; do ping6 -c1 -W2 "\${PEER_CORE}" >/dev/null 2>&1 || true; sleep 15; done
+    ;;
+  fwd)
+    args=()
+    IFS=',' read -ra parr <<< "\${PORTS}"
+    for p in "\${parr[@]}"; do
+      [[ -n "\${p}" ]] && args+=( "-L=\${PROTO}://:\${p}/[\${PEER_CORE}]:\${p}" )
     done
-    cat > "${unit}" <<EOF
+    [[ \${#args[@]} -eq 0 ]] && { echo "no ports configured" >&2; exit 1; }
+    exec "\${FWD_BIN}" "\${args[@]}"
+    ;;
+  *) echo "usage: phormal-bridge-run {up|down|guard|fwd} <name>" >&2; exit 2 ;;
+esac
+EOF
+  chmod +x "${BRIDGE_RUN}"
+
+  cat > "${BCORE_TMPL}" <<EOF
 [Unit]
-Description=Phormal Bridge publisher ${u}
-After=network.target phormal-core.service
-Wants=network.target
+Description=Phormal Bridge link (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 2
+ExecStart=${BRIDGE_RUN} up %i
+ExecStop=${BRIDGE_RUN} down %i
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > "${BGUARD_TMPL}" <<EOF
+[Unit]
+Description=Phormal Bridge guardian (%i)
+After=phormal-core@%i.service
+Requires=phormal-core@%i.service
+
+[Service]
+Type=simple
+ExecStart=${BRIDGE_RUN} guard %i
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > "${BFWD_TMPL}" <<EOF
+[Unit]
+Description=Phormal Bridge publisher (%i)
+After=phormal-core@%i.service network-online.target
+Wants=phormal-core@%i.service
 
 [Service]
 Type=simple
 Environment="GOST_LOGGER_LEVEL=fatal"
-${exec}
+ExecStart=${BRIDGE_RUN} fwd %i
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -495,23 +435,368 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl enable "phormal-fwd@${u}.service" >/dev/null 2>&1
-    systemctl daemon-reload
-    systemctl restart "phormal-fwd@${u}.service"
+  systemctl daemon-reload
+}
+
+# ------------------------------------------------------------------------------
+#  Start / restart an instance (core + guard, plus fwd for entries)
+# ------------------------------------------------------------------------------
+bridge_start_instance() {
+  local name="$1" role; role="$(bmeta_get "${name}" ROLE)"
+  systemctl daemon-reload
+  systemctl enable "$(bcore_svc "${name}")"  >/dev/null 2>&1
+  systemctl enable "$(bguard_svc "${name}")" >/dev/null 2>&1
+  systemctl restart "$(bcore_svc "${name}")"
+  systemctl restart "$(bguard_svc "${name}")"
+  if [[ "${role}" == "entry" ]]; then
+    systemctl enable "$(bfwd_svc "${name}")" >/dev/null 2>&1
+    systemctl restart "$(bfwd_svc "${name}")"
+  fi
+  sleep 1
+  if systemctl is-active "$(bcore_svc "${name}")" >/dev/null 2>&1; then
+    good "Bridge link '${name}' is up."
+  else
+    fail "Bridge link '${name}' failed to come up. Recent log:"
+    journalctl -u "$(bcore_svc "${name}")" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+}
+
+bridge_ping_peer() {
+  local name="$1" peer rx
+  peer="$(bmeta_get "${name}" PEER_CORE)"
+  [[ -z "${peer}" ]] && return 1
+  rx="$(ping6 -c5 -i0.3 -W2 "${peer}" 2>/dev/null | grep -oE '[0-9]+ received' | grep -oE '^[0-9]+' || echo 0)"
+  if [[ "${rx:-0}" -gt 0 ]]; then good "peer reachable (${rx}/5)"; else warn "peer unreachable (0/5) — bring up the other node"; fi
+}
+
+# ------------------------------------------------------------------------------
+#  Create links
+# ------------------------------------------------------------------------------
+bridge_pick_name() {
+  local raw name
+  raw="$(ask 'Link name (e.g. iran1, iran2)')"
+  name="$(relay_sanitize_name "${raw}")"
+  if [[ -f "$(bridge_idir "${name}")/meta.conf" ]]; then
+    warn "A link named '${name}' already exists." >&2
+    printf '%s' ""; return 1
+  fi
+  printf '%s' "${name}"
+}
+
+create_bridge_exit() {
+  rule
+  info "Phormal Bridge — new EXIT link (this server = kharej)"
+  info "Create one exit link per Iran peer. Run your service locally."
+  rule
+
+  install_engine >/dev/null 2>&1 || true
+  apply_tuning fq
+  bridge_install_runtime
+
+  local name; name="$(bridge_pick_name)" || return 1
+  [[ -z "${name}" ]] && { fail "Invalid name."; return 1; }
+  mkdir -p "$(bridge_idir "${name}")"
+
+  local local_v4 remote_v4
+  local_v4="$(ask 'This (exit) node public IPv4')"
+  remote_v4="$(ask 'Peer (Iran/entry) node public IPv4')"
+  if ! valid_ipv4 "${local_v4}" || ! valid_ipv4 "${remote_v4}"; then
+    fail "Invalid IPv4 address."; rm -rf "$(bridge_idir "${name}")"; return 1
+  fi
+
+  local suggested prefix
+  suggested="$(random_core_prefix)"
+  info "Bridge key (must match the matching Iran link). Suggested: ${BOLD}${suggested}${RST}"
+  prefix="$(ask 'Bridge key [Enter for suggested]')"; prefix="${prefix:-${suggested}}"
+
+  local mtu
+  mtu="$(ask "Link MTU [Enter for ${DEFAULT_MTU}]")"
+  [[ "${mtu}" =~ ^[0-9]+$ ]] || mtu="${DEFAULT_MTU}"
+
+  bmeta_set "${name}" ROLE exit
+  bmeta_set "${name}" IFACE "$(bridge_make_iface "${name}")"
+  bmeta_set "${name}" LOCAL_V4 "${local_v4}"
+  bmeta_set "${name}" REMOTE_V4 "${remote_v4}"
+  bmeta_set "${name}" CORE_KEY "${prefix}"
+  bmeta_set "${name}" SELF_CORE "${prefix}::1"
+  bmeta_set "${name}" PEER_CORE "${prefix}::2"
+  bmeta_set "${name}" MTU "${mtu}"
+
+  bridge_start_instance "${name}" || return 1
+  echo
+  good "Exit link '${name}' created."
+  info "  iface     : $(bmeta_get "${name}" IFACE)"
+  info "  local v6  : ${prefix}::1"
+  info "  peer  v6  : ${prefix}::2"
+  info "  bridge key: ${prefix}  ${MUT}(use this on the matching Iran link)${RST}"
+  warn "On the Iran node, add an entry link to ${local_v4} with bridge key ${prefix}."
+  bridge_ping_peer "${name}" || true
+}
+
+create_bridge_entry() {
+  rule
+  info "Phormal Bridge — new ENTRY link (this server = iran)"
+  info "Publishes user ports here, forwarding over the SIT link to the exit."
+  rule
+
+  install_engine || return 1
+  apply_tuning fq
+  bridge_install_runtime
+
+  local name; name="$(bridge_pick_name)" || return 1
+  [[ -z "${name}" ]] && { fail "Invalid name."; return 1; }
+  mkdir -p "$(bridge_idir "${name}")"
+
+  local local_v4 remote_v4
+  local_v4="$(ask 'This (Iran/entry) node public IPv4')"
+  remote_v4="$(ask 'Exit (kharej) node public IPv4')"
+  if ! valid_ipv4 "${local_v4}" || ! valid_ipv4 "${remote_v4}"; then
+    fail "Invalid IPv4 address."; rm -rf "$(bridge_idir "${name}")"; return 1
+  fi
+
+  local prefix
+  info "Bridge key — must MATCH the exit link created for this Iran node."
+  prefix="$(ask 'Bridge key')"
+  [[ -z "${prefix}" ]] && { fail "Bridge key is required."; rm -rf "$(bridge_idir "${name}")"; return 1; }
+
+  local mtu
+  mtu="$(ask "Link MTU [Enter for ${DEFAULT_MTU}]")"
+  [[ "${mtu}" =~ ^[0-9]+$ ]] || mtu="${DEFAULT_MTU}"
+
+  local proto pc
+  printf '  %s1%s  tcp   %s2%s  udp   %s3%s  grpc\n' "${ACC}" "${RST}" "${ACC}" "${RST}" "${ACC}" "${RST}"
+  pc="$(ask 'Transport')"
+  case "${pc}" in 1) proto=tcp ;; 2) proto=udp ;; 3) proto=grpc ;; *) proto=tcp ;; esac
+
+  local ports; ports="$(gather_ports)"
+  [[ -z "${ports}" ]] && { fail "No valid ports provided."; rm -rf "$(bridge_idir "${name}")"; return 1; }
+
+  bmeta_set "${name}" ROLE entry
+  bmeta_set "${name}" IFACE "$(bridge_make_iface "${name}")"
+  bmeta_set "${name}" LOCAL_V4 "${local_v4}"
+  bmeta_set "${name}" REMOTE_V4 "${remote_v4}"
+  bmeta_set "${name}" CORE_KEY "${prefix}"
+  bmeta_set "${name}" SELF_CORE "${prefix}::2"
+  bmeta_set "${name}" PEER_CORE "${prefix}::1"
+  bmeta_set "${name}" MTU "${mtu}"
+  bmeta_set "${name}" PROTO "${proto}"
+  bmeta_set "${name}" PORTS "${ports}"
+
+  bridge_start_instance "${name}" || return 1
+  echo
+  good "Entry link '${name}' live — ports: ${ports}"
+  info "  Link target : ${remote_v4} (peer v6 ${prefix}::1)"
+  good "Point users at THIS server's public IP on those ports."
+  bridge_ping_peer "${name}" || true
+}
+
+# ------------------------------------------------------------------------------
+#  Per-link management
+# ------------------------------------------------------------------------------
+bridge_list() {
+  rule
+  info "Phormal Bridge — links"
+  rule
+  local n any=0
+  printf '    %-14s %-6s %-16s %-9s %s\n' "NAME" "ROLE" "PEER IPv4" "STATE" "PORTS"
+  while read -r n; do
+    [[ -n "${n}" ]] || continue
+    any=1
+    printf '    %-14s %-6s %-16s %-9s %s\n' \
+      "${n}" "$(bmeta_get "${n}" ROLE)" "$(bmeta_get "${n}" REMOTE_V4)" \
+      "$(bcore_state "${n}")" "$(bmeta_get "${n}" PORTS || true)"
+  done < <(bridge_instances)
+  [[ ${any} -eq 0 ]] && warn "no bridge links configured yet"
+  rule
+}
+
+bridge_choose_instance() {
+  local names=() n i
+  while read -r n; do [[ -n "${n}" ]] && names+=("${n}"); done < <(bridge_instances)
+  if [[ ${#names[@]} -eq 0 ]]; then warn "No bridge links configured." >&2; printf '%s' ""; return 1; fi
+  {
+    for i in "${!names[@]}"; do
+      printf '  %s%s%s  %s (%s, %s)\n' "${ACC}" "$((i+1))" "${RST}" \
+        "${names[i]}" "$(bmeta_get "${names[i]}" ROLE)" "$(bcore_state "${names[i]}")"
+    done
+  } >&2
+  local sel; sel="$(ask 'Link number')"
+  [[ "${sel}" =~ ^[0-9]+$ ]] || { printf '%s' ""; return 1; }
+  local idx=$((sel-1))
+  [[ ${idx} -ge 0 && ${idx} -lt ${#names[@]} ]] || { printf '%s' ""; return 1; }
+  printf '%s' "${names[idx]}"
+}
+
+bridge_instance_edit_ports() {
+  local name="$1" role ports
+  role="$(bmeta_get "${name}" ROLE)"
+  [[ "${role}" == "entry" ]] || { fail "Ports are only published on entry links."; return 1; }
+  ports="$(bmeta_get "${name}" PORTS)"
+  info "Current ports: ${ports:-none}"
+  printf '  %s1%s  Add port   %s2%s  Remove port   %s3%s  Replace all\n' \
+    "${ACC}" "${RST}" "${ACC}" "${RST}" "${ACC}" "${RST}"
+  local c; c="$(ask 'Action')"
+  case "${c}" in
+    1) local p; p="$(ask 'Port to add')"; [[ "${p}" =~ ^[0-9]+$ ]] || { fail "Invalid port."; return 1; }
+       ports="$(merge_port_list "${ports}" "${p}")" ;;
+    2) local p; p="$(ask 'Port to remove')"; ports="$(remove_port_from_list "${ports}" "${p}")"
+       [[ -z "${ports}" ]] && { fail "Cannot remove the last port."; return 1; } ;;
+    3) ports="$(gather_ports)"; [[ -z "${ports}" ]] && { fail "No valid ports."; return 1; } ;;
+    *) fail "Invalid action."; return 1 ;;
+  esac
+  bmeta_set "${name}" PORTS "${ports}"
+  systemctl restart "$(bfwd_svc "${name}")" 2>/dev/null || true
+  good "Ports for '${name}' now: ${ports}"
+}
+
+bridge_instance_change_peer() {
+  local name="$1" ip
+  ip="$(ask "Peer node IPv4 [$(bmeta_get "${name}" REMOTE_V4)]")"
+  [[ -z "${ip}" ]] && return 0
+  valid_ipv4 "${ip}" || { fail "Invalid IPv4."; return 1; }
+  bmeta_set "${name}" REMOTE_V4 "${ip}"
+  bridge_start_instance "${name}"
+  good "Peer IPv4 for '${name}' updated to ${ip}."
+}
+
+bridge_instance_change_mtu() {
+  local name="$1" mtu iface
+  mtu="$(ask "New MTU [$(bmeta_get "${name}" MTU)] (try ${DEFAULT_MTU}, then 1280)")"
+  [[ "${mtu}" =~ ^[0-9]+$ ]] || { fail "Not a number."; return 1; }
+  bmeta_set "${name}" MTU "${mtu}"
+  iface="$(bmeta_get "${name}" IFACE)"
+  ip link set dev "${iface}" mtu "${mtu}" 2>/dev/null || true
+  bridge_start_instance "${name}"
+  good "MTU for '${name}' set to ${mtu}."
+}
+
+bridge_instance_change_key() {
+  local name="$1" k
+  warn "The bridge key must be identical on both ends of this link."
+  k="$(ask "Bridge key [$(bmeta_get "${name}" CORE_KEY)]")"
+  [[ -z "${k}" ]] && return 0
+  local role suffix peersuffix
+  role="$(bmeta_get "${name}" ROLE)"
+  if [[ "${role}" == "exit" ]]; then suffix="::1"; peersuffix="::2"; else suffix="::2"; peersuffix="::1"; fi
+  bmeta_set "${name}" CORE_KEY "${k}"
+  bmeta_set "${name}" SELF_CORE "${k}${suffix}"
+  bmeta_set "${name}" PEER_CORE "${k}${peersuffix}"
+  bridge_start_instance "${name}"
+  good "Bridge key for '${name}' updated."
+}
+
+bridge_instance_edit_raw() {
+  local name="$1" dir; dir="$(bridge_idir "${name}")"
+  info "  ${dir}/meta.conf"
+  local c; c="$(ask 'Edit meta now? (y/n)')"
+  [[ "${c}" == "y" ]] && ${EDITOR:-nano} "${dir}/meta.conf"
+  local r; r="$(ask 'Restart link to apply? (y/n)')"
+  [[ "${r}" == "y" ]] && bridge_start_instance "${name}"
+}
+
+bridge_instance_delete() {
+  local name="$1"
+  local c; c="$(ask "Delete bridge link '${name}' permanently? (y/n)")"
+  [[ "${c}" != "y" ]] && { info "Cancelled."; return 0; }
+  systemctl stop    "$(bfwd_svc "${name}")"  2>/dev/null || true
+  systemctl disable "$(bfwd_svc "${name}")"  2>/dev/null || true
+  systemctl stop    "$(bguard_svc "${name}")" 2>/dev/null || true
+  systemctl disable "$(bguard_svc "${name}")" 2>/dev/null || true
+  systemctl stop    "$(bcore_svc "${name}")" 2>/dev/null || true
+  systemctl disable "$(bcore_svc "${name}")" 2>/dev/null || true
+  ip link del "$(bmeta_get "${name}" IFACE)" 2>/dev/null || true
+  rm -rf "$(bridge_idir "${name}")"
+  systemctl daemon-reload
+  good "Bridge link '${name}' deleted."
+}
+
+bridge_instance_speedtest() {
+  install_speed_tool || return 1
+  local name="$1" role self peer
+  role="$(bmeta_get "${name}" ROLE)"
+  self="$(bmeta_get "${name}" SELF_CORE)"
+  peer="$(bmeta_get "${name}" PEER_CORE)"
+  rule
+  info "Speedtest for link '${name}' — run step 1 on exit, step 2 on entry (~30s apart)."
+  rule
+  printf '  %s1%s  This is the EXIT — start listener\n' "${ACC}" "${RST}"
+  printf '  %s2%s  This is the ENTRY — run test\n' "${ACC}" "${RST}"
+  local step; step="$(ask 'Step')"
+  case "${step}" in
+    1) info "Listening on ${self}:${PHORMAL_SPEED_PORT}…"
+       iperf3 -s -B "${self}" -p "${PHORMAL_SPEED_PORT}" -1 || { fail "Speed listener failed."; return 1; } ;;
+    2) warn "Step 1 must be running on the exit node first."
+       local ready; ready="$(ask 'Exit listener running? (y/n)')"
+       [[ "${ready}" =~ ^[Yy] ]] || { info "Cancelled."; return 0; }
+       info "Testing to ${peer}:${PHORMAL_SPEED_PORT} for 10s…"
+       iperf3 -c "${peer}" -p "${PHORMAL_SPEED_PORT}" -t 10 -f m \
+         || { fail "Speedtest failed — is step 1 still running on the exit?"; return 1; } ;;
+    *) fail "Invalid step." ;;
+  esac
+}
+
+manage_bridge_instance_menu() {
+  local name="$1"
+  while :; do
+    rule
+    info "Manage link '${name}'  (${MUT}$(bmeta_get "${name}" ROLE) • core $(bcore_state "${name}")${RST})"
+    rule
+    printf '  %s1%s  Restart\n'                  "${ACC}" "${RST}"
+    printf '  %s2%s  Stop\n'                     "${ACC}" "${RST}"
+    printf '  %s3%s  Start\n'                    "${ACC}" "${RST}"
+    printf '  %s4%s  Ping peer / status\n'       "${ACC}" "${RST}"
+    printf '  %s5%s  Live log (Ctrl-C to exit)\n' "${ACC}" "${RST}"
+    printf '  %s6%s  Edit ports (entry only)\n'  "${ACC}" "${RST}"
+    printf '  %s7%s  Change peer IPv4\n'         "${ACC}" "${RST}"
+    printf '  %s8%s  Change MTU\n'               "${ACC}" "${RST}"
+    printf '  %s9%s  Change bridge key\n'        "${ACC}" "${RST}"
+    printf ' %s10%s  Speedtest\n'                "${ACC}" "${RST}"
+    printf ' %s11%s  Edit raw meta\n'            "${ACC}" "${RST}"
+    printf ' %s12%s  Delete link\n'              "${ACC}" "${RST}"
+    printf '  %s0%s  Back\n\n'                   "${ACC}" "${RST}"
+    local c; c="$(ask 'Select')"; echo
+    case "${c}" in
+      1) bridge_start_instance "${name}" || true ;;
+      2) systemctl stop "$(bcore_svc "${name}")" "$(bguard_svc "${name}")" "$(bfwd_svc "${name}")" 2>/dev/null && good "Stopped." || good "Stopped." ;;
+      3) bridge_start_instance "${name}" || true ;;
+      4) bridge_ping_peer "${name}" || true ;;
+      5) journalctl -u "$(bcore_svc "${name}")" -u "$(bfwd_svc "${name}")" -f --no-pager 2>/dev/null || true ;;
+      6) bridge_instance_edit_ports "${name}" || true ;;
+      7) bridge_instance_change_peer "${name}" || true ;;
+      8) bridge_instance_change_mtu "${name}" || true ;;
+      9) bridge_instance_change_key "${name}" || true ;;
+      10) bridge_instance_speedtest "${name}" || true ;;
+      11) bridge_instance_edit_raw "${name}" || true ;;
+      12) bridge_instance_delete "${name}"; break ;;
+      0) break ;;
+      *) fail "Invalid selection." ;;
+    esac
+    echo
   done
-
-  good "Phormal Bridge publisher live."
 }
 
-redeploy_bridge_publisher() {
-  local peer proto ports
-  peer="$(conf_get PEER_CORE)"
-  proto="$(conf_get BRIDGE_PROTO)"
-  ports="$(conf_get BRIDGE_PORTS)"
-  [[ -z "${peer}" || -z "${ports}" ]] && { fail "Phormal Bridge publisher not configured."; return 1; }
-  [[ -z "${proto}" ]] && proto="tcp"
-  apply_bridge_publisher "${peer}" "${proto}" "${ports}"
+manage_bridge_menu() {
+  while :; do
+    bridge_list
+    printf '  %s1%s  Manage a link\n'    "${ACC}" "${RST}"
+    printf '  %s2%s  Add exit link\n'    "${ACC}" "${RST}"
+    printf '  %s3%s  Add entry link\n'   "${ACC}" "${RST}"
+    printf '  %s4%s  Restart ALL links\n' "${ACC}" "${RST}"
+    printf '  %s0%s  Back\n\n'           "${ACC}" "${RST}"
+    local c; c="$(ask 'Select')"; echo
+    case "${c}" in
+      1) local n; n="$(bridge_choose_instance)"; [[ -n "${n}" ]] && manage_bridge_instance_menu "${n}" ;;
+      2) create_bridge_exit || true ;;
+      3) create_bridge_entry || true ;;
+      4) local n; while read -r n; do [[ -n "${n}" ]] && bridge_start_instance "${n}" || true; done < <(bridge_instances) ;;
+      0) break ;;
+      *) fail "Invalid selection." ;;
+    esac
+    echo
+  done
 }
+
 # ==============================================================================
 #  PHORMAL RELAY  (multi-instance)
 #
@@ -1221,123 +1506,6 @@ relay_speedtest() {
   esac
 }
 
-# ==============================================================================
-#  BRIDGE — management (unchanged)
-# ==============================================================================
-bridge_rewrite_config() {
-  info "  ${PHORMAL_CONF}"
-  info "  ${CORE_UP_SCRIPT}"
-  local c; c="$(ask 'Open main config in editor? (y/n)')"
-  [[ "${c}" == "y" ]] && ${EDITOR:-nano} "${PHORMAL_CONF}"
-  local r; r="$(ask 'Rebuild from config and restart? (y/n)')"
-  [[ "${r}" == "y" ]] && bridge_rebuild_from_conf
-}
-
-bridge_rebuild_from_conf() {
-  local local_v4 remote_v4 self_core peer_core mtu
-  local_v4="$(conf_get LOCAL_V4)"
-  remote_v4="$(conf_get REMOTE_V4)"
-  self_core="$(conf_get SELF_CORE)"
-  peer_core="$(conf_get PEER_CORE)"
-  mtu="$(conf_get CORE_MTU)"; mtu="${mtu:-${DEFAULT_MTU}}"
-  [[ -z "${local_v4}" || -z "${remote_v4}" || -z "${self_core}" || -z "${peer_core}" ]] \
-    && { fail "Bridge link incomplete in config."; return 1; }
-  write_core_files "${local_v4}" "${remote_v4}" "${self_core}" "${peer_core}" "${mtu}"
-  systemctl restart phormal-core.service phormal-guard.service 2>/dev/null || true
-  redeploy_bridge_publisher 2>/dev/null || true
-  good "Phormal Bridge rebuilt from config."
-}
-
-bridge_change_addresses() {
-  local lv rv
-  lv="$(ask "This node IP [$(conf_get LOCAL_V4)]")"
-  rv="$(ask "Peer node IP [$(conf_get REMOTE_V4)]")"
-  [[ -n "${lv}" ]] && conf_set LOCAL_V4 "${lv}"
-  [[ -n "${rv}" ]] && conf_set REMOTE_V4 "${rv}"
-  bridge_rebuild_from_conf
-}
-
-bridge_add_port() {
-  local ports new
-  ports="$(conf_get BRIDGE_PORTS)"
-  new="$(ask 'Port to add')"
-  [[ "${new}" =~ ^[0-9]+$ ]] || { fail "Invalid port."; return 1; }
-  conf_set BRIDGE_PORTS "$(merge_port_list "${ports}" "${new}")"
-  redeploy_bridge_publisher
-}
-
-bridge_remove_port() {
-  local ports rem
-  ports="$(conf_get BRIDGE_PORTS)"
-  info "Current ports: ${ports:-none}"
-  rem="$(ask 'Port to remove')"
-  ports="$(remove_port_from_list "${ports}" "${rem}")"
-  [[ -z "${ports}" ]] && { fail "Cannot remove last port."; return 1; }
-  conf_set BRIDGE_PORTS "${ports}"
-  redeploy_bridge_publisher
-}
-
-bridge_speedtest() {
-  install_speed_tool || return 1
-  rule
-  info "Phormal Bridge — speedtest"
-  info "Order: run step 1 on exit, then step 2 on entry (within ~30s)."
-  rule
-  printf '  %s1%s  Exit node — start listener\n' "${ACC}" "${RST}"
-  printf '  %s2%s  Entry node — run test\n' "${ACC}" "${RST}"
-  local step; step="$(ask 'Step')"
-  case "${step}" in
-    1)
-      local bind; bind="$(conf_get SELF_CORE)"
-      [[ -z "${bind}" ]] && { fail "Configure exit node first."; return 1; }
-      info "Listening on ${bind}:${PHORMAL_SPEED_PORT}…"
-      iperf3 -s -B "${bind}" -p "${PHORMAL_SPEED_PORT}" -1 || { fail "Speed listener failed."; return 1; }
-      ;;
-    2)
-      local peer; peer="$(conf_get PEER_CORE)"
-      [[ -z "${peer}" ]] && { fail "Configure entry node first."; return 1; }
-      warn "Step 1 must be running on the exit node before you continue."
-      local ready; ready="$(ask 'Exit listener running? (y/n)')"
-      [[ "${ready}" =~ ^[Yy] ]] || { info "Cancelled."; return 0; }
-      info "Testing to ${peer}:${PHORMAL_SPEED_PORT} for 10s…"
-      iperf3 -c "${peer}" -p "${PHORMAL_SPEED_PORT}" -t 10 -f m \
-        || { fail "Speedtest failed — is step 1 still running on the exit node?"; return 1; }
-      ;;
-    *) fail "Invalid step." ;;
-  esac
-}
-
-manage_bridge_menu() {
-  grep -qE '^PEER_CORE=' "${PHORMAL_CONF}" 2>/dev/null || { fail "Phormal Bridge not deployed."; return 1; }
-  while :; do
-    rule
-    info "Phormal Bridge — manage"
-    rule
-    printf '  %s1%s  Restart services\n' "${ACC}" "${RST}"
-    printf '  %s2%s  Rewrite config files\n' "${ACC}" "${RST}"
-    printf '  %s3%s  Rebuild link from config\n' "${ACC}" "${RST}"
-    printf '  %s4%s  Add port\n' "${ACC}" "${RST}"
-    printf '  %s5%s  Remove port\n' "${ACC}" "${RST}"
-    printf '  %s6%s  Change node addresses\n' "${ACC}" "${RST}"
-    printf '  %s7%s  Speedtest\n' "${ACC}" "${RST}"
-    printf '  %s0%s  Back\n\n' "${ACC}" "${RST}"
-    local c; c="$(ask 'Select')"
-    echo
-    case "${c}" in
-      1) restart_bridge_services ;;
-      2) bridge_rewrite_config ;;
-      3) bridge_rebuild_from_conf ;;
-      4) bridge_add_port ;;
-      5) bridge_remove_port ;;
-      6) bridge_change_addresses ;;
-      7) bridge_speedtest ;;
-      0) break ;;
-      *) fail "Invalid selection." ;;
-    esac
-    echo
-  done
-}
-
 # ------------------------------------------------------------------------------
 #  OPS
 # ------------------------------------------------------------------------------
@@ -1348,8 +1516,9 @@ schedule_refresh() {
     cat > /usr/bin/phormal-refresh.sh <<'EOF'
 #!/usr/bin/env bash
 systemctl daemon-reload
-systemctl restart 'phormal-fwd@*.service' 2>/dev/null || true
-systemctl restart phormal-guard.service 2>/dev/null || true
+systemctl restart 'phormal-core@*.service'  2>/dev/null || true
+systemctl restart 'phormal-guard@*.service' 2>/dev/null || true
+systemctl restart 'phormal-bfwd@*.service'  2>/dev/null || true
 systemctl restart 'phormal-relay@*.service' 2>/dev/null || true
 EOF
     chmod +x /usr/bin/phormal-refresh.sh
@@ -1363,37 +1532,20 @@ EOF
 
 status() {
   rule
-  info "BRIDGE"
-  if grep -qE '^PEER_CORE=' "${PHORMAL_CONF}" 2>/dev/null; then
-    local role self peer mtu
-    role="$(conf_get ROLE)"; self="$(conf_get SELF_CORE)"; peer="$(conf_get PEER_CORE)"; mtu="$(conf_get CORE_MTU)"
-    printf '    role    : %s\n' "${role:-?}"
-    [[ -n "${self}" ]] && printf '    local   : %s\n' "${self}"
-    [[ -n "${peer}" ]] && printf '    peer    : %s\n' "${peer}"
-    [[ -n "${mtu}"  ]] && printf '    mtu     : %s\n' "${mtu}"
-    if [[ -n "${peer}" ]]; then
-      local rx
-      rx="$(ping6 -c5 -i0.3 -W2 "${peer}" 2>/dev/null | grep -oE '[0-9]+ received' | grep -oE '^[0-9]+' || echo 0)"
-      if [[ "${rx:-0}" -gt 0 ]]; then good "peer reachable (${rx}/5)"; else warn "peer unreachable (0/5)"; fi
-    fi
-  else
-    warn "no Bridge link configured"
-  fi
+  info "BRIDGE LINKS"
+  local bany=0 bn
+  while read -r bn; do
+    [[ -n "${bn}" ]] || continue
+    bany=1
+    printf '    %-14s %-6s peer %-16s %s\n' \
+      "${bn}" "$(bmeta_get "${bn}" ROLE)" "$(bmeta_get "${bn}" REMOTE_V4)" "$(bcore_state "${bn}")"
+  done < <(bridge_instances)
+  [[ ${bany} -eq 0 ]] && warn "no bridge links configured"
   echo
   info "PHORMAL TUNING"
   printf '    profile : %s / %s\n' \
     "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')" \
     "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
-  echo
-  info "BRIDGE FORWARDERS"
-  local found=0 u name st
-  for u in /etc/systemd/system/phormal-fwd@*.service; do
-    [[ -e "${u}" ]] || continue
-    found=1; name="$(basename "${u}" .service)"
-    st="$(systemctl is-active "${name}" 2>/dev/null || echo unknown)"
-    printf '    %-22s : %s\n' "${name}" "${st}"
-  done
-  [[ ${found} -eq 0 ]] && warn "no forwarder workers configured"
   echo
   info "RELAY TUNNELS"
   local any=0 n
@@ -1412,7 +1564,16 @@ status() {
 purge() {
   local c; c="$(ask 'Remove Phormal entirely? (y/n)')"
   [[ "${c}" != "y" ]] && { info "Cancelled."; return; }
-  # bridge forwarders
+  local n
+  # bridge links (new multi-instance templates)
+  while read -r n; do
+    [[ -n "${n}" ]] || continue
+    systemctl stop    "$(bfwd_svc "${n}")"  "$(bguard_svc "${n}")" "$(bcore_svc "${n}")" 2>/dev/null || true
+    systemctl disable "$(bfwd_svc "${n}")"  "$(bguard_svc "${n}")" "$(bcore_svc "${n}")" 2>/dev/null || true
+    ip link del "$(bmeta_get "${n}" IFACE)" 2>/dev/null || true
+  done < <(bridge_instances)
+  rm -f "${BCORE_TMPL}" "${BGUARD_TMPL}" "${BFWD_TMPL}" "${BRIDGE_RUN}"
+  # legacy bridge forwarders / single units
   for u in /etc/systemd/system/phormal-fwd@*.service; do
     [[ -e "${u}" ]] || continue
     local nm; nm="$(basename "${u}")"
@@ -1420,8 +1581,11 @@ purge() {
     systemctl disable "${nm}" 2>/dev/null || true
   done
   rm -f /etc/systemd/system/phormal-fwd@*.service
-  # relay instances (new template)
-  local n
+  systemctl stop phormal-core.service phormal-guard.service 2>/dev/null || true
+  systemctl disable phormal-core.service phormal-guard.service 2>/dev/null || true
+  rm -f "${CORE_UNIT}" "${GUARD_UNIT}"
+  ip link del "${CORE_IFACE}" 2>/dev/null || true
+  # relay instances (template)
   while read -r n; do
     [[ -n "${n}" ]] || continue
     systemctl stop "$(relay_svc "${n}")" 2>/dev/null || true
@@ -1432,16 +1596,10 @@ purge() {
   systemctl stop phormal-relay.service phormal-hysteria.service 2>/dev/null || true
   systemctl disable phormal-relay.service phormal-hysteria.service 2>/dev/null || true
   rm -f "${RELAY_UNIT}" /etc/systemd/system/phormal-hysteria.service
-  # bridge core/guard
-  for s in phormal-guard phormal-core; do
-    systemctl stop "${s}.service" 2>/dev/null || true
-    systemctl disable "${s}.service" 2>/dev/null || true
-  done
-  ip link del "${CORE_IFACE}" 2>/dev/null || true
-  rm -f "${CORE_UNIT}" "${GUARD_UNIT}" /etc/sysctl.d/99-phormal.conf \
+  rm -f /etc/sysctl.d/99-phormal.conf \
     /etc/sysctl.d/98-phormal-tuning.conf /etc/sysctl.d/98-phormal-bbr.conf \
     "${RELAY_SYSCTL}" /etc/sysctl.d/97-phormal-hysteria.conf /etc/sysctl.d/97-phormal-relay.conf
-  rm -f "${RELAY_BIN}" /usr/local/bin/phormal-hy2
+  rm -f "${RELAY_BIN}" /usr/local/bin/phormal-hy2 "${FWD_BIN}"
   rm -f /usr/bin/phormal-refresh.sh
   crontab -l 2>/dev/null | grep -v 'phormal-refresh' | crontab - 2>/dev/null || true
   rm -rf "${PHORMAL_HOME}"
@@ -1449,19 +1607,7 @@ purge() {
   good "Phormal removed. (CLI shortcut left at ${CLI_LINK}; delete manually if desired.)"
 }
 
-quick_deploy_bridge() {
-  deploy_bridge_core || { fail "Bridge step failed."; return; }
-  local role; role="$(conf_get ROLE)"
-  if [[ "${role}" == "exit" ]]; then
-    echo
-    info "Exit node ready — run your service on the ports you will publish."
-    info "Deploy the entry node next to expose them."
-  else
-    echo
-    local g; g="$(ask 'Publish ports now? (y/n)')"
-    [[ "${g}" == "y" ]] && deploy_bridge_forwarder
-  fi
-}
+quick_deploy_bridge() { create_bridge_entry; }
 
 install_cli() {
   local src; src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
@@ -1476,11 +1622,11 @@ install_cli() {
 menu() {
   while :; do
     banner
-    printf '  %sPHORMAL BRIDGE%s\n' "${BOLD}" "${RST}"
-    printf '    %s1%s  Quick deploy\n' "${ACC}" "${RST}"
-    printf '    %s2%s  Link only\n' "${ACC}" "${RST}"
-    printf '    %s3%s  Port publisher only\n' "${ACC}" "${RST}"
-    printf '    %s4%s  Manage\n' "${ACC}" "${RST}"
+    printf '  %sPHORMAL BRIDGE%s  %s(multi-tunnel)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '    %s1%s  Add exit link\n' "${ACC}" "${RST}"
+    printf '    %s2%s  Add entry link\n' "${ACC}" "${RST}"
+    printf '    %s3%s  Manage links\n' "${ACC}" "${RST}"
+    printf '    %s4%s  Speedtest\n' "${ACC}" "${RST}"
     printf '\n  %sPHORMAL RELAY%s  %s(multi-tunnel)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
     printf '    %s5%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '    %s6%s  Add entry tunnel\n' "${ACC}" "${RST}"
@@ -1489,27 +1635,25 @@ menu() {
     printf '\n  %sMANAGE%s\n' "${BOLD}" "${RST}"
     printf '    %s9%s  Status\n' "${ACC}" "${RST}"
     printf '   %s10%s  Phormal tuning\n' "${ACC}" "${RST}"
-    printf '   %s11%s  Adjust Bridge MTU\n' "${ACC}" "${RST}"
-    printf '   %s12%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
-    printf '   %s13%s  Uninstall\n' "${ACC}" "${RST}"
+    printf '   %s11%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
+    printf '   %s12%s  Uninstall\n' "${ACC}" "${RST}"
     printf '    %s0%s  Exit\n\n' "${ACC}" "${RST}"
 
     local choice; choice="$(ask 'Select')"
     echo
     case "${choice}" in
-      1) quick_deploy_bridge || true ;;
-      2) deploy_bridge_core || true ;;
-      3) deploy_bridge_forwarder || true ;;
-      4) manage_bridge_menu || true ;;
+      1) create_bridge_exit || true ;;
+      2) create_bridge_entry || true ;;
+      3) manage_bridge_menu || true ;;
+      4) local bn; bn="$(bridge_choose_instance)"; [[ -n "${bn}" ]] && bridge_instance_speedtest "${bn}" || true ;;
       5) create_exit_tunnel || true ;;
       6) create_entry_tunnel || true ;;
       7) manage_relay_menu || true ;;
       8) relay_speedtest || true ;;
       9) status || true ;;
       10) tune_menu || true ;;
-      11) retune_mtu || true ;;
-      12) schedule_refresh || true ;;
-      13) purge || true ;;
+      11) schedule_refresh || true ;;
+      12) purge || true ;;
       0) good "Goodbye — @SchmitzWS"; exit 0 ;;
       *) fail "Invalid selection." ;;
     esac
