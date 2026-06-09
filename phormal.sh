@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="3.2.9"
+readonly PHORMAL_VERSION="3.3.0"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -124,8 +124,8 @@ gost_upstream_tarball_url() {
 }
 
 hysteria_upstream_url() {
-  local enc="${HYSTERIA_RELEASE_TAG//\//%2F}"
-  printf 'https://github.com/apernet/hysteria/releases/download/%s/hysteria-linux-%s' "${enc}" "$1"
+  # GitHub serves release assets at the literal tag path (app/v2.9.2), NOT url-encoded
+  printf 'https://github.com/apernet/hysteria/releases/download/%s/hysteria-linux-%s' "${HYSTERIA_RELEASE_TAG}" "$1"
 }
 
 install_gost_from_release() {
@@ -411,7 +411,7 @@ bridge_idir() { printf '%s/%s' "${BRIDGE_DIR}" "$1"; }
 bridge_systemd_names() {
   local seen="" u name
   while read -r u; do
-    [[ "${u}" == phormal-core@*.service ]] && continue
+    [[ "${u}" == phormal-core@*.service ]] || continue
     name="${u#phormal-core@}"
     name="${name%.service}"
     [[ -n "${name}" ]] || continue
@@ -642,6 +642,7 @@ case "\${cmd}" in
     while :; do ping6 -c1 -W2 "\${PEER_CORE}" >/dev/null 2>&1 || true; sleep 15; done
     ;;
   fwd)
+    [[ -z "\${PEER_CORE}" ]] && { echo "PEER_CORE empty in meta.conf — refusing to start (would crash gost)" >&2; exit 1; }
     args=()
     IFS=',' read -ra parr <<< "\${PORTS}"
     for p in "\${parr[@]}"; do
