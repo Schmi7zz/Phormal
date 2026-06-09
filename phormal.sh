@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="3.3.1"
+readonly PHORMAL_VERSION="3.3.2"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -428,7 +428,9 @@ bridge_systemd_names() {
 
 bridge_legacy_iface() {
   ip link show "${CORE_IFACE}" &>/dev/null && { printf '%s' "${CORE_IFACE}"; return 0; }
-  ip -o link show type sit 2>/dev/null | awk -F': ' '{print $2}' | head -n1
+  # only a genuine legacy SIT iface — never our own phm-* multi-instance links or sit0
+  ip -o link show type sit 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' \
+    | grep -vE '^(phm-|sit0$)' | head -n1
 }
 
 bridge_import_legacy() {
@@ -598,8 +600,21 @@ bcore_state() {
 }
 
 bridge_stop_legacy_procs() {
-  systemctl stop phormal-fwd.service phormal-guard.service phormal-core.service 2>/dev/null || true
+  # stop + disable the old single-instance bridge runtime
+  systemctl stop    phormal-fwd.service phormal-guard.service phormal-core.service 2>/dev/null || true
+  systemctl disable phormal-fwd.service phormal-guard.service phormal-core.service 2>/dev/null || true
+  # old numeric publisher instances (phormal-fwd@0, @1 …) — NOT the new phormal-bfwd@
+  systemctl stop    'phormal-fwd@*.service' 2>/dev/null || true
+  systemctl disable 'phormal-fwd@*.service' 2>/dev/null || true
   pkill -f "${FWD_BIN}" 2>/dev/null || true
+  # remove the old unit files + flat config + legacy iface so the importer can't resurrect it
+  rm -f /etc/systemd/system/phormal-core.service \
+        /etc/systemd/system/phormal-guard.service \
+        /etc/systemd/system/phormal-fwd.service \
+        /etc/systemd/system/phormal-fwd@*.service \
+        "${CORE_UP_SCRIPT}" "${PHORMAL_CONF}"
+  ip link del "${CORE_IFACE}" 2>/dev/null || true
+  systemctl daemon-reload
   sleep 1
 }
 
@@ -979,6 +994,12 @@ bridge_instance_delete() {
   local name="$1"
   local c; c="$(ask "Delete bridge link '${name}' permanently? (y/n)")"
   [[ "${c}" != "y" ]] && { info "Cancelled."; return 0; }
+  # if this link is still a legacy single-instance setup, fully purge it first,
+  # otherwise the legacy importer re-creates it on the next menu view
+  if [[ "$(bmeta_get "${name}" LEGACY)" == "1" ]] || bridge_link_running_legacy "${name}"; then
+    info "Removing legacy single-instance runtime for '${name}'…"
+    bridge_stop_legacy_procs
+  fi
   systemctl stop    "$(bfwd_svc "${name}")"  2>/dev/null || true
   systemctl disable "$(bfwd_svc "${name}")"  2>/dev/null || true
   systemctl stop    "$(bguard_svc "${name}")" 2>/dev/null || true
