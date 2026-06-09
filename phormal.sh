@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="3.1.1"
+readonly PHORMAL_VERSION="3.1.2"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -1497,19 +1497,19 @@ menu() {
     local choice; choice="$(ask 'Select')"
     echo
     case "${choice}" in
-      1) quick_deploy_bridge ;;
-      2) deploy_bridge_core ;;
-      3) deploy_bridge_forwarder ;;
-      4) manage_bridge_menu ;;
-      5) create_exit_tunnel ;;
-      6) create_entry_tunnel ;;
-      7) manage_relay_menu ;;
-      8) relay_speedtest ;;
-      9) status ;;
-      10) tune_menu ;;
-      11) retune_mtu ;;
-      12) schedule_refresh ;;
-      13) purge ;;
+      1) quick_deploy_bridge || true ;;
+      2) deploy_bridge_core || true ;;
+      3) deploy_bridge_forwarder || true ;;
+      4) manage_bridge_menu || true ;;
+      5) create_exit_tunnel || true ;;
+      6) create_entry_tunnel || true ;;
+      7) manage_relay_menu || true ;;
+      8) relay_speedtest || true ;;
+      9) status || true ;;
+      10) tune_menu || true ;;
+      11) retune_mtu || true ;;
+      12) schedule_refresh || true ;;
+      13) purge || true ;;
       0) good "Goodbye — @SchmitzWS"; exit 0 ;;
       *) fail "Invalid selection." ;;
     esac
