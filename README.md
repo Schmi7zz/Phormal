@@ -1,53 +1,50 @@
-<h1 align="center">Phormal Tunnel</h1>
+<h1 align="center">🌀 Phormal Tunnel</h1>
 
 <p align="center">
   <em>A fast, resilient tunneling layer for bridging two servers across hostile networks.</em>
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-2.1.3-7aa2f7">
-  <img alt="platform" src="https://img.shields.io/badge/platform-Linux-78dba9">
-  <img alt="shell" src="https://img.shields.io/badge/made%20with-Bash-f7768e">
-  <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-c0caf5">
+  <img alt="version" src="https://img.shields.io/badge/version-3.1.1-7aa2f7?style=flat-square">
+  <img alt="platform" src="https://img.shields.io/badge/platform-Linux-78dba9?style=flat-square">
+  <img alt="shell" src="https://img.shields.io/badge/made%20with-Bash-f7768e?style=flat-square">
+  <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-c0caf5?style=flat-square">
 </p>
 
 <p align="center">
   <a href="https://github.com/Schmi7zz">GitHub</a> ·
-  <a href="https://t.me/SchmitzWS">Telegram</a>
+  <a href="https://t.me/SchmitzWS">Telegram</a> ·
+  <a href="./README.fa.md">🇮🇷 فارسی</a>
 </p>
 
 ---
 
-## Overview
+## ✨ What is Phormal?
 
-**Phormal** connects an **entry node** (restricted / local uplink) to an **exit node** (clean foreign uplink), then publishes your service ports so end users connect to the **entry node's public IP** — not the exit.
+**Phormal** connects an **entry node** (restricted / local uplink) to an **exit node** (clean foreign uplink), then publishes your service ports so end users connect to the **entry node's public IP** — never the exit.
 
 Two modes are built in:
 
 | Mode | Best for | How it works |
 | ---- | -------- | ------------ |
-| **Phormal Bridge** | Stable paths between nodes | Private SIT IPv6 link + port publisher |
-| **Phormal Relay** | Lossy, filtered, or congested paths | QUIC-based relay with obfuscation |
+| 🌉 **Phormal Bridge** | Stable paths between nodes | Private SIT IPv6 link + port publisher |
+| 🛰️ **Phormal Relay** | Lossy, filtered, or congested paths | QUIC tunnel with Salamander obfuscation |
 
 ```mermaid
 flowchart LR
   subgraph users [End users]
     C[Client]
   end
-
   subgraph entry [Entry node — Iran]
     E[Published ports]
   end
-
   subgraph link [Node link]
     B[Phormal Bridge<br/>SIT + publisher]
     R[Phormal Relay<br/>QUIC tunnel]
   end
-
   subgraph exit [Exit node — Kharej]
     X[Your service<br/>Xray / 3x-ui / etc.]
   end
-
   C --> E
   E --> B
   E --> R
@@ -57,24 +54,34 @@ flowchart LR
 
 ---
 
-## Requirements
+## 🆕 What's new in 3.1.1
 
-- **OS:** Linux (Debian/Ubuntu recommended)
-- **Access:** root (`sudo phormal`)
-- **Nodes:** two servers — one entry, one exit
-- **Network:** UDP reachability between nodes (for Relay link port)
+- **Multi-tunnel Relay.** Every tunnel is now a **named instance** with its own config, ports, credentials, and systemd service (`phormal-relay@<name>.service`).
+  - One Kharej can serve **many** Iran nodes — each Iran box runs its own entry tunnel with its own ports.
+  - One box can host **several tunnels at once** (e.g. entry to three different exits).
+- **Per-tunnel management.** List, restart, stop, start, diagnose, tail live logs, edit ports, change exit IP, change link port, edit credentials, edit raw config, or delete — **each scoped to one tunnel**.
+- **No more "restart on both sides" bug.** The client now connects eagerly and keeps the tunnel warm with keepalive (previously it started lazily and the first handshake often failed). Added `fastOpen` and a short start delay for reliable boot ordering.
 
 ---
 
-## Install
+## ⚙️ Requirements
+
+- **OS:** Linux (Debian / Ubuntu recommended)
+- **Access:** root (`sudo phormal`)
+- **Nodes:** two servers — one entry, one exit
+- **Network:** UDP reachability between nodes (for the Relay link port)
+
+---
+
+## 🚀 Install
+
+**One command** — download, normalise line endings, and launch:
 
 ```bash
-curl -fsSL -o phormal.sh https://raw.githubusercontent.com/Schmi7zz/Phormal/main/phormal.sh
-chmod +x phormal.sh
-sudo ./phormal.sh
+curl -fsSL https://raw.githubusercontent.com/Schmi7zz/Phormal/main/phormal.sh -o phormal.sh && sed -i 's/\r$//' phormal.sh && chmod +x phormal.sh && sudo ./phormal.sh
 ```
 
-After the first run, use the global command:
+After the first run, use the global command anywhere:
 
 ```bash
 sudo phormal
@@ -82,11 +89,40 @@ sudo phormal
 
 ---
 
-## Choose a mode
+## 🛰️ Phormal Relay — recommended for Iran ↔ foreign VPS
 
-### Phormal Bridge
+> One exit (Kharej) tunnel can be shared by **any number** of entry (Iran) tunnels — same link port, same passwords, different user ports per entry.
 
-Use when the path between your servers is **relatively stable** and you want a lightweight private link.
+### 1. On the exit (Kharej) — menu **5** · *Add exit tunnel*
+
+- Give the tunnel a **name** (e.g. `kharej-de`)
+- Choose a **link port** (UDP, e.g. `8531`) — *not* a user port
+- Note the **auth** and **obfuscation** passwords it prints
+- Open the link port in the firewall: `ufw allow 8531/udp`
+- Run your real service (Xray / 3x-ui) locally on the user port (e.g. `5151`)
+
+### 2. On each entry (Iran) — menu **6** · *Add entry tunnel*
+
+- Give it a **name** (e.g. `iran1`)
+- Enter the **exit IP**, the **same link port**, and the **same two passwords**
+- Enter the **user ports** to publish (e.g. `5151`)
+
+### 3. Point users at the entry
+
+```text
+  Client  →  Entry:5151  →  [ QUIC link :8531 ]  →  Exit:5151  →  Xray
+```
+
+| Port type | Example | Who connects |
+| --------- | ------- | ------------ |
+| 🔗 Link port | `8531` | Entry ↔ Exit only (UDP) |
+| 👤 User port | `5151` | Your VPN clients (via **entry IP**) |
+
+**Relay features:** Salamander obfuscation · bandwidth shaping · optional UDP port hopping · BBR + `fq` tuning.
+
+---
+
+## 🌉 Phormal Bridge — for stable paths
 
 1. **Exit node** → menu **1** (Quick deploy) or **2** (Link only)
 2. **Entry node** → same, using the **same bridge key** and peer addresses
@@ -95,65 +131,38 @@ Use when the path between your servers is **relatively stable** and you want a l
 5. Point users at **entry IP : published port**
 
 **Publisher transports:** `tcp` · `udp` · `grpc`
-
 **Defaults:** SIT interface `phormal0`, MTU `1360`, BBR + `fq` tuning, MSS clamping.
 
 ---
 
-### Phormal Relay
+## 🧭 Menu reference
 
-Use when the path is **lossy, filtered, or unreliable** (typical Iran ↔ foreign VPS setups).
-
-1. **Exit node (Kharej)** → menu **6** (Exit node only) or **5** (Quick deploy)
-   - Sets the **link port** (UDP, e.g. `8531`) — not your user port
-   - Run your service locally on the **user port** (e.g. `5151`)
-2. **Entry node (Iran)** → menu **7** (Entry node only) or **5** (Quick deploy)
-   - Enter exit IP, **same link port**, **same auth + obfuscation passwords**
-   - Enter **user ports** to publish (e.g. `5151`)
-3. Point users at **entry IP : user port** — never the exit IP for clients
-
-```text
-  Client  →  Entry:5151  →  [QUIC link :8531]  →  Exit:5151  →  Xray
-```
-
-| Port type | Example | Who connects |
-| --------- | ------- | ------------ |
-| Link port | `8531` | Entry ↔ Exit only (UDP) |
-| User port | `5151` | Your VPN clients |
-
-**Relay features:** Salamander obfuscation, bandwidth shaping, optional UDP port hopping, BBR/fq tuning.
-
----
-
-## Menu reference
-
-### Phormal Bridge
+### 🌉 Phormal Bridge
 
 | # | Action |
 | - | ------ |
 | 1 | Quick deploy — link + optional port publisher |
 | 2 | Link only — SIT tunnel between nodes |
 | 3 | Port publisher only — expose ports to users |
-| 4 | Manage |
+| 4 | Manage — restart · rewrite · rebuild · add/remove ports · change addresses · speedtest |
 
-**Manage (4):** restart · rewrite config · rebuild link · add/remove ports · change addresses · speedtest
-
-### Phormal Relay
+### 🛰️ Phormal Relay (multi-tunnel)
 
 | # | Action |
 | - | ------ |
-| 5 | Quick deploy — pick exit or entry role |
-| 6 | Exit node only |
-| 7 | Entry node only |
-| 8 | Manage |
+| 5 | **Add exit tunnel** (this server = Kharej) |
+| 6 | **Add entry tunnel** (this server = Iran) |
+| 7 | **Manage tunnels** — list / edit / delete / restart each |
+| 8 | Speedtest |
 
-**Manage (8):** restart · rewrite config · reapply settings · add/remove ports · change exit IP · diagnostics · speedtest
+**Manage tunnels (7)** lists every tunnel, then per tunnel offers:
+restart · stop · start · diagnostics · live log · edit ports · change exit IP · change link port · edit auth/obfs/bandwidth · edit raw config · delete.
 
-### Global manage
+### 🛠️ Global
 
 | # | Action |
 | - | ------ |
-| 9 | Status — Bridge link, forwarders, Relay service |
+| 9 | Status — Bridge link, forwarders, and all Relay tunnels |
 | 10 | Phormal tuning — BBR + `fq` (balanced) or `cake` (low-latency) |
 | 11 | Adjust Bridge MTU — live + persistent (try `1360`, then `1280` if uploads stall) |
 | 12 | Auto-refresh schedule — periodic service restart via cron |
@@ -162,110 +171,74 @@ Use when the path is **lossy, filtered, or unreliable** (typical Iran ↔ foreig
 
 ---
 
-## Speedtest
+## 📊 Speedtest
 
-### Bridge
+Two steps, run on **both** nodes within ~30 seconds of each other.
 
-Two steps — run on **both** nodes:
-
-1. **Exit** → Bridge Manage → **7 Speedtest** → step **1** (starts listener)
-2. **Entry** → Bridge Manage → **7 Speedtest** → step **2** (runs test)
-
-Complete step 2 within ~30 seconds of step 1.
-
-### Relay
-
-Two steps — run on **both** nodes:
-
-1. **Exit (Kharej)** → Relay Manage → **8 Speedtest** → step **1** (starts listener)
-2. **Entry (Iran)** → Relay Manage → **8 Speedtest** → step **2** (runs test)
-
-Complete step 2 within ~30 seconds of step 1. Both nodes must keep `phormal-relay` running.
+**Relay:** Exit → menu **8** → step **1** (listener), then Entry → menu **8** → step **2** (test, pick the tunnel).
+**Bridge:** Exit → Bridge Manage → **7** → step **1**, then Entry → step **2**.
 
 ---
 
-## Configuration files
+## 🗂️ Files & services
 
 | Path | Purpose |
 | ---- | ------- |
-| `/etc/phormal/phormal.conf` | Main settings (role, IPs, ports, credentials) |
+| `/etc/phormal/phormal.conf` | Bridge settings |
 | `/etc/phormal/core-up.sh` | Bridge SIT bring-up script |
-| `/etc/phormal/relay/config.yaml` | Relay engine config |
+| `/etc/phormal/relay/<name>/meta.conf` | Per-tunnel settings (role, IP, ports, credentials) |
+| `/etc/phormal/relay/<name>/config.yaml` | Per-tunnel engine config |
+| `/etc/phormal/tls/` | Shared self-signed certificate |
 | `/var/log/phormal.log` | Phormal log file |
-
-**Services**
 
 | Service | Mode |
 | ------- | ---- |
 | `phormal-core.service` | Bridge SIT link |
 | `phormal-guard.service` | Bridge keepalive |
 | `phormal-fwd@*.service` | Bridge port publishers |
-| `phormal-relay.service` | Relay (client or server) |
+| `phormal-relay@<name>.service` | One Relay tunnel each |
 
 ---
 
-## Typical Relay deployment
+## 🩺 Troubleshooting
 
-| | Entry (Iran) | Exit (Kharej) |
-| --- | --- | --- |
-| Role | `entry` | `exit` |
-| Link port | connects to `:8531` | listens UDP `:8531` |
-| User port | publishes `5151` | Xray on TCP `:5151` |
-| Client connects to | **Entry public IP :5151** | — |
+**Clients can't connect (Relay)**
+1. Confirm users use **entry IP + user port** — not the exit IP or link port.
+2. Check both passwords and the link port match on entry and exit.
+3. Restart the **exit first**, then the **entry**.
+4. Run **Manage tunnels → pick tunnel → Diagnostics** on both nodes.
+5. From the entry, test UDP to the exit: `nc -zvu EXIT_IP LINK_PORT`
 
-Credentials (auth + obfuscation) and link port **must match exactly** on both nodes.
+**`connect error: timeout`** — the node link is down, not your VPN config. Make sure the exit tunnel is running and the link UDP port is open.
 
----
+**`connection refused` on the exit** — the tunnel works, but your service isn't listening on that port. Start Xray / 3x-ui on the user port (bind to `0.0.0.0` or `127.0.0.1`).
 
-## Troubleshooting
+**`connection reset by peer` in logs** — usually normal as clients reconnect; ignore if traffic flows.
 
-### Relay: clients cannot connect
+**Bridge: peer unreachable** — bring up the other node with the same bridge key, check **9 Status**, lower MTU via **11** if uploads stall.
 
-1. Confirm users use **entry IP + user port**, not exit IP or link port
-2. Check both passwords and link port match on entry and exit
-3. Restart **exit first**, then **entry:** `systemctl restart phormal-relay`
-4. Run **Relay Manage → 7 Diagnostics** on both nodes
-5. From entry, verify UDP to exit link port: `nc -zvu EXIT_IP LINK_PORT`
-
-### Relay: `connect error: timeout`
-
-The **node link** is down, not your VPN config. Restart both relay services and watch exit logs for activity from the entry IP.
-
-### Relay: `connection reset by peer` in logs
-
-Usually **normal** when VPN clients reconnect or open many parallel connections. Ignore if service works.
-
-### Bridge: peer unreachable
-
-Bring up the other node with the same bridge key, then check **9 Status**. Lower MTU via **11** if uploads stall.
-
-### View logs
-
+**View logs**
 ```bash
-journalctl -u phormal-relay -f
+journalctl -u 'phormal-relay@*' -f
 journalctl -u phormal-core -f
 journalctl -u 'phormal-fwd@*' -f
 ```
 
 ---
 
-## Updating
+## 🔄 Updating
 
 ```bash
-curl -fsSL -o /usr/local/bin/phormal https://raw.githubusercontent.com/Schmi7zz/Phormal/main/phormal.sh
-chmod +x /usr/local/bin/phormal
-sudo phormal
+curl -fsSL https://raw.githubusercontent.com/Schmi7zz/Phormal/main/phormal.sh -o /usr/local/bin/phormal && sed -i 's/\r$//' /usr/local/bin/phormal && chmod +x /usr/local/bin/phormal && sudo phormal
 ```
-
-After updating, use **Rewrite config** or **Reapply settings** in the relevant Manage menu if prompted.
 
 ---
 
-## Credits
+## 🙌 Credits
 
 - **Author:** [Schmi7z](https://github.com/Schmi7zz)
 - **Channel:** [@SchmitzWS](https://t.me/SchmitzWS)
 
-## License
+## 📄 License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+GPL-3.0 — see [LICENSE](LICENSE.txt).

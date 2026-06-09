@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="2.1.3"
+readonly PHORMAL_VERSION="3.1.1"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -512,9 +512,25 @@ redeploy_bridge_publisher() {
   [[ -z "${proto}" ]] && proto="tcp"
   apply_bridge_publisher "${peer}" "${proto}" "${ports}"
 }
+# ==============================================================================
+#  PHORMAL RELAY  (multi-instance)
+#
+#  Each tunnel is a named instance living in:   /etc/phormal/relay/<name>/
+#    - meta.conf      key=val metadata for this tunnel
+#    - config.yaml    hysteria config for this tunnel
+#  Service per tunnel: phormal-relay@<name>.service  (systemd template unit)
+#  One server (exit/kharej) instance can serve many entry (iran) instances.
+#  One box can host many instances at once (e.g. entry to 3 different exits).
+# ==============================================================================
+readonly RELAY_DIR="${PHORMAL_HOME}/relay"
+readonly RELAY_TLS_DIR="${PHORMAL_HOME}/tls"
+readonly RELAY_TEMPLATE_UNIT="/etc/systemd/system/phormal-relay@.service"
+readonly RELAY_RUN="/usr/local/bin/phormal-relay-run"
+
+shopt -s nullglob
 
 # ------------------------------------------------------------------------------
-#  PHORMAL RELAY
+#  Engine install / TLS / buffers
 # ------------------------------------------------------------------------------
 install_relay_engine() {
   if [[ -x "${RELAY_BIN}" ]] && "${RELAY_BIN}" version >/dev/null 2>&1; then
@@ -522,7 +538,7 @@ install_relay_engine() {
     return 0
   fi
   info "Installing Phormal Relay engine…"
-  apt_install_quiet curl wget ca-certificates openssl
+  apt_install_quiet curl wget ca-certificates openssl libcap2-bin
 
   local arch urls url
   arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
@@ -552,8 +568,8 @@ install_relay_engine() {
 }
 
 gen_relay_tls() {
-  mkdir -p "${RELAY_HOME}"
-  local cert="${RELAY_HOME}/cert.crt" key="${RELAY_HOME}/cert.key"
+  mkdir -p "${RELAY_TLS_DIR}"
+  local cert="${RELAY_TLS_DIR}/cert.crt" key="${RELAY_TLS_DIR}/cert.key"
   [[ -f "${cert}" && -f "${key}" ]] && return 0
   info "Generating self-signed TLS certificate…"
   openssl req -x509 -nodes -newkey rsa:2048 \
@@ -576,15 +592,8 @@ EOF
   good "Network buffer tuning applied."
 }
 
-port_open_tcp() {
-  local port="$1"
-  ss -H -tln 2>/dev/null | grep -qE ":${port}([^0-9]|$)"
-}
-
-port_open_udp() {
-  local port="$1"
-  ss -H -ulnp 2>/dev/null | grep -qE ":${port}([^0-9]|$)"
-}
+port_open_tcp() { ss -H -tln 2>/dev/null | grep -qE ":${1}([^0-9]|$)"; }
+port_open_udp() { ss -H -uln 2>/dev/null | grep -qE ":${1}([^0-9]|$)"; }
 
 relay_engine_block() {
   cat <<'EOF'
@@ -599,91 +608,79 @@ quic:
 EOF
 }
 
-gather_relay_credentials() {
-  local suggested_auth suggested_obfs saved=0
-  suggested_auth="$(rand_secret)"
-  suggested_obfs="$(rand_secret)"
+# ------------------------------------------------------------------------------
+#  Instance registry helpers
+# ------------------------------------------------------------------------------
+relay_idir() { printf '%s/%s' "${RELAY_DIR}" "$1"; }
 
-  if [[ -n "$(conf_get RELAY_AUTH)" ]]; then
-    RELAY_AUTH="$(conf_get RELAY_AUTH)"
-    RELAY_OBFS="$(conf_get RELAY_OBFS)"
-    saved=1
-  elif [[ -n "$(conf_get HY2_AUTH)" ]]; then
-    RELAY_AUTH="$(conf_get HY2_AUTH)"
-    RELAY_OBFS="$(conf_get HY2_OBFS)"
-    saved=1
-  fi
-
-  if [[ ${saved} -eq 1 ]]; then
-    warn "Saved credentials found — they must match the other node exactly."
-    info "  Auth : ${BOLD}${RELAY_AUTH}${RST}"
-    info "  Obfs : ${BOLD}${RELAY_OBFS}${RST}"
-    local keep; keep="$(ask 'Use these? (y/n)')"
-    [[ "${keep}" == "y" ]] && return 0
-  fi
-
-  info "Auth password. Suggested: ${BOLD}${suggested_auth}${RST}"
-  RELAY_AUTH="$(ask 'Auth password [Enter for suggested]')"
-  RELAY_AUTH="${RELAY_AUTH:-${suggested_auth}}"
-
-  info "Obfuscation password. Suggested: ${BOLD}${suggested_obfs}${RST}"
-  RELAY_OBFS="$(ask 'Obfuscation password [Enter for suggested]')"
-  RELAY_OBFS="${RELAY_OBFS:-${suggested_obfs}}"
+# Sanitize a tunnel name to a safe systemd-instance token: [a-z0-9_-]
+relay_sanitize_name() {
+  local n="$1"
+  n="$(printf '%s' "${n}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' | tr -s '-')"
+  n="${n##-}"; n="${n%%-}"
+  printf '%s' "${n:-tunnel}"
 }
 
-gather_relay_bandwidth() {
-  local def_up def_down
-  def_up="$(conf_get RELAY_UP_MBPS)"; def_up="${def_up:-$(conf_get HY2_UP_MBPS)}"
-  def_up="${def_up:-50}"
-  def_down="$(conf_get RELAY_DOWN_MBPS)"; def_down="${def_down:-$(conf_get HY2_DOWN_MBPS)}"
-  def_down="${def_down:-100}"
-
-  info "Enter your real link bandwidth between the two nodes."
-  RELAY_UP_MBPS="$(ask "Upload mbps [${def_up}]")"
-  RELAY_UP_MBPS="${RELAY_UP_MBPS:-${def_up}}"
-  RELAY_DOWN_MBPS="$(ask "Download mbps [${def_down}]")"
-  RELAY_DOWN_MBPS="${RELAY_DOWN_MBPS:-${def_down}}"
+# List instance names (dirs that contain meta.conf)
+relay_instances() {
+  local d
+  for d in "${RELAY_DIR}"/*/; do
+    [[ -f "${d}meta.conf" ]] || continue
+    basename "${d}"
+  done
 }
 
-gather_relay_link_port() {
-  RELAY_PORT_HOP="0"
-  RELAY_HOP_INTERVAL="30s"
+relay_count() { relay_instances | grep -c . || true; }
 
-  local def
-  def="$(conf_get RELAY_LISTEN)"
-  [[ -z "${def}" ]] && def="$(conf_get HY2_LISTEN)"
-  def="${def:-443}"
+imeta_get() {
+  local name="$1" key="$2" f
+  f="$(relay_idir "${name}")/meta.conf"
+  [[ -f "${f}" ]] && grep -E "^${key}=" "${f}" | head -n1 | cut -d= -f2- || true
+}
 
-  info "Link port between nodes (not your user/client port)."
-  RELAY_LISTEN="$(ask "Link port [${def}]")"
-  RELAY_LISTEN="${RELAY_LISTEN:-${def}}"
-
-  local hop; hop="$(ask 'Enable port hopping? (y/n) [n]')"
-  [[ "${hop}" != "y" ]] && return 0
-
-  RELAY_PORT_HOP="1"
-  local range; range="$(ask 'Port range (e.g. 20000-50000)')"
-  if [[ "${range}" =~ ^[0-9]+-[0-9]+$ ]]; then
-    RELAY_LISTEN="${range}"
+imeta_set() {
+  local name="$1" key="$2" val="$3" f
+  f="$(relay_idir "${name}")/meta.conf"
+  mkdir -p "$(dirname "${f}")"; touch "${f}"
+  if grep -qE "^${key}=" "${f}" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "${f}"
   else
-    warn "Invalid range — using 20000-50000."
-    RELAY_LISTEN="20000-50000"
+    echo "${key}=${val}" >> "${f}"
   fi
-  RELAY_HOP_INTERVAL="$(ask 'Hop interval [30s]')"
-  RELAY_HOP_INTERVAL="${RELAY_HOP_INTERVAL:-30s}"
 }
 
-write_relay_systemd() {
-  local mode="$1"
-  cat > "${RELAY_UNIT}" <<EOF
+relay_svc()        { printf 'phormal-relay@%s.service' "$1"; }
+relay_svc_state()  { systemctl is-active "$(relay_svc "$1")" 2>/dev/null || echo unknown; }
+
+# ------------------------------------------------------------------------------
+#  systemd template + run wrapper (installed once)
+# ------------------------------------------------------------------------------
+relay_install_runtime() {
+  cat > "${RELAY_RUN}" <<EOF
+#!/usr/bin/env bash
+# Phormal relay launcher — decides server/client mode from the instance meta.
+set -e
+name="\$1"
+dir="${RELAY_DIR}/\${name}"
+[[ -f "\${dir}/meta.conf" ]] || { echo "no such relay instance: \${name}" >&2; exit 1; }
+# shellcheck disable=SC1090
+ROLE="\$(grep -E '^ROLE=' "\${dir}/meta.conf" | head -n1 | cut -d= -f2-)"
+mode="server"; [[ "\${ROLE}" == "entry" ]] && mode="client"
+exec ${RELAY_BIN} "\${mode}" -c "\${dir}/config.yaml"
+EOF
+  chmod +x "${RELAY_RUN}"
+
+  cat > "${RELAY_TEMPLATE_UNIT}" <<EOF
 [Unit]
-Description=Phormal relay (${mode})
+Description=Phormal relay tunnel (%i)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${RELAY_BIN} ${mode} -c ${RELAY_CONF}
+# small delay so cloud routing / public IP is ready before the QUIC handshake
+ExecStartPre=/bin/sleep 2
+ExecStart=${RELAY_RUN} %i
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -694,70 +691,81 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable phormal-relay.service >/dev/null 2>&1
-  systemctl restart phormal-relay.service
+}
+
+relay_start_instance() {
+  local name="$1" svc; svc="$(relay_svc "${name}")"
+  systemctl daemon-reload
+  systemctl enable "${svc}" >/dev/null 2>&1
+  systemctl restart "${svc}"
   sleep 1
-  if ! systemctl is-active phormal-relay.service >/dev/null 2>&1; then
-    warn "Relay service failed to start. Recent log:"
-    journalctl -u phormal-relay -n 12 --no-pager 2>/dev/null | sed 's/^/    /'
-    return 1
+  if systemctl is-active "${svc}" >/dev/null 2>&1; then
+    good "Tunnel '${name}' is active."
+    return 0
   fi
+  fail "Tunnel '${name}' failed to start. Recent log:"
+  journalctl -u "${svc}" -n 12 --no-pager 2>/dev/null | sed 's/^/    /'
+  return 1
 }
 
-save_relay_conf() {
-  ensure_dirs
-  conf_set TRANSPORT relay
-  conf_set RELAY_AUTH "${RELAY_AUTH}"
-  conf_set RELAY_OBFS "${RELAY_OBFS}"
-  conf_set RELAY_UP_MBPS "${RELAY_UP_MBPS}"
-  conf_set RELAY_DOWN_MBPS "${RELAY_DOWN_MBPS}"
-  conf_set RELAY_LISTEN "${RELAY_LISTEN:-443}"
-  conf_set RELAY_PORT_HOP "${RELAY_PORT_HOP:-0}"
-  conf_set RELAY_HOP_INTERVAL "${RELAY_HOP_INTERVAL:-30s}"
+# ------------------------------------------------------------------------------
+#  Config writers (per instance)
+# ------------------------------------------------------------------------------
+# Exit / server config. One server serves any number of entry clients.
+write_instance_exit_config() {
+  local name="$1" dir; dir="$(relay_idir "${name}")"
+  mkdir -p "${dir}"
+  local listen auth obfs up down
+  listen="$(imeta_get "${name}" LISTEN)"; listen="${listen:-443}"
+  auth="$(imeta_get "${name}" AUTH)"
+  obfs="$(imeta_get "${name}" OBFS)"
+  up="$(imeta_get "${name}" UP_MBPS)";   up="${up:-50}"
+  down="$(imeta_get "${name}" DOWN_MBPS)"; down="${down:-100}"
+
+  {
+    echo "listen: :${listen}"
+    echo ""
+    echo "tls:"
+    echo "  cert: ${RELAY_TLS_DIR}/cert.crt"
+    echo "  key: ${RELAY_TLS_DIR}/cert.key"
+    echo ""
+    echo "auth:"
+    echo "  type: password"
+    echo "  password: ${auth}"
+    echo ""
+    echo "obfs:"
+    echo "  type: salamander"
+    echo "  salamander:"
+    echo "    password: ${obfs}"
+    echo ""
+    echo "bandwidth:"
+    echo "  up: ${up} mbps"
+    echo "  down: ${down} mbps"
+    echo ""
+    relay_engine_block
+  } > "${dir}/config.yaml"
 }
 
-write_relay_exit_config() {
-  RELAY_LISTEN="${RELAY_LISTEN:-$(conf_get RELAY_LISTEN)}"
-  RELAY_AUTH="${RELAY_AUTH:-$(conf_get RELAY_AUTH)}"
-  RELAY_OBFS="${RELAY_OBFS:-$(conf_get RELAY_OBFS)}"
-  RELAY_UP_MBPS="${RELAY_UP_MBPS:-$(conf_get RELAY_UP_MBPS)}"
-  RELAY_DOWN_MBPS="${RELAY_DOWN_MBPS:-$(conf_get RELAY_DOWN_MBPS)}"
-  mkdir -p "${RELAY_HOME}"
-  cat > "${RELAY_CONF}" <<EOF
-listen: :${RELAY_LISTEN}
+# Entry / client config. NOTE: no 'lazy' — the client connects eagerly and keeps
+# the tunnel warm with keepalive, so it no longer needs a manual restart to come
+# up after first traffic. fastOpen shaves a round trip on connect.
+write_instance_entry_config() {
+  local name="$1" dir; dir="$(relay_idir "${name}")"
+  mkdir -p "${dir}"
+  local server_ip listen ports hop_interval auth obfs up down
+  server_ip="$(imeta_get "${name}" REMOTE_V4)"
+  listen="$(imeta_get "${name}" LISTEN)"; listen="${listen:-443}"
+  ports="$(imeta_get "${name}" PORTS)"
+  hop_interval="$(imeta_get "${name}" HOP_INTERVAL)"; hop_interval="${hop_interval:-30s}"
+  auth="$(imeta_get "${name}" AUTH)"
+  obfs="$(imeta_get "${name}" OBFS)"
+  up="$(imeta_get "${name}" UP_MBPS)";   up="${up:-50}"
+  down="$(imeta_get "${name}" DOWN_MBPS)"; down="${down:-100}"
 
-tls:
-  cert: ${RELAY_HOME}/cert.crt
-  key: ${RELAY_HOME}/cert.key
-
-auth:
-  type: password
-  password: ${RELAY_AUTH}
-
-obfs:
-  type: salamander
-  salamander:
-    password: ${RELAY_OBFS}
-
-bandwidth:
-  up: ${RELAY_UP_MBPS} mbps
-  down: ${RELAY_DOWN_MBPS} mbps
-
-$(relay_engine_block)
-EOF
-}
-
-write_relay_entry_config() {
-  local server_ip="$1" listen="$2" ports="$3" hop_interval="${4:-30s}"
-  RELAY_AUTH="${RELAY_AUTH:-$(conf_get RELAY_AUTH)}"
-  RELAY_OBFS="${RELAY_OBFS:-$(conf_get RELAY_OBFS)}"
-  RELAY_UP_MBPS="${RELAY_UP_MBPS:-$(conf_get RELAY_UP_MBPS)}"
-  RELAY_DOWN_MBPS="${RELAY_DOWN_MBPS:-$(conf_get RELAY_DOWN_MBPS)}"
-  mkdir -p "${RELAY_HOME}"
   {
     echo "server: ${server_ip}:${listen}"
     echo ""
-    echo "auth: ${RELAY_AUTH}"
+    echo "auth: ${auth}"
     echo ""
     echo "tls:"
     echo "  insecure: true"
@@ -765,236 +773,457 @@ write_relay_entry_config() {
     echo "obfs:"
     echo "  type: salamander"
     echo "  salamander:"
-    echo "    password: ${RELAY_OBFS}"
+    echo "    password: ${obfs}"
     echo ""
     echo "bandwidth:"
-    echo "  up: ${RELAY_UP_MBPS} mbps"
-    echo "  down: ${RELAY_DOWN_MBPS} mbps"
+    echo "  up: ${up} mbps"
+    echo "  down: ${down} mbps"
     echo ""
     relay_engine_block
     echo ""
+    echo "fastOpen: true"
     if [[ "${listen}" == *-* ]]; then
-      cat <<EOF
-transport:
-  type: udp
-  udp:
-    hopInterval: ${hop_interval}
-EOF
+      echo ""
+      echo "transport:"
+      echo "  type: udp"
+      echo "  udp:"
+      echo "    hopInterval: ${hop_interval}"
     fi
-    echo ""
-    echo "lazy: true"
     echo ""
     echo "tcpForwarding:"
     local p
     IFS=',' read -ra parr <<< "${ports}"
     for p in "${parr[@]}"; do
+      [[ -n "${p}" ]] || continue
       echo "  - listen: :${p}"
       echo "    remote: 127.0.0.1:${p}"
     done
     echo ""
     echo "udpForwarding:"
     for p in "${parr[@]}"; do
+      [[ -n "${p}" ]] || continue
       echo "  - listen: :${p}"
       echo "    remote: 127.0.0.1:${p}"
       echo "    timeout: 60s"
     done
-  } > "${RELAY_CONF}"
+  } > "${dir}/config.yaml"
 }
 
-deploy_relay_exit() {
+# Rebuild whichever config matches the instance role, then (re)start it.
+relay_rebuild_instance() {
+  local name="$1" role; role="$(imeta_get "${name}" ROLE)"
+  if [[ "${role}" == "exit" ]]; then
+    write_instance_exit_config "${name}"
+  else
+    write_instance_entry_config "${name}"
+  fi
+  relay_start_instance "${name}"
+}
+
+# ------------------------------------------------------------------------------
+#  Shared prompts (write into the chosen instance's meta)
+# ------------------------------------------------------------------------------
+prompt_credentials_into() {
+  local name="$1" cur_auth cur_obfs sug_auth sug_obfs
+  cur_auth="$(imeta_get "${name}" AUTH)"
+  cur_obfs="$(imeta_get "${name}" OBFS)"
+  sug_auth="$(rand_secret)"; sug_obfs="$(rand_secret)"
+
+  if [[ -n "${cur_auth}" ]]; then
+    warn "Saved credentials for '${name}' (must match the other node exactly):"
+    info "  Auth : ${BOLD}${cur_auth}${RST}"
+    info "  Obfs : ${BOLD}${cur_obfs}${RST}"
+    local keep; keep="$(ask 'Keep these? (y/n)')"
+    [[ "${keep}" == "y" ]] && return 0
+  fi
+  info "Auth password. Suggested: ${BOLD}${sug_auth}${RST}"
+  local a; a="$(ask 'Auth password [Enter for suggested]')"; a="${a:-${sug_auth}}"
+  info "Obfuscation password. Suggested: ${BOLD}${sug_obfs}${RST}"
+  local o; o="$(ask 'Obfuscation password [Enter for suggested]')"; o="${o:-${sug_obfs}}"
+  imeta_set "${name}" AUTH "${a}"
+  imeta_set "${name}" OBFS "${o}"
+}
+
+prompt_bandwidth_into() {
+  local name="$1" du dd
+  du="$(imeta_get "${name}" UP_MBPS)";   du="${du:-50}"
+  dd="$(imeta_get "${name}" DOWN_MBPS)"; dd="${dd:-100}"
+  info "Real link bandwidth between the two nodes (rough is fine)."
+  local u d
+  u="$(ask "Upload mbps [${du}]")";   u="${u:-${du}}"
+  d="$(ask "Download mbps [${dd}]")"; d="${d:-${dd}}"
+  imeta_set "${name}" UP_MBPS "${u}"
+  imeta_set "${name}" DOWN_MBPS "${d}"
+}
+
+# ------------------------------------------------------------------------------
+#  Create instances
+# ------------------------------------------------------------------------------
+relay_pick_name() {
+  local raw name
+  raw="$(ask 'Tunnel name (e.g. iran1, kharej-de)')"
+  name="$(relay_sanitize_name "${raw}")"
+  if [[ -f "$(relay_idir "${name}")/meta.conf" ]]; then
+    warn "A tunnel named '${name}' already exists." >&2
+    printf '%s' ""
+    return 1
+  fi
+  printf '%s' "${name}"
+}
+
+create_exit_tunnel() {
   rule
-  info "Phormal Relay — exit node"
-  info "Run your service locally on the ports you will publish."
+  info "Phormal Relay — new EXIT tunnel (this server = kharej)"
+  info "Run your real service (Xray/3x-ui) locally; entries point users at it."
   rule
 
   install_relay_engine || return 1
   gen_relay_tls
   enable_relay_buffers
   apply_tuning fq
+  relay_install_runtime
 
-  gather_relay_credentials
-  gather_relay_bandwidth
-  gather_relay_link_port
+  local name; name="$(relay_pick_name)" || return 1
+  [[ -z "${name}" ]] && { fail "Invalid name."; return 1; }
+  mkdir -p "$(relay_idir "${name}")"
+  imeta_set "${name}" ROLE exit
 
-  write_relay_exit_config
-  save_relay_conf
-  conf_set RELAY_ROLE exit
-  write_relay_systemd server || return 1
+  prompt_credentials_into "${name}"
+  prompt_bandwidth_into "${name}"
 
-  good "Phormal Relay live on link port ${RELAY_LISTEN}"
-  info "  Link port         : ${RELAY_LISTEN}  ${MUT}(entry must use this — not user ports like 6161)${RST}"
-  info "  Auth password     : ${RELAY_AUTH}"
-  info "  Obfuscation pass  : ${RELAY_OBFS}"
-  info "  Link bandwidth    : ↑${RELAY_UP_MBPS} / ↓${RELAY_DOWN_MBPS} mbps"
-  [[ "${RELAY_PORT_HOP}" == "1" ]] && info "  Port hopping      : ${RELAY_LISTEN}"
-  warn "Copy link port + both passwords to the entry node."
+  local listen hop
+  info "Link port between nodes (NOT a user port). e.g. 8443"
+  listen="$(ask 'Link port [443]')"; listen="${listen:-443}"
+  hop="$(ask 'Enable port hopping? (y/n) [n]')"
+  if [[ "${hop}" == "y" ]]; then
+    local range; range="$(ask 'Port range (e.g. 20000-50000)')"
+    [[ "${range}" =~ ^[0-9]+-[0-9]+$ ]] || { warn "Invalid range — using 20000-50000."; range="20000-50000"; }
+    listen="${range}"
+    local hi; hi="$(ask 'Hop interval [30s]')"; imeta_set "${name}" HOP_INTERVAL "${hi:-30s}"
+  fi
+  imeta_set "${name}" LISTEN "${listen}"
+
+  write_instance_exit_config "${name}"
+  relay_start_instance "${name}" || return 1
+
   echo
-  relay_diagnose
+  good "Exit tunnel '${name}' live."
+  info "  Link port  : ${listen}  ${MUT}(entries must use this)${RST}"
+  info "  Auth       : $(imeta_get "${name}" AUTH)"
+  info "  Obfs       : $(imeta_get "${name}" OBFS)"
+  info "  Bandwidth  : ↑$(imeta_get "${name}" UP_MBPS) / ↓$(imeta_get "${name}" DOWN_MBPS) mbps"
+  warn "Open ${listen%-*}/udp in the firewall, and give link port + both passwords to every entry node."
+  warn "Each Iran (entry) server can connect to this same exit with its own ports."
 }
 
-deploy_relay_entry() {
+create_entry_tunnel() {
   rule
-  info "Phormal Relay — entry node"
-  info "Listens on user ports, forwards to your service on the exit node."
+  info "Phormal Relay — new ENTRY tunnel (this server = iran)"
+  info "Listens on user ports here, forwards to the service on the exit node."
   rule
 
   install_relay_engine || return 1
   enable_relay_buffers
   apply_tuning fq
+  relay_install_runtime
+
+  local name; name="$(relay_pick_name)" || return 1
+  [[ -z "${name}" ]] && { fail "Invalid name."; return 1; }
+  mkdir -p "$(relay_idir "${name}")"
+  imeta_set "${name}" ROLE entry
 
   local server_ip
-  server_ip="$(conf_get REMOTE_V4)"
-  if [[ -n "${server_ip}" ]]; then
-    info "Exit node IP from config: ${BOLD}${server_ip}${RST}"
-    local keep; keep="$(ask 'Use this IP? (y/n)')"
-    [[ "${keep}" != "y" ]] && server_ip="$(ask 'Exit node public IPv4')"
-  else
-    server_ip="$(ask 'Exit node public IPv4')"
-  fi
-  if ! valid_ipv4 "${server_ip}"; then
-    fail "Invalid IPv4 address."; return 1
-  fi
+  server_ip="$(ask 'Exit (kharej) node public IPv4')"
+  valid_ipv4 "${server_ip}" || { fail "Invalid IPv4."; rm -rf "$(relay_idir "${name}")"; return 1; }
+  imeta_set "${name}" REMOTE_V4 "${server_ip}"
 
-  gather_relay_credentials
-  gather_relay_bandwidth
+  prompt_credentials_into "${name}"
+  prompt_bandwidth_into "${name}"
 
-  local listen saved_listen hop_interval
-  saved_listen="$(conf_get RELAY_LISTEN)"
-  [[ -z "${saved_listen}" ]] && saved_listen="$(conf_get HY2_LISTEN)"
-  listen="${saved_listen:-443}"
-  if [[ -z "${saved_listen}" ]]; then
-    info "Link port on exit — must match exit node exactly (NOT your user port 6161)."
-    listen="$(ask 'Link port or range [443]')"
-    listen="${listen:-443}"
-  else
-    info "Link port from saved config: ${BOLD}${listen}${RST}"
-    local relisten; relisten="$(ask 'Keep this link port? (y/n)')"
-    [[ "${relisten}" != "y" ]] && listen="$(ask 'Link port or range')"
-  fi
-  if [[ "${listen}" == *-* ]]; then
-    info "Port hopping enabled — rotating across ${listen}"
-  fi
-
-  hop_interval="$(conf_get RELAY_HOP_INTERVAL)"
-  [[ -z "${hop_interval}" ]] && hop_interval="$(conf_get HY2_HOP_INTERVAL)"
-  hop_interval="${hop_interval:-30s}"
+  local listen
+  info "Link port — must match the exit exactly (single port, or a range for hopping)."
+  listen="$(ask 'Link port or range [443]')"; listen="${listen:-443}"
+  imeta_set "${name}" LISTEN "${listen}"
+  [[ "${listen}" == *-* ]] && { local hi; hi="$(ask 'Hop interval [30s]')"; imeta_set "${name}" HOP_INTERVAL "${hi:-30s}"; }
 
   local ports; ports="$(gather_ports)"
-  [[ -z "${ports}" ]] && { fail "No valid ports provided."; return 1; }
+  [[ -z "${ports}" ]] && { fail "No valid ports provided."; rm -rf "$(relay_idir "${name}")"; return 1; }
+  imeta_set "${name}" PORTS "${ports}"
 
-  RELAY_LISTEN="${listen}"
-  RELAY_PORT_HOP="0"
-  [[ "${listen}" == *-* ]] && RELAY_PORT_HOP="1"
-  RELAY_HOP_INTERVAL="${hop_interval}"
+  write_instance_entry_config "${name}"
+  relay_start_instance "${name}" || return 1
 
-  write_relay_entry_config "${server_ip}" "${listen}" "${ports}" "${hop_interval}"
-  save_relay_conf
-  conf_set RELAY_ROLE entry
-  conf_set RELAY_PORTS "${ports}"
-  conf_set REMOTE_V4 "${server_ip}"
-
-  write_relay_systemd client || return 1
-
-  IFS=',' read -ra parr <<< "${ports}"
-  local count=${#parr[@]}
-  good "Phormal Relay live — ${count} port(s) published."
-  info "  Link target       : ${server_ip}:${listen}"
-  info "  Link bandwidth    : ↑${RELAY_UP_MBPS} / ↓${RELAY_DOWN_MBPS} mbps"
-  info "  Published ports   : ${ports}"
-  good "Point your users at this node's public IP on those ports."
-  warn "Your client must use this entry node's IP — not the exit IP."
   echo
-  relay_diagnose
+  good "Entry tunnel '${name}' live — ports: ${ports}"
+  info "  Link target : ${server_ip}:${listen}"
+  good "Point users at THIS server's public IP on those ports (never the exit IP)."
+  echo
+  diagnose_instance "${name}"
 }
 
-relay_diagnose() {
+# ------------------------------------------------------------------------------
+#  Diagnostics for one instance
+# ------------------------------------------------------------------------------
+diagnose_instance() {
+  local name="$1" dir role listen remote svc
+  dir="$(relay_idir "${name}")"
+  role="$(imeta_get "${name}" ROLE)"
+  listen="$(imeta_get "${name}" LISTEN)"
+  remote="$(imeta_get "${name}" REMOTE_V4)"
+  svc="$(relay_svc "${name}")"
+
   rule
-  info "Phormal Relay — diagnostics"
+  info "Diagnostics — tunnel '${name}' (${role})"
   rule
-
-  if [[ ! -f "${RELAY_CONF}" ]]; then
-    warn "No relay config at ${RELAY_CONF}"
-    return 1
-  fi
-
-  local r_role r_remote r_listen
-  r_role="$(conf_get RELAY_ROLE)"
-  [[ -z "${r_role}" ]] && r_role="$(conf_get HY2_ROLE)"
-  r_remote="$(conf_get REMOTE_V4)"
-  r_listen="$(conf_get RELAY_LISTEN)"
-  [[ -z "${r_listen}" ]] && r_listen="$(conf_get HY2_LISTEN)"
-
-  local svc; svc="$(systemctl is-active phormal-relay.service 2>/dev/null || echo unknown)"
-  if [[ "${svc}" == "active" ]]; then
-    good "phormal-relay.service is active"
+  if [[ "$(relay_svc_state "${name}")" == "active" ]]; then
+    good "service active"
   else
-    fail "phormal-relay.service is ${svc}"
-    journalctl -u phormal-relay -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+    fail "service $(relay_svc_state "${name}")"
+    journalctl -u "${svc}" -n 12 --no-pager 2>/dev/null | sed 's/^/    /'
   fi
 
-  if [[ "${r_role}" == "entry" ]]; then
-    info "Entry checks"
-    local pub_ports
-    pub_ports="$(grep -E '^\s+-\s+listen:\s+:' "${RELAY_CONF}" 2>/dev/null \
-      | sed 's/.*://;s/[^0-9].*//' | sort -un | paste -sd, -)"
-    if [[ -n "${pub_ports}" ]]; then
-      local p
-      IFS=',' read -ra parr <<< "${pub_ports}"
-      for p in "${parr[@]}"; do
-        if port_open_tcp "${p}"; then
-          good "TCP :${p} listening (users connect here)"
-        else
-          fail "TCP :${p} not listening"
-        fi
-      done
+  if [[ "${role}" == "entry" ]]; then
+    local ports p
+    ports="$(imeta_get "${name}" PORTS)"
+    IFS=',' read -ra parr <<< "${ports}"
+    for p in "${parr[@]}"; do
+      [[ -n "${p}" ]] || continue
+      if port_open_tcp "${p}"; then good "TCP :${p} listening (users connect here)"; else fail "TCP :${p} NOT listening"; fi
+    done
+    info "Link target: ${remote}:${listen%-*}"
+    if journalctl -u "${svc}" --since '3 min ago' 2>/dev/null | grep -q 'forwarding error'; then
+      warn "Recent forwarding errors — check link port + passwords match the exit, and that the exit's service is up."
     fi
-    if [[ -n "${r_remote}" && -n "${r_listen}" ]]; then
-      local hop_port="${r_listen%-*}"
-      info "Link target: ${r_remote}:${hop_port}"
-      if journalctl -u phormal-relay --since '5 min ago' 2>/dev/null \
-         | grep -q 'TCP forwarding error'; then
-        warn "Recent forwarding errors in log — check link port + passwords match exit"
-        info "  → journalctl -u phormal-relay -n 20"
-      elif journalctl -u phormal-relay --since '2 min ago' 2>/dev/null \
-         | grep -qE 'TCP forwarding listening|UDP forwarding listening'; then
-        good "Relay publisher ready"
-      fi
-    fi
-    info "Client address must be this server's public IP, port(s): ${pub_ports:-?}"
-  elif [[ "${r_role}" == "exit" ]]; then
-    info "Exit checks"
-    local hop_port="${r_listen%-*}"
-    if port_open_udp "${hop_port}" \
-       || journalctl -u phormal-relay --since '30 min ago' 2>/dev/null \
-          | grep -qF "\"listen\": \":${hop_port}\""; then
-      good "Link port ${hop_port} up"
-    else
-      warn "Link port ${hop_port} not confirmed — check: journalctl -u phormal-relay -n 10"
-    fi
-    info "Make sure your service listens on the published port(s)."
-    local rp p
-    rp="$(conf_get RELAY_PORTS)"
-    if [[ -n "${rp}" ]]; then
-      IFS=',' read -ra parr <<< "${rp}"
-      for p in "${parr[@]}"; do
-        if port_open_tcp "${p}"; then
-          good "TCP :${p} listening (service)"
-        else
-          warn "Nothing on TCP :${p} - start your service on this port"
-        fi
-      done
-    fi
-    info "Auth : $(conf_get RELAY_AUTH)"
-    info "Obfs : $(conf_get RELAY_OBFS)"
-    warn "Give these two passwords to the entry node."
+  elif [[ "${role}" == "exit" ]]; then
+    local hp="${listen%-*}"
+    if port_open_udp "${hp}"; then good "Link UDP :${hp} up"; else warn "Link UDP :${hp} not confirmed yet"; fi
+    info "Auth : $(imeta_get "${name}" AUTH)"
+    info "Obfs : $(imeta_get "${name}" OBFS)"
   fi
-
   echo
-  info "Recent relay log"
-  journalctl -u phormal-relay -n 8 --no-pager 2>/dev/null | sed 's/^/    /' || warn "no log entries"
+  info "Recent log:"
+  journalctl -u "${svc}" -n 8 --no-pager 2>/dev/null | sed 's/^/    /' || true
   rule
 }
 
+# ------------------------------------------------------------------------------
+#  Per-instance management
+# ------------------------------------------------------------------------------
+relay_list() {
+  rule
+  info "Phormal Relay — tunnels"
+  rule
+  local n any=0
+  printf '    %-16s %-6s %-22s %-10s %s\n' "NAME" "ROLE" "TARGET/LINK" "STATE" "PORTS"
+  while read -r n; do
+    [[ -n "${n}" ]] || continue
+    any=1
+    local role listen remote state ports tgt
+    role="$(imeta_get "${n}" ROLE)"
+    listen="$(imeta_get "${n}" LISTEN)"
+    remote="$(imeta_get "${n}" REMOTE_V4)"
+    ports="$(imeta_get "${n}" PORTS)"
+    state="$(relay_svc_state "${n}")"
+    if [[ "${role}" == "entry" ]]; then tgt="${remote}:${listen}"; else tgt=":${listen}"; fi
+    printf '    %-16s %-6s %-22s %-10s %s\n' "${n}" "${role}" "${tgt}" "${state}" "${ports:--}"
+  done < <(relay_instances)
+  [[ ${any} -eq 0 ]] && warn "no tunnels configured yet"
+  rule
+}
+
+# Show a numbered picker; echo the chosen instance name (or empty).
+relay_choose_instance() {
+  local names=() n i
+  while read -r n; do [[ -n "${n}" ]] && names+=("${n}"); done < <(relay_instances)
+  if [[ ${#names[@]} -eq 0 ]]; then warn "No tunnels configured." >&2; printf '%s' ""; return 1; fi
+  {
+    for i in "${!names[@]}"; do
+      printf '  %s%s%s  %s (%s, %s)\n' "${ACC}" "$((i+1))" "${RST}" \
+        "${names[i]}" "$(imeta_get "${names[i]}" ROLE)" "$(relay_svc_state "${names[i]}")"
+    done
+  } >&2
+  local sel; sel="$(ask 'Tunnel number')"
+  [[ "${sel}" =~ ^[0-9]+$ ]] || { printf '%s' ""; return 1; }
+  local idx=$((sel-1))
+  [[ ${idx} -ge 0 && ${idx} -lt ${#names[@]} ]] || { printf '%s' ""; return 1; }
+  printf '%s' "${names[idx]}"
+}
+
+instance_edit_ports() {
+  local name="$1" role ports
+  role="$(imeta_get "${name}" ROLE)"
+  [[ "${role}" == "entry" ]] || { fail "Ports are only configured on entry tunnels."; return 1; }
+  ports="$(imeta_get "${name}" PORTS)"
+  info "Current ports: ${ports:-none}"
+  printf '  %s1%s  Add port   %s2%s  Remove port   %s3%s  Replace all\n' \
+    "${ACC}" "${RST}" "${ACC}" "${RST}" "${ACC}" "${RST}"
+  local c; c="$(ask 'Action')"
+  case "${c}" in
+    1) local p; p="$(ask 'Port to add')"; [[ "${p}" =~ ^[0-9]+$ ]] || { fail "Invalid port."; return 1; }
+       ports="$(merge_port_list "${ports}" "${p}")" ;;
+    2) local p; p="$(ask 'Port to remove')"
+       ports="$(remove_port_from_list "${ports}" "${p}")"
+       [[ -z "${ports}" ]] && { fail "Cannot remove the last port."; return 1; } ;;
+    3) ports="$(gather_ports)"; [[ -z "${ports}" ]] && { fail "No valid ports."; return 1; } ;;
+    *) fail "Invalid action."; return 1 ;;
+  esac
+  imeta_set "${name}" PORTS "${ports}"
+  write_instance_entry_config "${name}"
+  relay_start_instance "${name}"
+  good "Ports for '${name}' now: ${ports}"
+}
+
+instance_change_exit_ip() {
+  local name="$1" role ip
+  role="$(imeta_get "${name}" ROLE)"
+  [[ "${role}" == "entry" ]] || { fail "Exit IP only applies to entry tunnels."; return 1; }
+  ip="$(ask "Exit node IP [$(imeta_get "${name}" REMOTE_V4)]")"
+  [[ -z "${ip}" ]] && return 0
+  valid_ipv4 "${ip}" || { fail "Invalid IPv4."; return 1; }
+  imeta_set "${name}" REMOTE_V4 "${ip}"
+  write_instance_entry_config "${name}"
+  relay_start_instance "${name}"
+  good "Exit IP for '${name}' updated to ${ip}."
+}
+
+instance_change_linkport() {
+  local name="$1" role lp
+  role="$(imeta_get "${name}" ROLE)"
+  lp="$(ask "Link port or range [$(imeta_get "${name}" LISTEN)]")"
+  [[ -z "${lp}" ]] && return 0
+  imeta_set "${name}" LISTEN "${lp}"
+  [[ "${lp}" == *-* ]] && { local hi; hi="$(ask 'Hop interval [30s]')"; imeta_set "${name}" HOP_INTERVAL "${hi:-30s}"; }
+  relay_rebuild_instance "${name}"
+  [[ "${role}" == "exit" ]] && warn "Open ${lp%-*}/udp in the firewall and update every entry to this link port."
+  good "Link port for '${name}' updated."
+}
+
+instance_edit_creds() {
+  local name="$1"
+  prompt_credentials_into "${name}"
+  prompt_bandwidth_into "${name}"
+  relay_rebuild_instance "${name}"
+  good "Credentials/bandwidth for '${name}' reapplied."
+  warn "These must match on the other node."
+}
+
+instance_edit_raw() {
+  local name="$1" dir; dir="$(relay_idir "${name}")"
+  info "  ${dir}/meta.conf"
+  info "  ${dir}/config.yaml"
+  local c; c="$(ask 'Edit raw hysteria config now? (y/n)')"
+  [[ "${c}" == "y" ]] && ${EDITOR:-nano} "${dir}/config.yaml"
+  local r; r="$(ask 'Restart tunnel to apply? (y/n)')"
+  [[ "${r}" == "y" ]] && relay_start_instance "${name}"
+}
+
+instance_delete() {
+  local name="$1" svc; svc="$(relay_svc "${name}")"
+  local c; c="$(ask "Delete tunnel '${name}' permanently? (y/n)")"
+  [[ "${c}" != "y" ]] && { info "Cancelled."; return 0; }
+  systemctl stop "${svc}" 2>/dev/null || true
+  systemctl disable "${svc}" 2>/dev/null || true
+  rm -rf "$(relay_idir "${name}")"
+  systemctl daemon-reload
+  good "Tunnel '${name}' deleted."
+}
+
+manage_instance_menu() {
+  local name="$1"
+  while :; do
+    rule
+    info "Manage tunnel '${name}'  (${MUT}$(imeta_get "${name}" ROLE) • $(relay_svc_state "${name}")${RST})"
+    rule
+    printf '  %s1%s  Restart\n'                 "${ACC}" "${RST}"
+    printf '  %s2%s  Stop\n'                    "${ACC}" "${RST}"
+    printf '  %s3%s  Start\n'                   "${ACC}" "${RST}"
+    printf '  %s4%s  Diagnostics\n'             "${ACC}" "${RST}"
+    printf '  %s5%s  Live log (Ctrl-C to exit)\n' "${ACC}" "${RST}"
+    printf '  %s6%s  Edit ports (entry only)\n' "${ACC}" "${RST}"
+    printf '  %s7%s  Change exit IP (entry only)\n' "${ACC}" "${RST}"
+    printf '  %s8%s  Change link port\n'        "${ACC}" "${RST}"
+    printf '  %s9%s  Edit auth/obfs/bandwidth\n' "${ACC}" "${RST}"
+    printf ' %s10%s  Edit raw config\n'         "${ACC}" "${RST}"
+    printf ' %s11%s  Delete tunnel\n'           "${ACC}" "${RST}"
+    printf '  %s0%s  Back\n\n'                  "${ACC}" "${RST}"
+    local c; c="$(ask 'Select')"; echo
+    case "${c}" in
+      1) relay_start_instance "${name}" || true ;;
+      2) systemctl stop "$(relay_svc "${name}")" 2>/dev/null && good "Stopped." || fail "Could not stop." ;;
+      3) systemctl start "$(relay_svc "${name}")" 2>/dev/null && good "Started." || fail "Could not start." ;;
+      4) diagnose_instance "${name}" ;;
+      5) journalctl -u "$(relay_svc "${name}")" -f --no-pager 2>/dev/null || true ;;
+      6) instance_edit_ports "${name}" || true ;;
+      7) instance_change_exit_ip "${name}" || true ;;
+      8) instance_change_linkport "${name}" || true ;;
+      9) instance_edit_creds "${name}" || true ;;
+      10) instance_edit_raw "${name}" || true ;;
+      11) instance_delete "${name}"; break ;;
+      0) break ;;
+      *) fail "Invalid selection." ;;
+    esac
+    echo
+  done
+}
+
+manage_relay_menu() {
+  while :; do
+    relay_list
+    printf '  %s1%s  Manage a tunnel\n'   "${ACC}" "${RST}"
+    printf '  %s2%s  Add exit tunnel\n'   "${ACC}" "${RST}"
+    printf '  %s3%s  Add entry tunnel\n'  "${ACC}" "${RST}"
+    printf '  %s4%s  Restart ALL tunnels\n' "${ACC}" "${RST}"
+    printf '  %s0%s  Back\n\n'            "${ACC}" "${RST}"
+    local c; c="$(ask 'Select')"; echo
+    case "${c}" in
+      1) local n; n="$(relay_choose_instance)"; [[ -n "${n}" ]] && manage_instance_menu "${n}" ;;
+      2) create_exit_tunnel || true ;;
+      3) create_entry_tunnel || true ;;
+      4) local n; while read -r n; do [[ -n "${n}" ]] && relay_start_instance "${n}" || true; done < <(relay_instances) ;;
+      0) break ;;
+      *) fail "Invalid selection." ;;
+    esac
+    echo
+  done
+}
+
+relay_speedtest() {
+  install_speed_tool || return 1
+  rule
+  info "Phormal Relay — speedtest (per entry tunnel)"
+  info "Order: run step 1 on the EXIT, then step 2 on the ENTRY (within ~30s)."
+  rule
+  printf '  %s1%s  Exit node — start listener\n' "${ACC}" "${RST}"
+  printf '  %s2%s  Entry node — run test\n' "${ACC}" "${RST}"
+  local step; step="$(ask 'Step')"
+  case "${step}" in
+    1)
+      info "Listening on 127.0.0.1:${PHORMAL_SPEED_PORT} — waiting for entry…"
+      iperf3 -s -B 127.0.0.1 -p "${PHORMAL_SPEED_PORT}" -1 || { fail "Speed listener failed."; return 1; }
+      ;;
+    2)
+      local name; name="$(relay_choose_instance)"; [[ -z "${name}" ]] && return 1
+      [[ "$(imeta_get "${name}" ROLE)" == "entry" ]] || { fail "Pick an ENTRY tunnel."; return 1; }
+      warn "Step 1 must already be running on the exit node."
+      local ready; ready="$(ask 'Exit listener running? (y/n)')"
+      [[ "${ready}" =~ ^[Yy] ]] || { info "Cancelled."; return 0; }
+      local ports; ports="$(imeta_get "${name}" PORTS)"
+      if [[ ",${ports}," != *",${PHORMAL_SPEED_PORT},"* ]]; then
+        info "Temporarily adding speed port ${PHORMAL_SPEED_PORT}…"
+        imeta_set "${name}" PORTS "$(merge_port_list "${ports}" "${PHORMAL_SPEED_PORT}")"
+        write_instance_entry_config "${name}"; relay_start_instance "${name}" || return 1
+        sleep 3
+      fi
+      info "Testing through tunnel '${name}' for 10s…"
+      iperf3 -c 127.0.0.1 -p "${PHORMAL_SPEED_PORT}" -t 10 -f m || { fail "Speedtest failed — is step 1 still running on the exit?"; return 1; }
+      ;;
+    *) fail "Invalid step." ;;
+  esac
+}
+
+# ==============================================================================
+#  BRIDGE — management (unchanged)
+# ==============================================================================
 bridge_rewrite_config() {
   info "  ${PHORMAL_CONF}"
   info "  ${CORE_UP_SCRIPT}"
@@ -1062,8 +1291,7 @@ bridge_speedtest() {
       local bind; bind="$(conf_get SELF_CORE)"
       [[ -z "${bind}" ]] && { fail "Configure exit node first."; return 1; }
       info "Listening on ${bind}:${PHORMAL_SPEED_PORT}…"
-      iperf3 -s -B "${bind}" -p "${PHORMAL_SPEED_PORT}" -1 \
-        || { fail "Speed listener failed."; return 1; }
+      iperf3 -s -B "${bind}" -p "${PHORMAL_SPEED_PORT}" -1 || { fail "Speed listener failed."; return 1; }
       ;;
     2)
       local peer; peer="$(conf_get PEER_CORE)"
@@ -1072,10 +1300,8 @@ bridge_speedtest() {
       local ready; ready="$(ask 'Exit listener running? (y/n)')"
       [[ "${ready}" =~ ^[Yy] ]] || { info "Cancelled."; return 0; }
       info "Testing to ${peer}:${PHORMAL_SPEED_PORT} for 10s…"
-      if ! iperf3 -c "${peer}" -p "${PHORMAL_SPEED_PORT}" -t 10 -f m; then
-        fail "Speedtest failed — is step 1 still running on the exit node?"
-        return 1
-      fi
+      iperf3 -c "${peer}" -p "${PHORMAL_SPEED_PORT}" -t 10 -f m \
+        || { fail "Speedtest failed — is step 1 still running on the exit node?"; return 1; }
       ;;
     *) fail "Invalid step." ;;
   esac
@@ -1112,180 +1338,6 @@ manage_bridge_menu() {
   done
 }
 
-relay_rewrite_config() {
-  local role; role="$(conf_get RELAY_ROLE)"
-  [[ -z "${role}" ]] && { fail "Phormal Relay not configured."; return 1; }
-  info "  ${PHORMAL_CONF}"
-  info "  ${RELAY_CONF}"
-  local c; c="$(ask 'Edit main config? (y/n)')"
-  [[ "${c}" == "y" ]] && ${EDITOR:-nano} "${PHORMAL_CONF}"
-  local y; y="$(ask 'Edit relay config? (y/n)')"
-  [[ "${y}" == "y" ]] && ${EDITOR:-nano} "${RELAY_CONF}"
-  if [[ "${role}" == "exit" ]]; then
-    write_relay_exit_config
-    write_relay_systemd server
-  else
-    local hop; hop="$(conf_get RELAY_HOP_INTERVAL)"; hop="${hop:-30s}"
-    write_relay_entry_config "$(conf_get REMOTE_V4)" "$(conf_get RELAY_LISTEN)" "$(conf_get RELAY_PORTS)" "${hop}"
-    write_relay_systemd client
-  fi
-  good "Phormal Relay configs saved and service restarted."
-}
-
-relay_reapply_settings() {
-  local role; role="$(conf_get RELAY_ROLE)"
-  [[ -z "${role}" ]] && { fail "Phormal Relay not configured."; return 1; }
-  gather_relay_credentials
-  gather_relay_bandwidth
-  if [[ "${role}" == "exit" ]]; then
-    gather_relay_link_port
-    write_relay_exit_config
-    save_relay_conf
-    write_relay_systemd server
-  else
-    local listen hop
-    listen="$(conf_get RELAY_LISTEN)"
-    hop="$(conf_get RELAY_HOP_INTERVAL)"; hop="${hop:-30s}"
-    RELAY_LISTEN="${listen}"
-    write_relay_entry_config "$(conf_get REMOTE_V4)" "${listen}" "$(conf_get RELAY_PORTS)" "${hop}"
-    save_relay_conf
-    write_relay_systemd client
-  fi
-  good "Phormal Relay settings reapplied."
-}
-
-relay_change_exit_ip() {
-  [[ "$(conf_get RELAY_ROLE)" != "entry" ]] && { fail "Only on entry node."; return 1; }
-  local ip; ip="$(ask "Exit node IP [$(conf_get REMOTE_V4)]")"
-  [[ -z "${ip}" ]] && return 0
-  valid_ipv4 "${ip}" || { fail "Invalid IPv4."; return 1; }
-  conf_set REMOTE_V4 "${ip}"
-  local hop; hop="$(conf_get RELAY_HOP_INTERVAL)"; hop="${hop:-30s}"
-  write_relay_entry_config "${ip}" "$(conf_get RELAY_LISTEN)" "$(conf_get RELAY_PORTS)" "${hop}"
-  write_relay_systemd client
-  good "Exit node IP updated."
-}
-
-relay_add_port() {
-  [[ "$(conf_get RELAY_ROLE)" != "entry" ]] && { fail "Only on entry node."; return 1; }
-  local ports new hop
-  ports="$(conf_get RELAY_PORTS)"
-  new="$(ask 'Port to add')"
-  [[ "${new}" =~ ^[0-9]+$ ]] || { fail "Invalid port."; return 1; }
-  ports="$(merge_port_list "${ports}" "${new}")"
-  conf_set RELAY_PORTS "${ports}"
-  hop="$(conf_get RELAY_HOP_INTERVAL)"; hop="${hop:-30s}"
-  write_relay_entry_config "$(conf_get REMOTE_V4)" "$(conf_get RELAY_LISTEN)" "${ports}" "${hop}"
-  write_relay_systemd client
-  good "Port ${new} added."
-}
-
-relay_remove_port() {
-  [[ "$(conf_get RELAY_ROLE)" != "entry" ]] && { fail "Only on entry node."; return 1; }
-  local ports rem hop
-  ports="$(conf_get RELAY_PORTS)"
-  info "Current ports: ${ports:-none}"
-  rem="$(ask 'Port to remove')"
-  ports="$(remove_port_from_list "${ports}" "${rem}")"
-  [[ -z "${ports}" ]] && { fail "Cannot remove last port."; return 1; }
-  conf_set RELAY_PORTS "${ports}"
-  hop="$(conf_get RELAY_HOP_INTERVAL)"; hop="${hop:-30s}"
-  write_relay_entry_config "$(conf_get REMOTE_V4)" "$(conf_get RELAY_LISTEN)" "${ports}" "${hop}"
-  write_relay_systemd client
-  good "Port ${rem} removed."
-}
-
-relay_speedtest() {
-  install_speed_tool || return 1
-  rule
-  info "Phormal Relay — speedtest"
-  info "Order: run step 1 on exit, then step 2 on entry (within ~30s)."
-  rule
-  printf '  %s1%s  Exit node — start listener\n' "${ACC}" "${RST}"
-  printf '  %s2%s  Entry node — run test\n' "${ACC}" "${RST}"
-  local step; step="$(ask 'Step')"
-  case "${step}" in
-    1)
-      [[ "$(conf_get RELAY_ROLE)" != "exit" ]] && { fail "Run step 1 on exit node."; return 1; }
-      info "Listening on 127.0.0.1:${PHORMAL_SPEED_PORT} — waiting for entry…"
-      iperf3 -s -B 127.0.0.1 -p "${PHORMAL_SPEED_PORT}" -1 \
-        || { fail "Speed listener failed."; return 1; }
-      ;;
-    2)
-      [[ "$(conf_get RELAY_ROLE)" != "entry" ]] && { fail "Run step 2 on entry node."; return 1; }
-      warn "Step 1 must be running on the exit node before you continue."
-      local ready; ready="$(ask 'Exit listener running? (y/n)')"
-      [[ "${ready}" =~ ^[Yy] ]] || { info "Cancelled."; return 0; }
-      local ports; ports="$(conf_get RELAY_PORTS)"
-      if [[ ",${ports}," != *",${PHORMAL_SPEED_PORT},"* ]]; then
-        info "Adding speed port ${PHORMAL_SPEED_PORT} to relay…"
-        conf_set RELAY_PORTS "$(merge_port_list "${ports}" "${PHORMAL_SPEED_PORT}")"
-        local hop; hop="$(conf_get RELAY_HOP_INTERVAL)"; hop="${hop:-30s}"
-        write_relay_entry_config "$(conf_get REMOTE_V4)" "$(conf_get RELAY_LISTEN)" "$(conf_get RELAY_PORTS)" "${hop}"
-        write_relay_systemd client || return 1
-        info "Waiting for relay to settle…"
-        sleep 3
-      fi
-      info "Testing through Phormal Relay for 10s…"
-      if ! iperf3 -c 127.0.0.1 -p "${PHORMAL_SPEED_PORT}" -t 10 -f m; then
-        fail "Speedtest failed — is step 1 still running on the exit node?"
-        return 1
-      fi
-      ;;
-    *) fail "Invalid step." ;;
-  esac
-}
-
-manage_relay_menu() {
-  [[ -f "${RELAY_CONF}" ]] || { fail "Phormal Relay not deployed."; return 1; }
-  while :; do
-    rule
-    info "Phormal Relay — manage"
-    rule
-    printf '  %s1%s  Restart service\n' "${ACC}" "${RST}"
-    printf '  %s2%s  Rewrite config files\n' "${ACC}" "${RST}"
-    printf '  %s3%s  Reapply settings\n' "${ACC}" "${RST}"
-    printf '  %s4%s  Add port\n' "${ACC}" "${RST}"
-    printf '  %s5%s  Remove port\n' "${ACC}" "${RST}"
-    printf '  %s6%s  Change exit node IP\n' "${ACC}" "${RST}"
-    printf '  %s7%s  Diagnostics\n' "${ACC}" "${RST}"
-    printf '  %s8%s  Speedtest\n' "${ACC}" "${RST}"
-    printf '  %s0%s  Back\n\n' "${ACC}" "${RST}"
-    local c; c="$(ask 'Select')"
-    echo
-    case "${c}" in
-      1) restart_relay_service || true ;;
-      2) relay_rewrite_config || true ;;
-      3) relay_reapply_settings || true ;;
-      4) relay_add_port || true ;;
-      5) relay_remove_port || true ;;
-      6) relay_change_exit_ip || true ;;
-      7) relay_diagnose || true ;;
-      8) relay_speedtest || true ;;
-      0) break ;;
-      *) fail "Invalid selection." ;;
-    esac
-    echo
-  done
-}
-
-quick_deploy_relay() {
-  rule
-  info "Phormal Relay — quick deploy"
-  rule
-
-  local role_choice
-  printf '  %s1%s  Exit node\n' "${ACC}" "${RST}"
-  printf '  %s2%s  Entry node\n' "${ACC}" "${RST}"
-  role_choice="$(ask 'Node role')"
-
-  case "${role_choice}" in
-    1) deploy_relay_exit ;;
-    2) deploy_relay_entry ;;
-    *) fail "Unknown role."; return 1 ;;
-  esac
-}
-
 # ------------------------------------------------------------------------------
 #  OPS
 # ------------------------------------------------------------------------------
@@ -1298,7 +1350,7 @@ schedule_refresh() {
 systemctl daemon-reload
 systemctl restart 'phormal-fwd@*.service' 2>/dev/null || true
 systemctl restart phormal-guard.service 2>/dev/null || true
-systemctl restart phormal-relay.service 2>/dev/null || true
+systemctl restart 'phormal-relay@*.service' 2>/dev/null || true
 EOF
     chmod +x /usr/bin/phormal-refresh.sh
     ( crontab -l 2>/dev/null; echo "0 */${hrs} * * * /usr/bin/phormal-refresh.sh # phormal-refresh" ) | crontab -
@@ -1343,37 +1395,44 @@ status() {
   done
   [[ ${found} -eq 0 ]] && warn "no forwarder workers configured"
   echo
-  info "RELAY"
-  if [[ -f "${RELAY_CONF}" ]]; then
-    local r_role r_listen r_remote
-    r_role="$(conf_get RELAY_ROLE)"
-    [[ -z "${r_role}" ]] && r_role="$(conf_get HY2_ROLE)"
-    r_listen="$(conf_get RELAY_LISTEN)"
-    [[ -z "${r_listen}" ]] && r_listen="$(conf_get HY2_LISTEN)"
-    r_remote="$(conf_get REMOTE_V4)"
-    printf '    role    : %s\n' "${r_role:-?}"
-    [[ -n "${r_listen}" ]] && printf '    link    : %s\n' "${r_listen}"
-    [[ -n "${r_remote}" ]] && printf '    exit ip : %s\n' "${r_remote}"
-    local r_st; r_st="$(systemctl is-active phormal-relay.service 2>/dev/null || echo unknown)"
-    printf '    service : %s\n' "${r_st}"
-    if [[ "${r_st}" == "active" ]]; then good "relay running"; else warn "relay not active"; fi
-  else
-    warn "no relay configured"
-  fi
+  info "RELAY TUNNELS"
+  local any=0 n
+  while read -r n; do
+    [[ -n "${n}" ]] || continue
+    any=1
+    local role listen remote tgt
+    role="$(imeta_get "${n}" ROLE)"; listen="$(imeta_get "${n}" LISTEN)"; remote="$(imeta_get "${n}" REMOTE_V4)"
+    if [[ "${role}" == "entry" ]]; then tgt="${remote}:${listen}"; else tgt=":${listen}"; fi
+    printf '    %-16s %-6s %-22s %s\n' "${n}" "${role}" "${tgt}" "$(relay_svc_state "${n}")"
+  done < <(relay_instances)
+  [[ ${any} -eq 0 ]] && warn "no relay tunnels configured"
   rule
 }
 
 purge() {
   local c; c="$(ask 'Remove Phormal entirely? (y/n)')"
   [[ "${c}" != "y" ]] && { info "Cancelled."; return; }
-  systemctl stop    'phormal-fwd@*.service' 2>/dev/null || true
-  systemctl disable 'phormal-fwd@*.service' 2>/dev/null || true
+  # bridge forwarders
+  for u in /etc/systemd/system/phormal-fwd@*.service; do
+    [[ -e "${u}" ]] || continue
+    local nm; nm="$(basename "${u}")"
+    systemctl stop "${nm}" 2>/dev/null || true
+    systemctl disable "${nm}" 2>/dev/null || true
+  done
   rm -f /etc/systemd/system/phormal-fwd@*.service
-  systemctl stop phormal-relay.service 2>/dev/null || true
-  systemctl disable phormal-relay.service 2>/dev/null || true
-  systemctl stop phormal-hysteria.service 2>/dev/null || true
-  systemctl disable phormal-hysteria.service 2>/dev/null || true
+  # relay instances (new template)
+  local n
+  while read -r n; do
+    [[ -n "${n}" ]] || continue
+    systemctl stop "$(relay_svc "${n}")" 2>/dev/null || true
+    systemctl disable "$(relay_svc "${n}")" 2>/dev/null || true
+  done < <(relay_instances)
+  rm -f "${RELAY_TEMPLATE_UNIT}" "${RELAY_RUN}"
+  # legacy single-instance relay + hysteria units
+  systemctl stop phormal-relay.service phormal-hysteria.service 2>/dev/null || true
+  systemctl disable phormal-relay.service phormal-hysteria.service 2>/dev/null || true
   rm -f "${RELAY_UNIT}" /etc/systemd/system/phormal-hysteria.service
+  # bridge core/guard
   for s in phormal-guard phormal-core; do
     systemctl stop "${s}.service" 2>/dev/null || true
     systemctl disable "${s}.service" 2>/dev/null || true
@@ -1405,7 +1464,6 @@ quick_deploy_bridge() {
 }
 
 install_cli() {
-  # Make `phormal` runnable from anywhere after first run
   local src; src="$(readlink -f "$0" 2>/dev/null || echo "$0")"
   if [[ "${src}" != "${CLI_LINK}" ]]; then
     cp -f "${src}" "${CLI_LINK}" 2>/dev/null && chmod +x "${CLI_LINK}" 2>/dev/null || true
@@ -1423,11 +1481,11 @@ menu() {
     printf '    %s2%s  Link only\n' "${ACC}" "${RST}"
     printf '    %s3%s  Port publisher only\n' "${ACC}" "${RST}"
     printf '    %s4%s  Manage\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL RELAY%s\n' "${BOLD}" "${RST}"
-    printf '    %s5%s  Quick deploy\n' "${ACC}" "${RST}"
-    printf '    %s6%s  Exit node only\n' "${ACC}" "${RST}"
-    printf '    %s7%s  Entry node only\n' "${ACC}" "${RST}"
-    printf '    %s8%s  Manage\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL RELAY%s  %s(multi-tunnel)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '    %s5%s  Add exit tunnel   %s(this server = kharej)%s\n' "${ACC}" "${RST}" "${MUT}" "${RST}"
+    printf '    %s6%s  Add entry tunnel  %s(this server = iran)%s\n' "${ACC}" "${RST}" "${MUT}" "${RST}"
+    printf '    %s7%s  Manage tunnels    %s(list / edit / delete / restart)%s\n' "${ACC}" "${RST}" "${MUT}" "${RST}"
+    printf '    %s8%s  Speedtest\n' "${ACC}" "${RST}"
     printf '\n  %sMANAGE%s\n' "${BOLD}" "${RST}"
     printf '    %s9%s  Status\n' "${ACC}" "${RST}"
     printf '   %s10%s  Phormal tuning\n' "${ACC}" "${RST}"
@@ -1443,10 +1501,10 @@ menu() {
       2) deploy_bridge_core ;;
       3) deploy_bridge_forwarder ;;
       4) manage_bridge_menu ;;
-      5) quick_deploy_relay ;;
-      6) deploy_relay_exit ;;
-      7) deploy_relay_entry ;;
-      8) manage_relay_menu ;;
+      5) create_exit_tunnel ;;
+      6) create_entry_tunnel ;;
+      7) manage_relay_menu ;;
+      8) relay_speedtest ;;
       9) status ;;
       10) tune_menu ;;
       11) retune_mtu ;;
