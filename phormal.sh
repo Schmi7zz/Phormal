@@ -34,6 +34,15 @@ readonly RELAY_BIN="/usr/local/bin/phormal-relay"
 readonly RELAY_UNIT="/etc/systemd/system/phormal-relay.service"
 readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 
+# Iran-hosted mirror for gost / hysteria (optional).
+# Entry nodes try this base URL before GitHub. Override per-server in
+# /etc/phormal/phormal.conf with  MIRROR_BASE=http://your-server/phormal
+# Files expected: gost-linux-amd64, gost-linux-arm64,
+#                 hysteria-linux-amd64, hysteria-linux-arm64
+readonly DEFAULT_MIRROR_BASE="http://85.198.16.108/phormal"
+readonly GOST_RELEASE_VERSION="3.2.6"
+readonly HYSTERIA_RELEASE_TAG="app/v2.9.2"
+
 # ------------------------------------------------------------------------------
 #  Presentation
 # ------------------------------------------------------------------------------
@@ -109,6 +118,34 @@ machine_arch() {
   esac
 }
 
+gost_upstream_tarball_url() {
+  printf 'https://github.com/go-gost/gost/releases/download/v%s/gost_%s_linux_%s.tar.gz' \
+    "${GOST_RELEASE_VERSION}" "${GOST_RELEASE_VERSION}" "$1"
+}
+
+hysteria_upstream_url() {
+  local enc="${HYSTERIA_RELEASE_TAG//\//%2F}"
+  printf 'https://github.com/apernet/hysteria/releases/download/%s/hysteria-linux-%s' "${enc}" "$1"
+}
+
+install_gost_from_release() {
+  local arch tmpdir tgz
+  arch="$(machine_arch)" || return 1
+  tgz="$(mktemp)"
+  tmpdir="$(mktemp -d)"
+  if ! fetch_url "$(gost_upstream_tarball_url "${arch}")" "${tgz}"; then
+    rm -f "${tgz}"
+    rm -rf "${tmpdir}"
+    return 1
+  fi
+  tar xzf "${tgz}" -C "${tmpdir}"
+  mv -f "${tmpdir}/gost" "${FWD_BIN}"
+  chmod +x "${FWD_BIN}"
+  rm -f "${tgz}"
+  rm -rf "${tmpdir}"
+  "${FWD_BIN}" -V >/dev/null 2>&1
+}
+
 install_local_binary() {
   local dest="$1"
   warn "Automatic download failed on this network."
@@ -119,6 +156,54 @@ install_local_binary() {
   cp -f "${path}" "${dest}"
   chmod +x "${dest}"
   good "Binary installed from local file."
+}
+
+mirror_base() {
+  local b
+  b="$(conf_get MIRROR_BASE)"
+  [[ -n "${b}" ]] && { printf '%s' "${b}"; return 0; }
+  [[ -n "${DEFAULT_MIRROR_BASE}" ]] && printf '%s' "${DEFAULT_MIRROR_BASE}"
+}
+
+mirror_fwd_url() {
+  local arch="$1" base
+  base="$(mirror_base)"
+  [[ -z "${base}" ]] && return 1
+  printf '%s/gost-linux-%s' "${base%/}" "${arch}"
+}
+
+mirror_relay_url() {
+  local arch="$1" base
+  base="$(mirror_base)"
+  [[ -z "${base}" ]] && return 1
+  printf '%s/hysteria-linux-%s' "${base%/}" "${arch}"
+}
+
+verify_fwd_tmp()   { [[ -x "$1" ]] && "$1" -V >/dev/null 2>&1; }
+verify_relay_tmp() { [[ -x "$1" ]] && "$1" version >/dev/null 2>&1; }
+
+fetch_binary() {
+  local dest="$1" verify_fn="$2" label="$3"; shift 3
+  local url tmp
+  for url in "$@"; do
+    [[ -z "${url}" ]] && continue
+    info "Downloading ${label}…"
+    tmp="${dest}.tmp"
+    rm -f "${tmp}"
+    if fetch_url "${url}" "${tmp}"; then
+      chmod +x "${tmp}"
+      if "${verify_fn}" "${tmp}"; then
+        mv -f "${tmp}" "${dest}"
+        good "${label} installed."
+        return 0
+      fi
+      warn "Downloaded file failed verification — trying next source…"
+    else
+      warn "Download failed: ${url}"
+    fi
+    rm -f "${tmp}"
+  done
+  return 1
 }
 
 random_core_prefix() {
@@ -265,6 +350,24 @@ install_engine() {
   info "Installing Phormal publisher engine…"
   apt_install_quiet curl wget tar gzip iptables
 
+  local arch urls=() mirror
+  if arch="$(machine_arch)"; then
+    if mirror="$(mirror_fwd_url "${arch}" 2>/dev/null || true)" && [[ -n "${mirror}" ]]; then
+      urls+=("${mirror}")
+    fi
+    if fetch_binary "${FWD_BIN}" verify_fwd_tmp \
+        "Phormal publisher engine (gost)" "${urls[@]}"; then
+      return 0
+    fi
+  fi
+
+  info "Mirror unavailable — trying upstream gost release v${GOST_RELEASE_VERSION}…"
+  if install_gost_from_release; then
+    good "Phormal publisher engine installed."
+    return 0
+  fi
+
+  info "Trying gost install script…"
   if bash <(curl -fsSL --connect-timeout 20 --max-time 180 \
       https://github.com/go-gost/gost/raw/master/install.sh) --install >/dev/null 2>&1 \
      && have gost; then
@@ -272,8 +375,10 @@ install_engine() {
     good "Phormal publisher engine installed."
     return 0
   fi
-  fail "Publisher engine install failed. Check connectivity and retry."
-  return 1
+
+  install_local_binary "${FWD_BIN}" || { fail "Publisher engine install failed."; return 1; }
+  "${FWD_BIN}" -V >/dev/null 2>&1 || { fail "Binary is not runnable."; return 1; }
+  good "Phormal publisher engine installed."
 }
 
 gather_ports() {
@@ -825,26 +930,19 @@ install_relay_engine() {
   info "Installing Phormal Relay engine…"
   apt_install_quiet curl wget ca-certificates openssl libcap2-bin
 
-  local arch urls url
+  local arch urls=() mirror
   arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
 
-  urls=(
-    "https://download.hysteria.network/app/latest/hysteria-linux-${arch}"
-    "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${arch}"
-  )
+  if mirror="$(mirror_relay_url "${arch}" 2>/dev/null || true)" && [[ -n "${mirror}" ]]; then
+    urls+=("${mirror}")
+  fi
+  urls+=( "$(hysteria_upstream_url "${arch}")" )
 
-  for url in "${urls[@]}"; do
-    info "Downloading engine (timeout 3 min)…"
-    if fetch_url "${url}" "${RELAY_BIN}.tmp"; then
-      chmod +x "${RELAY_BIN}.tmp"
-      mv -f "${RELAY_BIN}.tmp" "${RELAY_BIN}"
-      setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
-      good "Phormal Relay engine installed."
-      return 0
-    fi
-    warn "Download failed — trying next source…"
-    rm -f "${RELAY_BIN}.tmp"
-  done
+  if fetch_binary "${RELAY_BIN}" verify_relay_tmp \
+      "Phormal Relay engine (hysteria)" "${urls[@]}"; then
+    setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
+    return 0
+  fi
 
   install_local_binary "${RELAY_BIN}" || return 1
   setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
