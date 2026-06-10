@@ -219,8 +219,7 @@ choose_binary_source() {
   rule
   info "Binary download source (gost + hysteria)"
   rule
-  printf '  %s1%s  Mirror — %s (fast inside Iran) [default]\n' \
-    "${ACC}" "${RST}" "${DEFAULT_MIRROR_BASE}"
+  printf '  %s1%s  Iran mirror download [default]\n' "${ACC}" "${RST}"
   printf '  %s2%s  GitHub — official pinned releases\n' "${ACC}" "${RST}"
   printf '  %s3%s  Manual — files already in %s\n' "${ACC}" "${RST}" "${MANUAL_DIR}"
   printf '\n'
