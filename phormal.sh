@@ -217,7 +217,7 @@ reset_binary_source() { BINARY_SOURCE=""; }
 choose_binary_source() {
   [[ -n "${BINARY_SOURCE}" ]] && return 0
   rule
-  info "Binary download source (gost + hysteria)"
+  info "Binary download source"
   rule
   printf '  %s1%s  Iran mirror download [default]\n' "${ACC}" "${RST}"
   printf '  %s2%s  GitHub — official pinned releases\n' "${ACC}" "${RST}"
@@ -429,7 +429,7 @@ install_engine() {
         urls+=("${mirror}")
       fi
       if fetch_binary "${FWD_BIN}" verify_fwd_tmp \
-          "Phormal publisher engine (gost)" "${urls[@]}"; then
+          "Phormal publisher engine" "${urls[@]}"; then
         return 0
       fi
     fi
