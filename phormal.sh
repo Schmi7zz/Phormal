@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="4.1.5"
+readonly PHORMAL_VERSION="4.1.6"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -217,7 +217,7 @@ reset_binary_source() { BINARY_SOURCE=""; }
 choose_binary_source() {
   [[ -n "${BINARY_SOURCE}" ]] && return 0
   rule
-  info "Binary download source"
+  info "Binary download source (gost + hysteria)"
   rule
   printf '  %s1%s  Iran mirror download [default]\n' "${ACC}" "${RST}"
   printf '  %s2%s  GitHub — official pinned releases\n' "${ACC}" "${RST}"
@@ -429,7 +429,7 @@ install_engine() {
         urls+=("${mirror}")
       fi
       if fetch_binary "${FWD_BIN}" verify_fwd_tmp \
-          "Phormal publisher engine" "${urls[@]}"; then
+          "Phormal publisher engine (gost)" "${urls[@]}"; then
         return 0
       fi
     fi
@@ -872,7 +872,7 @@ create_bridge_exit() {
   info "Create one exit link per Iran peer. Run your service locally."
   rule
 
-  install_engine >/dev/null 2>&1 || true
+  # Exit links do not run gost — skip install_engine (silent redirect hid the source menu and hung).
   apply_tuning fq
   bridge_install_runtime
 
