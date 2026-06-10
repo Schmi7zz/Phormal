@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="3.3.2"
+readonly PHORMAL_VERSION="3.4.0"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -42,6 +42,10 @@ readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 readonly DEFAULT_MIRROR_BASE="http://85.198.16.108/phormal"
 readonly GOST_RELEASE_VERSION="3.2.6"
 readonly HYSTERIA_RELEASE_TAG="app/v2.9.2"
+readonly MANUAL_DIR="/root/phormal"
+
+# Set once per phormal invocation when a binary must be downloaded (mirror/github/manual).
+BINARY_SOURCE=""
 
 # ------------------------------------------------------------------------------
 #  Presentation
@@ -122,6 +126,8 @@ gost_upstream_tarball_url() {
   printf 'https://github.com/go-gost/gost/releases/download/v%s/gost_%s_linux_%s.tar.gz' \
     "${GOST_RELEASE_VERSION}" "${GOST_RELEASE_VERSION}" "$1"
 }
+
+gost_release_url() { gost_upstream_tarball_url "$1"; }
 
 hysteria_upstream_url() {
   # GitHub serves release assets at the literal tag path (app/v2.9.2), NOT url-encoded
@@ -204,6 +210,66 @@ fetch_binary() {
     rm -f "${tmp}"
   done
   return 1
+}
+
+reset_binary_source() { BINARY_SOURCE=""; }
+
+choose_binary_source() {
+  [[ -n "${BINARY_SOURCE}" ]] && return 0
+  rule
+  info "Binary download source (gost + hysteria)"
+  rule
+  printf '  %s1%s  Mirror — %s (fast inside Iran) [default]\n' \
+    "${ACC}" "${RST}" "${DEFAULT_MIRROR_BASE}"
+  printf '  %s2%s  GitHub — official pinned releases\n' "${ACC}" "${RST}"
+  printf '  %s3%s  Manual — files already in %s\n' "${ACC}" "${RST}" "${MANUAL_DIR}"
+  printf '\n'
+  local c; c="$(ask 'Select [1]')"; c="${c:-1}"
+  case "${c}" in
+    1|"") BINARY_SOURCE="mirror" ;;
+    2)    BINARY_SOURCE="github" ;;
+    3)    BINARY_SOURCE="manual" ;;
+    *)    BINARY_SOURCE="mirror" ;;
+  esac
+}
+
+install_manual_fwd() {
+  local arch src
+  arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
+  src="${MANUAL_DIR}/gost-linux-${arch}"
+  if [[ ! -f "${src}" ]]; then
+    fail "Place the gost binary at ${src}"
+    info "Download it from: $(gost_release_url "${arch}")"
+    return 1
+  fi
+  cp -f "${src}" "${FWD_BIN}"
+  chmod +x "${FWD_BIN}"
+  if ! verify_fwd_tmp "${FWD_BIN}"; then
+    fail "Binary at ${src} failed verification."
+    info "Download it from: $(gost_release_url "${arch}")"
+    return 1
+  fi
+  good "Phormal publisher engine installed (manual)."
+}
+
+install_manual_relay() {
+  local arch src
+  arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
+  src="${MANUAL_DIR}/hysteria-linux-${arch}"
+  if [[ ! -f "${src}" ]]; then
+    fail "Place the hysteria binary at ${src}"
+    info "Download it from: $(hysteria_upstream_url "${arch}")"
+    return 1
+  fi
+  cp -f "${src}" "${RELAY_BIN}"
+  chmod +x "${RELAY_BIN}"
+  if ! verify_relay_tmp "${RELAY_BIN}"; then
+    fail "Binary at ${src} failed verification."
+    info "Download it from: $(hysteria_upstream_url "${arch}")"
+    return 1
+  fi
+  setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
+  good "Phormal Relay engine installed (manual)."
 }
 
 random_core_prefix() {
@@ -347,24 +413,38 @@ install_engine() {
     good "Phormal publisher engine present."
     return 0
   fi
+  choose_binary_source || true
   info "Installing Phormal publisher engine…"
-  apt_install_quiet curl wget tar gzip iptables
 
-  local arch urls=() mirror
-  if arch="$(machine_arch)"; then
-    if mirror="$(mirror_fwd_url "${arch}" 2>/dev/null || true)" && [[ -n "${mirror}" ]]; then
-      urls+=("${mirror}")
-    fi
-    if fetch_binary "${FWD_BIN}" verify_fwd_tmp \
-        "Phormal publisher engine (gost)" "${urls[@]}"; then
-      return 0
-    fi
+  if [[ "${BINARY_SOURCE}" == "manual" ]]; then
+    install_manual_fwd || return 1
+    return 0
   fi
 
-  info "Mirror unavailable — trying upstream gost release v${GOST_RELEASE_VERSION}…"
-  if install_gost_from_release; then
-    good "Phormal publisher engine installed."
-    return 0
+  apt_install_quiet curl wget tar gzip iptables
+
+  if [[ "${BINARY_SOURCE}" == "mirror" ]]; then
+    local arch urls=() mirror
+    if arch="$(machine_arch)"; then
+      if mirror="$(mirror_fwd_url "${arch}" 2>/dev/null || true)" && [[ -n "${mirror}" ]]; then
+        urls+=("${mirror}")
+      fi
+      if fetch_binary "${FWD_BIN}" verify_fwd_tmp \
+          "Phormal publisher engine (gost)" "${urls[@]}"; then
+        return 0
+      fi
+    fi
+    info "Mirror unavailable — trying upstream gost release v${GOST_RELEASE_VERSION}…"
+    if install_gost_from_release; then
+      good "Phormal publisher engine installed."
+      return 0
+    fi
+  elif [[ "${BINARY_SOURCE}" == "github" ]]; then
+    info "Fetching gost release v${GOST_RELEASE_VERSION} from GitHub…"
+    if install_gost_from_release; then
+      good "Phormal publisher engine installed."
+      return 0
+    fi
   fi
 
   info "Trying gost install script…"
@@ -401,6 +481,16 @@ gather_ports() {
     done
   fi
   printf '%s' "${merged}" | tr ',' '\n' | awk 'NF && !seen[$0]++' | paste -sd, -
+}
+
+first_port_from_list() {
+  local list="$1" p
+  IFS=',' read -ra parr <<< "${list}"
+  for p in "${parr[@]}"; do
+    p="${p// /}"
+    [[ -n "${p}" && "${p}" =~ ^[0-9]+$ ]] && { printf '%s' "${p}"; return 0; }
+  done
+  return 1
 }
 
 # ------------------------------------------------------------------------------
@@ -1123,21 +1213,37 @@ install_relay_engine() {
     good "Phormal Relay engine present."
     return 0
   fi
+  choose_binary_source || true
   info "Installing Phormal Relay engine…"
+
+  if [[ "${BINARY_SOURCE}" == "manual" ]]; then
+    install_manual_relay || return 1
+    return 0
+  fi
+
   apt_install_quiet curl wget ca-certificates openssl libcap2-bin
 
-  local arch urls=() mirror
+  local arch urls=()
   arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
 
-  if mirror="$(mirror_relay_url "${arch}" 2>/dev/null || true)" && [[ -n "${mirror}" ]]; then
-    urls+=("${mirror}")
-  fi
-  urls+=( "$(hysteria_upstream_url "${arch}")" )
-
-  if fetch_binary "${RELAY_BIN}" verify_relay_tmp \
-      "Phormal Relay engine (hysteria)" "${urls[@]}"; then
-    setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
-    return 0
+  if [[ "${BINARY_SOURCE}" == "mirror" ]]; then
+    local mirror
+    if mirror="$(mirror_relay_url "${arch}" 2>/dev/null || true)" && [[ -n "${mirror}" ]]; then
+      urls+=("${mirror}")
+    fi
+    urls+=( "$(hysteria_upstream_url "${arch}")" )
+    if fetch_binary "${RELAY_BIN}" verify_relay_tmp \
+        "Phormal Relay engine (hysteria)" "${urls[@]}"; then
+      setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
+      return 0
+    fi
+  elif [[ "${BINARY_SOURCE}" == "github" ]]; then
+    urls+=( "$(hysteria_upstream_url "${arch}")" )
+    if fetch_binary "${RELAY_BIN}" verify_relay_tmp \
+        "Phormal Relay engine (hysteria)" "${urls[@]}"; then
+      setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
+      return 0
+    fi
   fi
 
   install_local_binary "${RELAY_BIN}" || return 1
@@ -1226,6 +1332,72 @@ imeta_set() {
   else
     echo "${key}=${val}" >> "${f}"
   fi
+}
+
+relay_cdn_site_available() { printf '/etc/nginx/sites-available/phormal-%s.conf' "$1"; }
+relay_cdn_site_enabled()   { printf '/etc/nginx/sites-enabled/phormal-%s.conf' "$1"; }
+
+relay_cdn_remove() {
+  local name="$1"
+  rm -f "$(relay_cdn_site_enabled "${name}")" "$(relay_cdn_site_available "${name}")" 2>/dev/null || true
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx 2>/dev/null || true
+    good "CDN nginx site removed for tunnel '${name}'."
+  else
+    warn "nginx config test failed after removing CDN site — check /etc/nginx/."
+  fi
+}
+
+relay_cdn_setup_nginx() {
+  local name="$1" domain="$2" path="$3" port="$4"
+  local sa se
+  sa="$(relay_cdn_site_available "${name}")"
+  se="$(relay_cdn_site_enabled "${name}")"
+
+  apt_install_quiet nginx
+  if ! have nginx; then
+    fail "nginx could not be installed — CDN front skipped."
+    return 1
+  fi
+
+  if ss -tlnp 2>/dev/null | grep -qE ':80\s'; then
+    if ! ss -tlnp 2>/dev/null | grep ':80' | grep -qi nginx; then
+      warn "Port 80 may already be in use — ensure server_name ${domain} routes correctly."
+    fi
+  fi
+
+  cat > "${sa}" <<EOF
+server {
+    listen 80;
+    server_name ${domain};
+
+    location ${path} {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 86400;
+    }
+
+    location / {
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+    }
+}
+EOF
+  ln -sf "${sa}" "${se}"
+  if nginx -t 2>/dev/null; then
+    systemctl enable nginx 2>/dev/null || true
+    systemctl reload nginx 2>/dev/null || systemctl start nginx 2>/dev/null || true
+    good "CDN nginx: ${domain}${path} → 127.0.0.1:${port}"
+    return 0
+  fi
+  fail "nginx config test failed:"
+  nginx -t 2>&1 | sed 's/^/    /' || true
+  return 1
 }
 
 relay_svc()        { printf 'phormal-relay@%s.service' "$1"; }
@@ -1529,6 +1701,33 @@ create_entry_tunnel() {
   [[ -z "${ports}" ]] && { fail "No valid ports provided."; rm -rf "$(relay_idir "${name}")"; return 1; }
   imeta_set "${name}" PORTS "${ports}"
 
+  local cdn_ans cdn_domain cdn_path cdn_port fp
+  cdn_ans="$(ask 'Put this entry behind a CDN (ArvanCloud) over port 80 + WebSocket? (y/n) [n]')"
+  cdn_ans="${cdn_ans:-n}"
+  if [[ "${cdn_ans}" =~ ^[Yy] ]]; then
+    cdn_domain="$(ask 'CDN domain (proxied through Arvan to this server)')"
+    if [[ -z "${cdn_domain}" ]]; then
+      fail "CDN domain is required."
+      rm -rf "$(relay_idir "${name}")"
+      return 1
+    fi
+    cdn_path="$(ask 'WebSocket path (must match Xray inbound) [/phormalws]')"
+    cdn_path="${cdn_path:-/phormalws}"
+    [[ "${cdn_path}" != /* ]] && cdn_path="/${cdn_path}"
+    fp="$(first_port_from_list "${ports}" || true)"
+    cdn_port="$(ask "Local entry port to proxy to [${fp:-first user port}]")"
+    cdn_port="${cdn_port:-${fp}}"
+    [[ "${cdn_port}" =~ ^[0-9]+$ ]] || { fail "Invalid local port."; rm -rf "$(relay_idir "${name}")"; return 1; }
+    imeta_set "${name}" CDN_ENABLED "1"
+    imeta_set "${name}" CDN_DOMAIN "${cdn_domain}"
+    imeta_set "${name}" CDN_PATH "${cdn_path}"
+    imeta_set "${name}" CDN_PORT "${cdn_port}"
+    relay_cdn_setup_nginx "${name}" "${cdn_domain}" "${cdn_path}" "${cdn_port}" || \
+      warn "CDN nginx setup failed — tunnel will still listen on local ports."
+  else
+    imeta_set "${name}" CDN_ENABLED "0"
+  fi
+
   write_instance_entry_config "${name}"
   relay_start_instance "${name}" || return 1
 
@@ -1536,6 +1735,10 @@ create_entry_tunnel() {
   good "Entry tunnel '${name}' live — ports: ${ports}"
   info "  Link target : ${server_ip}:${listen}"
   good "Point users at THIS server's public IP on those ports (never the exit IP)."
+  if [[ "$(imeta_get "${name}" CDN_ENABLED)" == "1" ]]; then
+    info "  CDN front   : http://$(imeta_get "${name}" CDN_DOMAIN)$(imeta_get "${name}" CDN_PATH)"
+    warn "If Arvan later blocks WebSocket, point clients at this server's IP:$(imeta_get "${name}" CDN_PORT) — the Relay tunnel keeps working without nginx."
+  fi
   echo
   diagnose_instance "${name}"
 }
@@ -1572,6 +1775,20 @@ diagnose_instance() {
     info "Link target: ${remote}:${listen%-*}"
     if journalctl -u "${svc}" --since '3 min ago' 2>/dev/null | grep -q 'forwarding error'; then
       warn "Recent forwarding errors — check link port + passwords match the exit, and that the exit's service is up."
+    fi
+    if [[ "$(imeta_get "${name}" CDN_ENABLED)" == "1" ]]; then
+      info "CDN domain : $(imeta_get "${name}" CDN_DOMAIN)"
+      info "CDN path   : $(imeta_get "${name}" CDN_PATH) → 127.0.0.1:$(imeta_get "${name}" CDN_PORT)"
+      if systemctl is-active nginx >/dev/null 2>&1; then
+        good "nginx active"
+      else
+        warn "nginx not active"
+      fi
+      if ss -tlnp 2>/dev/null | grep -qE ':80\s'; then
+        good "port 80 listening"
+      else
+        warn "port 80 not listening"
+      fi
     fi
   elif [[ "${role}" == "exit" ]]; then
     local hp="${listen%-*}"
@@ -1700,6 +1917,9 @@ instance_delete() {
   local name="$1" svc; svc="$(relay_svc "${name}")"
   local c; c="$(ask "Delete tunnel '${name}' permanently? (y/n)")"
   [[ "${c}" != "y" ]] && { info "Cancelled."; return 0; }
+  if [[ "$(imeta_get "${name}" CDN_ENABLED)" == "1" ]]; then
+    relay_cdn_remove "${name}" || true
+  fi
   systemctl stop "${svc}" 2>/dev/null || true
   systemctl disable "${svc}" 2>/dev/null || true
   rm -rf "$(relay_idir "${name}")"
