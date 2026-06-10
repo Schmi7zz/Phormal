@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="3.4.0"
+readonly PHORMAL_VERSION="3.5.0"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -1334,71 +1334,95 @@ imeta_set() {
   fi
 }
 
-relay_cdn_site_available() { printf '/etc/nginx/sites-available/phormal-%s.conf' "$1"; }
-relay_cdn_site_enabled()   { printf '/etc/nginx/sites-enabled/phormal-%s.conf' "$1"; }
+readonly CDN_TMPL="/etc/systemd/system/phormal-cdn@.service"
+readonly CDN_RUN="/usr/local/bin/phormal-cdn-run"
+
+cdn_svc()       { printf 'phormal-cdn@%s.service' "$1"; }
+cdn_svc_state() { systemctl is-active "$(cdn_svc "$1")" 2>/dev/null || echo unknown; }
+
+# gost is the same binary used by Bridge publishers; for CDN we reuse it and the
+# same source selection (mirror / github / manual), just with CDN wording.
+install_cdn_engine() {
+  if [[ -x "${FWD_BIN}" ]] && "${FWD_BIN}" -V >/dev/null 2>&1; then
+    good "Phormal CDN engine present."
+    return 0
+  fi
+  info "Downloading Phormal CDN engine…"
+  install_engine
+}
+
+cdn_install_runtime() {
+  cat > "${CDN_RUN}" <<EOF
+#!/usr/bin/env bash
+# Phormal CDN front — raw TCP from the CDN port to the local relay entry port.
+# The WebSocket layer is terminated on the EXIT (Xray ws inbound), so here we
+# just pass bytes through transparently.
+set -e
+name="\$1"
+dir="${RELAY_DIR}/\${name}"
+[[ -f "\${dir}/meta.conf" ]] || { echo "no such tunnel: \${name}" >&2; exit 1; }
+get(){ grep -E "^\$1=" "\${dir}/meta.conf" | head -n1 | cut -d= -f2-; }
+LISTEN="\$(get CDN_LISTEN)"; LISTEN="\${LISTEN:-80}"
+PORT="\$(get CDN_PORT)"
+[[ -n "\${PORT}" ]] || { echo "CDN_PORT empty in meta.conf" >&2; exit 1; }
+exec ${FWD_BIN} -L="tcp://:\${LISTEN}/127.0.0.1:\${PORT}"
+EOF
+  chmod +x "${CDN_RUN}"
+
+  cat > "${CDN_TMPL}" <<EOF
+[Unit]
+Description=Phormal CDN front (%i)
+After=network-online.target phormal-relay@%i.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="GOST_LOGGER_LEVEL=fatal"
+ExecStart=${CDN_RUN} %i
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
 
 relay_cdn_remove() {
   local name="$1"
-  rm -f "$(relay_cdn_site_enabled "${name}")" "$(relay_cdn_site_available "${name}")" 2>/dev/null || true
-  if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx 2>/dev/null || true
-    good "CDN nginx site removed for tunnel '${name}'."
-  else
-    warn "nginx config test failed after removing CDN site — check /etc/nginx/."
-  fi
+  systemctl stop    "$(cdn_svc "${name}")" 2>/dev/null || true
+  systemctl disable "$(cdn_svc "${name}")" 2>/dev/null || true
+  systemctl daemon-reload
+  good "CDN front removed for tunnel '${name}'."
 }
 
-relay_cdn_setup_nginx() {
-  local name="$1" domain="$2" path="$3" port="$4"
-  local sa se
-  sa="$(relay_cdn_site_available "${name}")"
-  se="$(relay_cdn_site_enabled "${name}")"
+# Set up the gost-based CDN front for an entry tunnel.
+#   $1 name   $2 listen-port (public, from CDN)   $3 target-port (local relay entry)
+relay_cdn_setup() {
+  local name="$1" listen="$2" port="$3"
+  install_cdn_engine || { fail "CDN engine unavailable — CDN front skipped."; return 1; }
 
-  apt_install_quiet nginx
-  if ! have nginx; then
-    fail "nginx could not be installed — CDN front skipped."
-    return 1
+  if ss -tln 2>/dev/null | grep -qE ":${listen}\b"; then
+    warn "Port ${listen} already in use — the CDN front may fail to bind."
   fi
 
-  if ss -tlnp 2>/dev/null | grep -qE ':80\s'; then
-    if ! ss -tlnp 2>/dev/null | grep ':80' | grep -qi nginx; then
-      warn "Port 80 may already be in use — ensure server_name ${domain} routes correctly."
-    fi
-  fi
+  imeta_set "${name}" CDN_LISTEN "${listen}"
+  imeta_set "${name}" CDN_PORT "${port}"
+  cdn_install_runtime
 
-  cat > "${sa}" <<EOF
-server {
-    listen 80;
-    server_name ${domain};
-
-    location ${path} {
-        proxy_pass http://127.0.0.1:${port};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_read_timeout 86400;
-    }
-
-    location / {
-        return 200 "ok\n";
-        add_header Content-Type text/plain;
-    }
-}
-EOF
-  ln -sf "${sa}" "${se}"
-  if nginx -t 2>/dev/null; then
-    systemctl enable nginx 2>/dev/null || true
-    systemctl reload nginx 2>/dev/null || systemctl start nginx 2>/dev/null || true
-    good "CDN nginx: ${domain}${path} → 127.0.0.1:${port}"
+  systemctl enable "$(cdn_svc "${name}")" >/dev/null 2>&1
+  systemctl restart "$(cdn_svc "${name}")"
+  sleep 1
+  if systemctl is-active "$(cdn_svc "${name}")" >/dev/null 2>&1; then
+    good "CDN front live: port ${listen} → 127.0.0.1:${port}"
     return 0
   fi
-  fail "nginx config test failed:"
-  nginx -t 2>&1 | sed 's/^/    /' || true
+  fail "CDN front failed to start. Recent log:"
+  journalctl -u "$(cdn_svc "${name}")" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'
   return 1
 }
+
 
 relay_svc()        { printf 'phormal-relay@%s.service' "$1"; }
 relay_svc_state()  { systemctl is-active "$(relay_svc "$1")" 2>/dev/null || echo unknown; }
@@ -1701,7 +1725,7 @@ create_entry_tunnel() {
   [[ -z "${ports}" ]] && { fail "No valid ports provided."; rm -rf "$(relay_idir "${name}")"; return 1; }
   imeta_set "${name}" PORTS "${ports}"
 
-  local cdn_ans cdn_domain cdn_path cdn_port fp
+  local cdn_ans cdn_domain cdn_path cdn_listen cdn_port fp
   cdn_ans="$(ask 'Put this entry behind a CDN (ArvanCloud) over port 80 + WebSocket? (y/n) [n]')"
   cdn_ans="${cdn_ans:-n}"
   if [[ "${cdn_ans}" =~ ^[Yy] ]]; then
@@ -1714,16 +1738,18 @@ create_entry_tunnel() {
     cdn_path="$(ask 'WebSocket path (must match Xray inbound) [/phormalws]')"
     cdn_path="${cdn_path:-/phormalws}"
     [[ "${cdn_path}" != /* ]] && cdn_path="/${cdn_path}"
+    cdn_listen="$(ask 'CDN listen port on this server (Arvan sends here) [80]')"
+    cdn_listen="${cdn_listen:-80}"
+    [[ "${cdn_listen}" =~ ^[0-9]+$ ]] || { fail "Invalid listen port."; rm -rf "$(relay_idir "${name}")"; return 1; }
     fp="$(first_port_from_list "${ports}" || true)"
-    cdn_port="$(ask "Local entry port to proxy to [${fp:-first user port}]")"
+    cdn_port="$(ask "Local entry port to forward to [${fp:-first user port}]")"
     cdn_port="${cdn_port:-${fp}}"
     [[ "${cdn_port}" =~ ^[0-9]+$ ]] || { fail "Invalid local port."; rm -rf "$(relay_idir "${name}")"; return 1; }
     imeta_set "${name}" CDN_ENABLED "1"
     imeta_set "${name}" CDN_DOMAIN "${cdn_domain}"
     imeta_set "${name}" CDN_PATH "${cdn_path}"
-    imeta_set "${name}" CDN_PORT "${cdn_port}"
-    relay_cdn_setup_nginx "${name}" "${cdn_domain}" "${cdn_path}" "${cdn_port}" || \
-      warn "CDN nginx setup failed — tunnel will still listen on local ports."
+    relay_cdn_setup "${name}" "${cdn_listen}" "${cdn_port}" || \
+      warn "CDN front setup failed — tunnel will still listen on local ports."
   else
     imeta_set "${name}" CDN_ENABLED "0"
   fi
@@ -1736,8 +1762,9 @@ create_entry_tunnel() {
   info "  Link target : ${server_ip}:${listen}"
   good "Point users at THIS server's public IP on those ports (never the exit IP)."
   if [[ "$(imeta_get "${name}" CDN_ENABLED)" == "1" ]]; then
-    info "  CDN front   : http://$(imeta_get "${name}" CDN_DOMAIN)$(imeta_get "${name}" CDN_PATH)"
-    warn "If Arvan later blocks WebSocket, point clients at this server's IP:$(imeta_get "${name}" CDN_PORT) — the Relay tunnel keeps working without nginx."
+    info "  CDN front   : ${MUT}port $(imeta_get "${name}" CDN_LISTEN) → 127.0.0.1:$(imeta_get "${name}" CDN_PORT)${RST}"
+    info "  CDN client  : ${MUT}host $(imeta_get "${name}" CDN_DOMAIN), port $(imeta_get "${name}" CDN_LISTEN), ws path $(imeta_get "${name}" CDN_PATH)${RST}"
+    warn "If Arvan later blocks WebSocket, point clients at this server's IP:$(imeta_get "${name}" CDN_PORT) — the Relay tunnel keeps working without the CDN front."
   fi
   echo
   diagnose_instance "${name}"
@@ -1777,17 +1804,20 @@ diagnose_instance() {
       warn "Recent forwarding errors — check link port + passwords match the exit, and that the exit's service is up."
     fi
     if [[ "$(imeta_get "${name}" CDN_ENABLED)" == "1" ]]; then
+      local cl; cl="$(imeta_get "${name}" CDN_LISTEN)"; cl="${cl:-80}"
       info "CDN domain : $(imeta_get "${name}" CDN_DOMAIN)"
-      info "CDN path   : $(imeta_get "${name}" CDN_PATH) → 127.0.0.1:$(imeta_get "${name}" CDN_PORT)"
-      if systemctl is-active nginx >/dev/null 2>&1; then
-        good "nginx active"
+      info "CDN path   : $(imeta_get "${name}" CDN_PATH)  (terminated on the exit's Xray ws inbound)"
+      info "CDN front  : port ${cl} → 127.0.0.1:$(imeta_get "${name}" CDN_PORT)"
+      if [[ "$(cdn_svc_state "${name}")" == "active" ]]; then
+        good "CDN front service active"
       else
-        warn "nginx not active"
+        warn "CDN front service $(cdn_svc_state "${name}")"
+        journalctl -u "$(cdn_svc "${name}")" -n 8 --no-pager 2>/dev/null | sed 's/^/    /'
       fi
-      if ss -tlnp 2>/dev/null | grep -qE ':80\s'; then
-        good "port 80 listening"
+      if ss -tln 2>/dev/null | grep -qE ":${cl}\b"; then
+        good "port ${cl} listening"
       else
-        warn "port 80 not listening"
+        warn "port ${cl} not listening"
       fi
     fi
   elif [[ "${role}" == "exit" ]]; then
@@ -2104,8 +2134,18 @@ purge() {
     [[ -n "${n}" ]] || continue
     systemctl stop "$(relay_svc "${n}")" 2>/dev/null || true
     systemctl disable "$(relay_svc "${n}")" 2>/dev/null || true
+    systemctl stop "$(cdn_svc "${n}")" 2>/dev/null || true
+    systemctl disable "$(cdn_svc "${n}")" 2>/dev/null || true
   done < <(relay_instances)
   rm -f "${RELAY_TEMPLATE_UNIT}" "${RELAY_RUN}"
+  # CDN front (gost) template + any leftover instances
+  for u in /etc/systemd/system/phormal-cdn@*.service; do
+    [[ -e "${u}" ]] || continue
+    local cm; cm="$(basename "${u}")"
+    systemctl stop "${cm}" 2>/dev/null || true
+    systemctl disable "${cm}" 2>/dev/null || true
+  done
+  rm -f "${CDN_TMPL}" "${CDN_RUN}"
   # legacy single-instance relay + hysteria units
   systemctl stop phormal-relay.service phormal-hysteria.service 2>/dev/null || true
   systemctl disable phormal-relay.service phormal-hysteria.service 2>/dev/null || true

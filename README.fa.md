@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-3.4.0-7aa2f7?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-3.5.0-7aa2f7?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux-78dba9?style=flat-square">
   <img alt="shell" src="https://img.shields.io/badge/made%20with-Bash-f7768e?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-c0caf5?style=flat-square">
@@ -69,7 +69,7 @@ flowchart LR
 - **رفع باگ «ری‌استارت دو طرف» (Relay).** کلاینت حالا بلافاصله وصل می‌شود و تونل را با keepalive گرم نگه می‌دارد، به‌جای اتصال با تأخیر که اولین هندشیک را خراب می‌کرد. `fastOpen` و یک تأخیر کوتاه در بوت هم اضافه شد.
 - **منوی مقاوم.** اگر یک گزینه خطا بدهد دیگر کل برنامه بسته نمی‌شود؛ فقط پیام می‌دهد و به منو برمی‌گردد.
 - **انتخاب منبع باینری (۳.۴.۰).** موقع نصب gost/hysteria یک‌بار در هر اجرا انتخاب می‌کنی: **Mirror** (سریع داخل ایران)، **GitHub** (ریلیزهای رسمی پین‌شده)، یا **Manual** (خودت فایل‌ها را در `/root/phormal/` بگذار). حالت Manual اگر فایلی نبود، نام دقیق فایل و لینک رسمی دانلود را می‌گوید.
-- **فرانت CDN / WebSocket (۳.۴.۰).** موقع ساخت تونل **entry** رله می‌توانی آن را پشت CDN (مثل ابر آروان) روی پورت ۸۰ + WebSocket بگذاری: اسکریپت nginx را نصب و تنظیم می‌کند تا WS را ترمینیت کرده و به پورت لوکال تونل پاس بدهد. اگر CDN بعداً WebSocket را ببندد، کلاینت را مستقیم به IP:port سرور وصل کن — تونل بدون CDN هم کار می‌کند.
+- **فرانت CDN / WebSocket (۳.۴.۰).** موقع ساخت تونل **entry** رله می‌توانی آن را پشت CDN (مثل ابر آروان) روی پورت ۸۰ + WebSocket بگذاری: اسکریپت یک فرانت سبک gost (همان موتور، بدون nginx) اجرا می‌کند که پورت ۸۰ را به پورت لوکال تونل می‌فرستد؛ WebSocket روی Xray در خارج ترمینیت می‌شود. اگر CDN بعداً WebSocket را ببندد، کلاینت را مستقیم به IP:port سرور وصل کن — تونل بدون CDN هم کار می‌کند.
 
 ---
 

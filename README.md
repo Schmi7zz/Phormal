@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-3.4.0-7aa2f7?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-3.5.0-7aa2f7?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux-78dba9?style=flat-square">
   <img alt="shell" src="https://img.shields.io/badge/made%20with-Bash-f7768e?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-c0caf5?style=flat-square">
@@ -63,7 +63,7 @@ flowchart LR
 - **No more "restart both sides" bug (Relay).** The client now connects eagerly and keeps the tunnel warm with keepalive, instead of starting lazily and failing the first handshake. Added `fastOpen` and a short boot delay.
 - **Robust menu.** A failing action no longer aborts the whole tool — it just reports and returns to the menu.
 - **Choose your binary source (3.4.0).** When gost/hysteria need installing, pick once per run: **Mirror** (fast inside Iran), **GitHub** (official pinned releases), or **Manual** (drop the files in `/root/phormal/` yourself). Manual mode tells you the exact filename and official download URL if a file is missing.
-- **CDN / WebSocket front (3.4.0).** When creating a Relay **entry** tunnel you can optionally put it behind a CDN (e.g. ArvanCloud) on port 80 + WebSocket: the script installs and configures nginx to terminate the WS and proxy it to the local tunnel port. If the CDN later blocks WebSocket, point clients straight at the server IP:port — the tunnel keeps working.
+- **CDN / WebSocket front (3.4.0).** When creating a Relay **entry** tunnel you can optionally put it behind a CDN (e.g. ArvanCloud) on port 80 + WebSocket: the script runs a lightweight gost front (the same engine, no nginx) that forwards port 80 to the local tunnel port; the WebSocket is terminated on the exit’s Xray. If the CDN later blocks WebSocket, point clients straight at the server IP:port — the tunnel keeps working.
 
 ---
 
