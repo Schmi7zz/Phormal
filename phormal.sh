@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.1.7"
+readonly PHORMAL_VERSION="5.1.8"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -36,10 +36,11 @@ readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 
 # Iran-hosted mirror for gost / hysteria (optional).
 # Entry nodes try this base URL before GitHub. Override per-server in
-# /etc/phormal/phormal.conf with  MIRROR_BASE=http://your-server/phormal
-# Files expected: gost-linux-amd64, gost-linux-arm64,
-#                 hysteria-linux-amd64, hysteria-linux-arm64
-readonly DEFAULT_MIRROR_BASE="http://85.198.16.108/phormal"
+# /etc/phormal/phormal.conf with  MIRROR_BASE=http://your-server:8880/phormal
+# Files expected on the mirror host (served at MIRROR_BASE):
+#   gost-linux-{amd64,arm64}  hysteria-linux-{amd64,arm64}
+#   rathole-linux-{amd64,arm64}  spoof-linux-{amd64,arm64}  phormal.sh
+readonly DEFAULT_MIRROR_BASE="http://85.198.16.108:8880/phormal"
 readonly GOST_RELEASE_VERSION="3.2.6"
 readonly HYSTERIA_RELEASE_TAG="app/v2.9.2"
 readonly MANUAL_DIR="/root/phormal"
@@ -112,19 +113,61 @@ need_root() {
   fi
 }
 
-ensure_dirs() { mkdir -p "${PHORMAL_HOME}"; touch "${PHORMAL_LOG}" 2>/dev/null || true; }
+ensure_dirs() {
+  mkdir -p "${PHORMAL_HOME}"
+  touch "${PHORMAL_LOG}" 2>/dev/null || true
+  ensure_mirror_conf
+}
+
+# Seed / upgrade MIRROR_BASE so binary downloads use the Iran mirror on port 8880.
+ensure_mirror_conf() {
+  local cur legacy="http://85.198.16.108/phormal"
+  cur="$(conf_get MIRROR_BASE)"
+  if [[ -n "${cur}" ]]; then
+    [[ "${cur}" == "${legacy}" ]] && conf_set MIRROR_BASE "${DEFAULT_MIRROR_BASE}"
+    return 0
+  fi
+  [[ -n "${DEFAULT_MIRROR_BASE}" ]] && conf_set MIRROR_BASE "${DEFAULT_MIRROR_BASE}"
+}
 
 have()        { command -v "$1" >/dev/null 2>&1; }
 
 valid_ipv4()  { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 
+# Map Debian-style package names to RHEL/Alma equivalents when using dnf/yum.
+pkg_install_name() {
+  local p="$1"
+  if have apt-get; then
+    printf '%s' "${p}"
+    return 0
+  fi
+  case "${p}" in
+    libpcap0.8)  printf 'libpcap' ;;
+    iproute2)    printf 'iproute' ;;
+    libcap2-bin) printf 'libcap' ;;
+    *)           printf '%s' "${p}" ;;
+  esac
+}
+
 apt_install_quiet() {
-  local missing=() p
+  local missing=() install_pkgs=() p mapped
   for p in "$@"; do have "${p}" || missing+=("${p}"); done
   [[ ${#missing[@]} -eq 0 ]] && return 0
   info "Installing packages: ${missing[*]}…"
-  timeout 45 apt-get update -y >/dev/null 2>&1 || true
-  timeout 120 apt-get install -y "${missing[@]}" >/dev/null 2>&1 || true
+  if have apt-get; then
+    timeout 45 apt-get update -y >/dev/null 2>&1 || true
+    timeout 120 apt-get install -y "${missing[@]}" >/dev/null 2>&1 || true
+  elif have dnf || have yum; then
+    local pm; pm="dnf"; have dnf || pm="yum"
+    for p in "${missing[@]}"; do
+      mapped="$(pkg_install_name "${p}")"
+      install_pkgs+=("${mapped}")
+    done
+    timeout 180 "${pm}" install -y "${install_pkgs[@]}" >/dev/null 2>&1 || true
+  else
+    warn "No supported package manager (apt/dnf/yum) — install manually: ${missing[*]}"
+    return 1
+  fi
 }
 
 fetch_url() {
@@ -184,8 +227,8 @@ install_local_binary() {
 mirror_base() {
   local b
   b="$(conf_get MIRROR_BASE)"
-  [[ -n "${b}" ]] && { printf '%s' "${b}"; return 0; }
-  [[ -n "${DEFAULT_MIRROR_BASE}" ]] && printf '%s' "${DEFAULT_MIRROR_BASE}"
+  [[ -n "${b}" ]] && { printf '%s' "${b%/}"; return 0; }
+  [[ -n "${DEFAULT_MIRROR_BASE}" ]] && printf '%s' "${DEFAULT_MIRROR_BASE%/}"
 }
 
 mirror_fwd_url() {
@@ -483,7 +526,7 @@ conf_get() { [[ -f "${PHORMAL_CONF}" ]] && grep -E "^${1}=" "${PHORMAL_CONF}" | 
 
 conf_set() {
   local key="$1" val="$2"
-  ensure_dirs
+  mkdir -p "${PHORMAL_HOME}"
   if grep -qE "^${key}=" "${PHORMAL_CONF}" 2>/dev/null; then
     sed -i "s|^${key}=.*|${key}=${val}|" "${PHORMAL_CONF}"
   else
