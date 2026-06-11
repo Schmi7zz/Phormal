@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-4.2.0-7aa2f7?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-5.1.7-7aa2f7?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux-78dba9?style=flat-square">
   <img alt="shell" src="https://img.shields.io/badge/made%20with-Bash-f7768e?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-c0caf5?style=flat-square">
