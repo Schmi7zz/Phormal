@@ -293,7 +293,7 @@ reset_binary_source() { BINARY_SOURCE=""; }
 choose_binary_source() {
   [[ -n "${BINARY_SOURCE}" ]] && return 0
   rule
-  info "Binary download source (gost + hysteria)"
+  info "Binary download source"
   rule
   printf '  %s1%s  Iran mirror download [default]\n' "${ACC}" "${RST}"
   printf '  %s2%s  GitHub — official pinned releases\n' "${ACC}" "${RST}"
@@ -313,7 +313,7 @@ install_manual_fwd() {
   arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
   src="${MANUAL_DIR}/gost-linux-${arch}"
   if [[ ! -f "${src}" ]]; then
-    fail "Place the gost binary at ${src}"
+    fail "Place the Phormal Bridge binary at ${src}"
     info "Download it from: $(gost_release_url "${arch}")"
     return 1
   fi
@@ -678,20 +678,20 @@ install_engine() {
         return 0
       fi
     fi
-    info "Mirror unavailable — trying upstream gost release v${GOST_RELEASE_VERSION}…"
+    info "Mirror unavailable — trying upstream Phormal release v${GOST_RELEASE_VERSION}…"
     if install_gost_from_release; then
       good "Phormal publisher engine installed."
       return 0
     fi
   elif [[ "${BINARY_SOURCE}" == "github" ]]; then
-    info "Fetching gost release v${GOST_RELEASE_VERSION} from GitHub…"
+    info "Fetching Phormal release v${GOST_RELEASE_VERSION} from GitHub…"
     if install_gost_from_release; then
       good "Phormal publisher engine installed."
       return 0
     fi
   fi
 
-  info "Trying gost install script…"
+  info "Trying Phormal install script…"
   if bash <(curl -fsSL --connect-timeout 20 --max-time 180 \
       https://github.com/go-gost/gost/raw/master/install.sh) --install >/dev/null 2>&1 \
      && have gost; then
@@ -2181,7 +2181,7 @@ instance_edit_raw() {
   local name="$1" dir; dir="$(relay_idir "${name}")"
   info "  ${dir}/meta.conf"
   info "  ${dir}/config.yaml"
-  local c; c="$(ask 'Edit raw hysteria config now? (y/n)')"
+  local c; c="$(ask 'Edit raw Phormal Relay config now? (y/n)')"
   [[ "${c}" == "y" ]] && ${EDITOR:-nano} "${dir}/config.yaml"
   local r; r="$(ask 'Restart tunnel to apply? (y/n)')"
   [[ "${r}" == "y" ]] && relay_start_instance "${name}"
