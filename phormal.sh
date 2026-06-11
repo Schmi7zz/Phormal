@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.1.8"
+readonly PHORMAL_VERSION="5.1.9"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -133,6 +133,21 @@ ensure_mirror_conf() {
 have()        { command -v "$1" >/dev/null 2>&1; }
 
 valid_ipv4()  { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+
+# Strip ANSI colour codes accidentally captured from menu stdout.
+sanitize_meta_val() {
+  printf '%s' "$1" | sed 's/\x1b\[[0-9;]*m//g' | tr -d '\r'
+}
+
+reverse_proto_clean() {
+  local v; v="$(sanitize_meta_val "$1" | tr -cd 'a-z')"
+  [[ "${v}" == *udp* ]] && printf 'udp' || printf 'tcp'
+}
+
+reverse_nodelay_clean() {
+  local v; v="$(sanitize_meta_val "$1" | tr -d '[:space:]')"
+  [[ "${v}" == "false" ]] && printf 'false' || printf 'true'
+}
 
 # Map Debian-style package names to RHEL/Alma equivalents when using dnf/yum.
 pkg_install_name() {
@@ -293,7 +308,7 @@ reset_binary_source() { BINARY_SOURCE=""; }
 choose_binary_source() {
   [[ -n "${BINARY_SOURCE}" ]] && return 0
   rule
-  info "Binary download source"
+  info "Binary download source (gost + hysteria)"
   rule
   printf '  %s1%s  Iran mirror download [default]\n' "${ACC}" "${RST}"
   printf '  %s2%s  GitHub — official pinned releases\n' "${ACC}" "${RST}"
@@ -313,7 +328,7 @@ install_manual_fwd() {
   arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
   src="${MANUAL_DIR}/gost-linux-${arch}"
   if [[ ! -f "${src}" ]]; then
-    fail "Place the Phormal Bridge binary at ${src}"
+    fail "Place the gost binary at ${src}"
     info "Download it from: $(gost_release_url "${arch}")"
     return 1
   fi
@@ -678,20 +693,20 @@ install_engine() {
         return 0
       fi
     fi
-    info "Mirror unavailable — trying upstream Phormal release v${GOST_RELEASE_VERSION}…"
+    info "Mirror unavailable — trying upstream gost release v${GOST_RELEASE_VERSION}…"
     if install_gost_from_release; then
       good "Phormal publisher engine installed."
       return 0
     fi
   elif [[ "${BINARY_SOURCE}" == "github" ]]; then
-    info "Fetching Phormal release v${GOST_RELEASE_VERSION} from GitHub…"
+    info "Fetching gost release v${GOST_RELEASE_VERSION} from GitHub…"
     if install_gost_from_release; then
       good "Phormal publisher engine installed."
       return 0
     fi
   fi
 
-  info "Trying Phormal install script…"
+  info "Trying gost install script…"
   if bash <(curl -fsSL --connect-timeout 20 --max-time 180 \
       https://github.com/go-gost/gost/raw/master/install.sh) --install >/dev/null 2>&1 \
      && have gost; then
@@ -2181,7 +2196,7 @@ instance_edit_raw() {
   local name="$1" dir; dir="$(relay_idir "${name}")"
   info "  ${dir}/meta.conf"
   info "  ${dir}/config.yaml"
-  local c; c="$(ask 'Edit raw Phormal Relay config now? (y/n)')"
+  local c; c="$(ask 'Edit raw hysteria config now? (y/n)')"
   [[ "${c}" == "y" ]] && ${EDITOR:-nano} "${dir}/config.yaml"
   local r; r="$(ask 'Restart tunnel to apply? (y/n)')"
   [[ "${r}" == "y" ]] && relay_start_instance "${name}"
@@ -2341,8 +2356,10 @@ reverse_pick_name() {
 }
 
 reverse_prompt_proto() {
-  printf '  %s1%s  tcp [default]\n' "${ACC}" "${RST}"
-  printf '  %s2%s  udp\n' "${ACC}" "${RST}"
+  {
+    printf '  %s1%s  tcp [default]\n' "${ACC}" "${RST}"
+    printf '  %s2%s  udp\n' "${ACC}" "${RST}"
+  } >&2
   local c; c="$(ask 'Transport [1]')"; c="${c:-1}"
   case "${c}" in
     2) printf 'udp' ;;
@@ -2408,9 +2425,9 @@ write_reverse_entry_config() {
   link_port="$(rmeta_get "${name}" LINK_PORT)"; link_port="${link_port:-443}"
   token="$(rmeta_get "${name}" TOKEN)"
   ports="$(rmeta_get "${name}" PORTS)"
-  proto="$(rmeta_get "${name}" PROTO)"; proto="${proto:-tcp}"
-  nodelay="$(rmeta_get "${name}" NODELAY)"; nodelay="${nodelay:-true}"
-  heartbeat="$(rmeta_get "${name}" HEARTBEAT)"; heartbeat="${heartbeat:-30}"
+  proto="$(reverse_proto_clean "$(rmeta_get "${name}" PROTO)")"
+  nodelay="$(reverse_nodelay_clean "$(rmeta_get "${name}" NODELAY)")"
+  heartbeat="$(sanitize_meta_val "$(rmeta_get "${name}" HEARTBEAT)")"; heartbeat="${heartbeat:-30}"
 
   {
     echo "[server]"
@@ -2442,10 +2459,10 @@ write_reverse_exit_config() {
   link_port="$(rmeta_get "${name}" LINK_PORT)"; link_port="${link_port:-443}"
   token="$(rmeta_get "${name}" TOKEN)"
   ports="$(rmeta_get "${name}" PORTS)"
-  proto="$(rmeta_get "${name}" PROTO)"; proto="${proto:-tcp}"
-  nodelay="$(rmeta_get "${name}" NODELAY)"; nodelay="${nodelay:-true}"
-  heartbeat="$(rmeta_get "${name}" HEARTBEAT)"; heartbeat="${heartbeat:-30}"
-  local_host="$(rmeta_get "${name}" LOCAL_HOST)"; local_host="${local_host:-127.0.0.1}"
+  proto="$(reverse_proto_clean "$(rmeta_get "${name}" PROTO)")"
+  nodelay="$(reverse_nodelay_clean "$(rmeta_get "${name}" NODELAY)")"
+  heartbeat="$(sanitize_meta_val "$(rmeta_get "${name}" HEARTBEAT)")"; heartbeat="${heartbeat:-30}"
+  local_host="$(sanitize_meta_val "$(rmeta_get "${name}" LOCAL_HOST)")"; local_host="${local_host:-127.0.0.1}"
 
   {
     echo "[client]"
@@ -2529,7 +2546,8 @@ create_reverse_entry() {
 create_reverse_exit() {
   rule
   info "Phormal Reverse — new EXIT tunnel (this server = kharej)"
-  info "Dials into Iran and forwards to local services."
+  info "Dials into Iran and forwards to local services (Xray/3x-ui on THIS node)."
+  warn "Run your panel inbound here — Iran only publishes ports; it does not host the service."
   rule
 
   install_reverse_engine || return 1
@@ -2565,6 +2583,8 @@ create_reverse_exit() {
   [[ -z "${ports}" ]] && { fail "No valid ports provided."; rm -rf "$(rev_idir "${name}")"; return 1; }
   rmeta_set "${name}" PORTS "${ports}"
 
+  info "Local upstream = where Xray/3x-ui listens on this kharej box (usually 127.0.0.1)."
+  info "User port on Iran must match the port in your inbound here (e.g. both 7171)."
   local_host="$(ask 'Local upstream host [127.0.0.1]')"; local_host="${local_host:-127.0.0.1}"
   rmeta_set "${name}" LOCAL_HOST "${local_host}"
 
@@ -2811,10 +2831,12 @@ spoof_pick_name() {
 }
 
 spoof_pick_transport() {
-  printf '  %s1%s  icmp [default]\n' "${ACC}" "${RST}"
-  printf '  %s2%s  udp\n' "${ACC}" "${RST}"
-  printf '  %s3%s  tcp\n' "${ACC}" "${RST}"
-  printf '  %s4%s  icmpv6\n' "${ACC}" "${RST}"
+  {
+    printf '  %s1%s  icmp [default]\n' "${ACC}" "${RST}"
+    printf '  %s2%s  udp\n' "${ACC}" "${RST}"
+    printf '  %s3%s  tcp\n' "${ACC}" "${RST}"
+    printf '  %s4%s  icmpv6\n' "${ACC}" "${RST}"
+  } >&2
   local c; c="$(ask 'Carrier transport [1]')"; c="${c:-1}"
   case "${c}" in
     2) printf 'udp' ;;
