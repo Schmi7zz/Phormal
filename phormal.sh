@@ -12,7 +12,6 @@
 
 set -Eeuo pipefail
 
-
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
@@ -280,12 +279,30 @@ mirror_spoof_url() {
 verify_fwd_tmp()     { [[ -x "$1" ]] && "$1" -V >/dev/null 2>&1; }
 verify_relay_tmp()   { [[ -x "$1" ]] && "$1" version >/dev/null 2>&1; }
 verify_reverse_tmp() { [[ -x "$1" ]] && "$1" --help >/dev/null 2>&1; }
+spoof_engine_is_wrong_tunnel() {
+  local bin="$1" out
+  [[ -x "${bin}" ]] || return 1
+  out="$("${bin}" -c /dev/null 2>&1 || "${bin}" --help 2>&1 || "${bin}" -h 2>&1 || true)"
+  [[ "${out}" == *"Run in local (client) mode"* ]] && return 0
+  [[ "${out}" == *"spoofed packets to server"* ]] && return 0
+  [[ "${out}" == *'Use "spoof [command]'* ]] && return 0
+  return 1
+}
+
 verify_spoof_tmp() {
-  [[ -x "$1" ]] || return 1
-  if "$1" -h >/dev/null 2>&1 || "$1" --help >/dev/null 2>&1; then
+  local bin="$1" out
+  [[ -x "${bin}" ]] || return 1
+  if spoof_engine_is_wrong_tunnel "${bin}"; then
+    return 1
+  fi
+  out="$("${bin}" -c /dev/null 2>&1 || true)"
+  if [[ "${out}" == *"Run in local (client) mode"* ]]; then
+    return 1
+  fi
+  if [[ -n "${out}" ]]; then
     return 0
   fi
-  have file && file -b "$1" 2>/dev/null | grep -q ELF
+  "${bin}" -h >/dev/null 2>&1 || "${bin}" --help >/dev/null 2>&1
 }
 
 fetch_binary() {
@@ -543,9 +560,17 @@ install_manual_spoof() {
 }
 
 install_spoof_engine() {
-  if [[ -x "${SPOOF_BIN}" ]] && verify_spoof_tmp "${SPOOF_BIN}"; then
-    good "Phormal Spoof engine present."
-    return 0
+  if [[ -x "${SPOOF_BIN}" ]]; then
+    if spoof_engine_is_wrong_tunnel "${SPOOF_BIN}"; then
+      warn "Wrong engine at ${SPOOF_BIN} (old UDP spoof-tunnel) — replacing with Backhaul…"
+      rm -f "${SPOOF_BIN}"
+    elif verify_spoof_tmp "${SPOOF_BIN}"; then
+      good "Phormal Spoof engine present."
+      return 0
+    else
+      warn "Phormal Spoof engine failed verification — reinstalling…"
+      rm -f "${SPOOF_BIN}"
+    fi
   fi
   choose_binary_source || true
   info "Installing Phormal Spoof engine…"
@@ -1875,7 +1900,15 @@ write_instance_entry_config() {
     echo ""
     relay_engine_block
     echo ""
-    echo "fastOpen: true"
+    # Connection mode. Default = eager + fastOpen (best for most servers / CDN).
+    # COMPAT_LAZY=1 switches to lazy dial (fresh QUIC per use) for the minority of
+    # links where a warm long-lived session gets killed by DPI/NAT ("connects with
+    # high ping, then drops"). Both keep the keepAlive from relay_engine_block.
+    if [[ "$(imeta_get "${name}" COMPAT_LAZY)" == "1" ]]; then
+      echo "lazy: true"
+    else
+      echo "fastOpen: true"
+    fi
     if [[ "${listen}" == *-* ]]; then
       echo ""
       echo "transport:"
@@ -2043,6 +2076,14 @@ create_entry_tunnel() {
   local ports; ports="$(gather_ports)"
   [[ -z "${ports}" ]] && { fail "No valid ports provided."; rm -rf "$(relay_idir "${name}")"; return 1; }
   imeta_set "${name}" PORTS "${ports}"
+
+  # Connection mode. Default (eager + fastOpen) is best for most servers and CDN.
+  # Enable compatibility mode only if THIS server shows "connects, high ping, then
+  # drops" — it switches to lazy dial (fresh QUIC per use).
+  local compat
+  compat="$(ask 'Connection compatibility mode? Use only if the link connects then drops (y/n) [n]')"
+  compat="${compat:-n}"
+  [[ "${compat}" =~ ^[Yy] ]] && imeta_set "${name}" COMPAT_LAZY 1 || imeta_set "${name}" COMPAT_LAZY 0
 
   local cdn_ans cdn_domain cdn_path cdn_listen cdn_port fp
   cdn_ans="$(ask 'Put this entry behind a CDN (ArvanCloud) over port 80 + WebSocket? (y/n) [n]')"
@@ -2276,6 +2317,24 @@ instance_delete() {
   good "Tunnel '${name}' deleted."
 }
 
+instance_toggle_compat() {
+  local name="$1" cur
+  [[ "$(imeta_get "${name}" ROLE)" == "entry" ]] || { warn "Compatibility mode applies to ENTRY tunnels only."; return 0; }
+  cur="$(imeta_get "${name}" COMPAT_LAZY)"; cur="${cur:-0}"
+  if [[ "${cur}" == "1" ]]; then
+    info "Compatibility mode is currently ON (lazy dial)."
+    local a; a="$(ask 'Turn it OFF (back to default fastOpen)? (y/n)')"
+    [[ "${a}" =~ ^[Yy] ]] && imeta_set "${name}" COMPAT_LAZY 0 || return 0
+  else
+    info "Compatibility mode is currently OFF (default fastOpen)."
+    local a; a="$(ask 'Turn it ON (lazy dial — for links that connect then drop)? (y/n)')"
+    [[ "${a}" =~ ^[Yy] ]] && imeta_set "${name}" COMPAT_LAZY 1 || return 0
+  fi
+  write_instance_entry_config "${name}"
+  relay_start_instance "${name}" || true
+  good "Compatibility mode updated and tunnel restarted."
+}
+
 manage_instance_menu() {
   local name="$1"
   while :; do
@@ -2293,6 +2352,7 @@ manage_instance_menu() {
     printf '  %s9%s  Edit auth/obfs/bandwidth\n' "${ACC}" "${RST}"
     printf ' %s10%s  Edit raw config\n'         "${ACC}" "${RST}"
     printf ' %s11%s  Delete tunnel\n'           "${ACC}" "${RST}"
+    printf ' %s12%s  Compatibility mode (entry only)\n' "${ACC}" "${RST}"
     printf '  %s0%s  Back\n\n'                  "${ACC}" "${RST}"
     local c; c="$(ask 'Select')"; echo
     case "${c}" in
@@ -2307,6 +2367,7 @@ manage_instance_menu() {
       9) instance_edit_creds "${name}" || true ;;
       10) instance_edit_raw "${name}" || true ;;
       11) instance_delete "${name}"; break ;;
+      12) instance_toggle_compat "${name}" || true ;;
       0) break ;;
       *) fail "Invalid selection." ;;
     esac
@@ -2802,6 +2863,7 @@ manage_reverse_instance_menu() {
     printf '  %s9%s  Change token\n'            "${ACC}" "${RST}"
     printf ' %s10%s  Edit raw config\n'         "${ACC}" "${RST}"
     printf ' %s11%s  Delete tunnel\n'           "${ACC}" "${RST}"
+    printf ' %s12%s  Compatibility mode (entry only)\n' "${ACC}" "${RST}"
     printf '  %s0%s  Back\n\n'                  "${ACC}" "${RST}"
     local c; c="$(ask 'Select')"; echo
     case "${c}" in
@@ -2876,7 +2938,12 @@ smeta_set() {
 }
 
 sp_svc()       { printf 'phormal-spoof@%s.service' "$1"; }
-sp_svc_state() { systemctl is-active "$(sp_svc "$1")" 2>/dev/null || echo unknown; }
+sp_svc_state() {
+  local st
+  st="$(systemctl is-active "$(sp_svc "$1")" 2>/dev/null || true)"
+  st="${st//$'\n'/}"
+  [[ -n "${st}" && "${st}" != "unknown" ]] && printf '%s' "${st}" || printf 'inactive'
+}
 
 spoof_pick_name() {
   local raw name
@@ -2897,12 +2964,10 @@ spoof_enable_raw() {
 net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
 net.ipv4.ip_forward = 1
-net.ipv4.icmp_echo_ignore_all = 1
 EOF
   sysctl --system >/dev/null 2>&1 || true
   local iface; iface="$(primary_iface)"
   [[ -n "${iface}" ]] && sysctl -w "net.ipv4.conf.${iface}.rp_filter=0" >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.icmp_echo_ignore_all=1 >/dev/null 2>&1 || true
   enable_relay_buffers
   good "Phormal Spoof kernel tuning applied."
 }
@@ -3212,8 +3277,9 @@ spoof_create_preflight_advisory() {
   fi
 
   warn "Preflight egress check FAILED — this server may not emit spoofed packets."
-  local cont; cont="$(ask 'Continue anyway? (y/n) [n]')"
-  cont="${cont:-n}"
+  warn "This test often false-negatives; the tunnel may still work."
+  local cont; cont="$(ask 'Continue anyway? (y/n) [y]')"
+  cont="${cont:-y}"
   [[ "${cont}" =~ ^[Yy] ]]
 }
 
@@ -3251,11 +3317,14 @@ EOF
 }
 
 spoof_write_ipx_block() {
-  local spoof_ip="$1"
+  # $1 = src spoof IP, $2 = dst spoof (white) IP. dst defaults to src when empty.
+  local src_ip="$1" dst_ip="${2:-$1}"
   echo '[ipx]'
-  echo 'icmp = true'
-  echo "spoof_src_ip = \"${spoof_ip}\""
-  echo "spoof_dst_ip = \"${spoof_ip}\""
+  echo 'profile = "icmp"'
+  echo 'icmp_type = 8'
+  echo 'icmp_code = 0'
+  echo "spoof_src_ip = \"${src_ip}\""
+  echo "spoof_dst_ip = \"${dst_ip}\""
   echo 'custom_packet = true'
 }
 
@@ -3289,18 +3358,19 @@ write_spoof_entry_config() {
   link_port="$(smeta_get "${name}" LINK_PORT)"; link_port="${link_port:-${SPOOF_DEFAULT_LINK_PORT}}"
   ports="$(smeta_get "${name}" PORTS)"
   spoof_ip="$(smeta_get "${name}" SPOOF_IP)"
+  local spoof_dst; spoof_dst="$(smeta_get "${name}" SPOOF_DST_IP)"; spoof_dst="${spoof_dst:-${spoof_ip}}"
 
   {
     echo '[server]'
     echo "bind_addr = \"0.0.0.0:${link_port}\""
-    echo 'transport = "ipx"'
+    echo 'transport = "tcp"'
     echo "token = \"${token}\""
     echo 'heartbeat = 40'
     echo 'channel_size = 2048'
     echo 'accept_udp = true'
     [[ -n "${ports}" ]] && spoof_write_ports_block "${ports}"
     echo ''
-    spoof_write_ipx_block "${spoof_ip}"
+    spoof_write_ipx_block "${spoof_ip}" "${spoof_dst}"
   } > "${dir}/config.toml"
 }
 
@@ -3312,16 +3382,17 @@ write_spoof_exit_config() {
   link_port="$(smeta_get "${name}" LINK_PORT)"; link_port="${link_port:-${SPOOF_DEFAULT_LINK_PORT}}"
   remote="$(smeta_get "${name}" REMOTE_V4)"
   spoof_ip="$(smeta_get "${name}" SPOOF_IP)"
+  local spoof_dst; spoof_dst="$(smeta_get "${name}" SPOOF_DST_IP)"; spoof_dst="${spoof_dst:-${spoof_ip}}"
 
   {
     echo '[client]'
     echo "remote_addr = \"${remote}:${link_port}\""
-    echo 'transport = "ipx"'
+    echo 'transport = "tcp"'
     echo "token = \"${token}\""
     echo 'heartbeat = 40'
     echo 'connection_pool = 8'
     echo ''
-    spoof_write_ipx_block "${spoof_ip}"
+    spoof_write_ipx_block "${spoof_ip}" "${spoof_dst}"
   } > "${dir}/config.toml"
 }
 
@@ -3361,10 +3432,14 @@ spoof_rebuild_config_only() {
 }
 
 spoof_prompt_white_ip() {
-  local name="$1" w
-  w="$(ask 'White / spoof IP (same on both nodes, e.g. 62.60.212.199)')"
+  local name="$1" w d
+  w="$(ask 'Spoof SOURCE IP (white IP, same on both nodes, e.g. 62.60.212.199)')"
   valid_ipv4 "${w}" || { fail "Invalid IPv4."; return 1; }
   smeta_set "${name}" SPOOF_IP "${w}"
+  d="$(ask "Spoof DESTINATION (white) IP [${w}] — press enter to reuse the source")"
+  d="${d:-${w}}"
+  valid_ipv4 "${d}" || { fail "Invalid IPv4."; return 1; }
+  smeta_set "${name}" SPOOF_DST_IP "${d}"
   return 0
 }
 
@@ -3390,8 +3465,15 @@ create_spoof_entry() {
   [[ "${link_port}" =~ ^[0-9]+$ ]] || { fail "Invalid port."; rm -rf "$(sp_idir "${name}")"; return 1; }
   smeta_set "${name}" LINK_PORT "${link_port}"
 
-  token="$(spoof_gen_token)"
+  token="$(ask 'Tunnel token [leave empty to auto-generate]')"
+  if [[ -z "${token}" ]]; then
+    token="$(spoof_gen_token)"
+  fi
   smeta_set "${name}" TOKEN "${token}"
+  rule
+  good "Entry token — copy this to kharej exit (menu 12):"
+  info "  ${token}"
+  rule
 
   ports="$(ask 'Published user ports (comma-separated, e.g. 8081 or 8081=127.0.0.1:8081)')"
   [[ -n "${ports}" ]] || { fail "At least one port required."; rm -rf "$(sp_idir "${name}")"; return 1; }
@@ -3404,14 +3486,16 @@ create_spoof_entry() {
   spoof_prompt_white_ip "${name}" || { rm -rf "$(sp_idir "${name}")"; return 1; }
 
   spoof_create_preflight_advisory "$(smeta_get "${name}" SPOOF_IP)" "${remote}" || {
-    rm -rf "$(sp_idir "${name}")"; return 1
+    warn "Setup cancelled. Token was: ${token}"
+    rm -rf "$(sp_idir "${name}")"
+    return 1
   }
 
   spoof_start_instance "${name}" || return 1
 
   echo
   good "Entry tunnel '${name}' live — link :${link_port}"
-  info "  Token : ${token}"
+  good "Token (for kharej exit): ${token}"
   info "  Ports : ${ports}"
   info "  IPX   : icmp + custom_packet + spoof_src/dst = $(smeta_get "${name}" SPOOF_IP)"
   good "Point users at THIS server's IP and the published port(s)."
