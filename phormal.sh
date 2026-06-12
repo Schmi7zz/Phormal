@@ -373,7 +373,7 @@ install_manual_relay() {
   arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
   src="${MANUAL_DIR}/hysteria-linux-${arch}"
   if [[ ! -f "${src}" ]]; then
-    fail "Place the hysteria binary at ${src}"
+    fail "Place the phormal relay binary at ${src}"
     info "Download it from: $(hysteria_upstream_url "${arch}")"
     return 1
   fi
@@ -1577,14 +1577,14 @@ install_relay_engine() {
     fi
     urls+=( "$(hysteria_upstream_url "${arch}")" )
     if fetch_binary "${RELAY_BIN}" verify_relay_tmp \
-        "Phormal Relay engine (hysteria)" "${urls[@]}"; then
+        "Phormal Relay engine" "${urls[@]}"; then
       setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
       return 0
     fi
   elif [[ "${BINARY_SOURCE}" == "github" ]]; then
     urls+=( "$(hysteria_upstream_url "${arch}")" )
     if fetch_binary "${RELAY_BIN}" verify_relay_tmp \
-        "Phormal Relay engine (hysteria)" "${urls[@]}"; then
+        "Phormal Relay engine" "${urls[@]}"; then
       setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
       return 0
     fi
@@ -2297,7 +2297,7 @@ instance_edit_raw() {
   local name="$1" dir; dir="$(relay_idir "${name}")"
   info "  ${dir}/meta.conf"
   info "  ${dir}/config.yaml"
-  local c; c="$(ask 'Edit raw hysteria config now? (y/n)')"
+  local c; c="$(ask 'Edit raw phormal relay config now? (y/n)')"
   [[ "${c}" == "y" ]] && ${EDITOR:-nano} "${dir}/config.yaml"
   local r; r="$(ask 'Restart tunnel to apply? (y/n)')"
   [[ "${r}" == "y" ]] && relay_start_instance "${name}"
