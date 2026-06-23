@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.4.3"
+readonly PHORMAL_VERSION="5.4.4"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -4013,15 +4013,22 @@ layer_bridge_has_peer() {
 
 layer_peer_bridge_active() {
   local local_v4="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
+  [[ -n "${local_v4}" ]] || return 1
   layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "for f in ${BRIDGE_DIR}/*/meta.conf; do
        [[ -f \"\${f}\" ]] || continue
        r=\$(grep -E '^REMOTE_V4=' \"\${f}\" | head -n1 | cut -d= -f2-)
        [[ \"\${r}\" == \"${local_v4}\" ]] || continue
        i=\$(grep -E '^IFACE=' \"\${f}\" | head -n1 | cut -d= -f2-)
-       ip link show \"\${i}\" 2>/dev/null | grep -qE '<[^>]*UP[^>]*>' && echo yes && exit 0
+       ip link show \"\${i}\" 2>/dev/null | grep -q UP && echo yes && exit 0
      done
      echo no" 2>/dev/null | tr -d '\r' | grep -q yes
+}
+
+layer_peer_bridge_reachable() {
+  local link_local_v4="$1" local_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
+  layer_peer_bridge_active "${link_local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" && return 0
+  layer_peer_bridge_active "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
 }
 
 layer_autotest_print_table() {
@@ -4265,8 +4272,7 @@ layer_test_bridge_configured() {
         layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
         return 0
       fi
-      if layer_peer_bridge_active "${link_local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-        || layer_peer_bridge_active "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"; then
+      if layer_peer_bridge_reachable "${link_local_v4}" "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"; then
         ok=PASS
         note="link '${n}' (${role}) — SIT ${iface} UP, peer bridge to ${local_v4} also UP"
         layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
