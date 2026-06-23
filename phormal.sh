@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.4.5"
+readonly PHORMAL_VERSION="5.4.7"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -863,11 +863,15 @@ bridge_link_running_legacy() {
 }
 
 bcore_state() {
-  local name="$1" st
+  local name="$1" st iface
   st="$(systemctl is-active "$(bcore_svc "${name}")" 2>/dev/null || true)"
   [[ "${st}" == "active" ]] && { printf 'active'; return 0; }
   if [[ "${name}" == "main" ]] && systemctl is-active phormal-core.service &>/dev/null; then
     printf 'active'; return 0
+  fi
+  iface="$(bmeta_get "${name}" IFACE)"
+  if [[ -n "${iface}" ]] && ip link show "${iface}" 2>/dev/null | grep -qE 'UP|LOWER_UP'; then
+    printf 'running'; return 0
   fi
   if bridge_link_running_legacy "${name}"; then
     printf 'running'; return 0
@@ -4008,7 +4012,7 @@ layer_local_sit_to_peer() {
 }
 
 layer_local_bridge_meta_to_peer() {
-  local peer_v4="$1" n remote iface role self_core
+  local peer_v4="$1" n remote iface role self_core st
   while read -r n; do
     [[ -n "${n}" ]] || continue
     remote="$(bmeta_get "${n}" REMOTE_V4)"
@@ -4019,18 +4023,22 @@ layer_local_bridge_meta_to_peer() {
     if bridge_iface_operational "${iface}" "${self_core}" \
       || bridge_core_running "${n}" \
       || layer_local_sit_to_peer "${peer_v4}"; then
-        printf '%s|%s|%s' "${n}" "${role}" "${iface}"
-        return 0
+      st=up
+    else
+      st=stopped
     fi
+    printf '%s|%s|%s|%s' "${n}" "${role}" "${iface}" "${st}"
+    return 0
   done < <(bridge_instances 2>/dev/null)
   return 1
 }
 
-layer_ssh_peer_bridge_status() {
+layer_ssh_peer_bridge_lookup() {
   local toward_v4="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
-  [[ -n "${toward_v4}" ]] || return 1
+  [[ -n "${toward_v4}" ]] || { printf 'NONE'; return 0; }
   layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "toward='${toward_v4}'
+     found_stop=
      for f in ${BRIDGE_DIR}/*/meta.conf; do
        [[ -f \"\${f}\" ]] || continue
        r=\$(grep -E '^REMOTE_V4=' \"\${f}\" | head -n1 | cut -d= -f2-)
@@ -4039,24 +4047,88 @@ layer_ssh_peer_bridge_status() {
        role=\$(grep -E '^ROLE=' \"\${f}\" | head -n1 | cut -d= -f2-)
        name=\$(basename \"\$(dirname \"\${f}\")\")
        if ip link show \"\${i}\" 2>/dev/null | grep -qE 'UP|LOWER_UP'; then
-         echo \"meta:\${name}:\${role}:\${i}\"
+         echo \"UP:\${name}:\${role}:\${i}\"
          exit 0
        fi
-       if systemctl is-active phormal-core@\${name}.service 2>/dev/null | grep -q active; then
-         echo \"core:\${name}:\${role}:\${i}\"
-         exit 0
-       fi
+       found_stop=\"STOP:\${name}:\${role}:\${i}\"
      done
      ip -o link show type sit 2>/dev/null | while read -r _ _ iface _; do
        iface=\${iface%%@*}
        ip -d link show \"\${iface}\" 2>/dev/null | grep -q \"remote \${toward}\" \
          && ip link show \"\${iface}\" 2>/dev/null | grep -qE 'UP|LOWER_UP' \
-         && echo \"sit:\${iface}\" && exit 0
+         && echo \"UP:sit:\${iface}\" && exit 0
      done
-     echo none" 2>/dev/null | tr -d '\r' | head -n1
+     [[ -n \"\${found_stop}\" ]] && echo \"\${found_stop}\" && exit 0
+     echo NONE" 2>/dev/null | tr -d '\r' | head -n1
 }
 
-layer_ssh_peer_relay_status() {
+layer_ssh_peer_relay_lookup() {
+  local toward_v4="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "toward='${toward_v4}'
+     found_stop=
+     for f in ${RELAY_DIR}/*/meta.conf; do
+       [[ -f \"\${f}\" ]] || continue
+       name=\$(basename \"\$(dirname \"\${f}\")\")
+       role=\$(grep -E '^ROLE=' \"\${f}\" | head -n1 | cut -d= -f2-)
+       remote=\$(grep -E '^REMOTE_V4=' \"\${f}\" | head -n1 | cut -d= -f2-)
+       listen=\$(grep -E '^LISTEN=' \"\${f}\" | head -n1 | cut -d= -f2-)
+       listen=\${listen:-443}
+       st=\$(systemctl is-active phormal-relay@\${name}.service 2>/dev/null || echo down)
+       if [[ \"\${st}\" == active ]]; then
+         if [[ \"\${role}\" == entry && \"\${remote}\" == \"\${toward}\" ]]; then
+           echo \"UP:entry:\${name}:\${remote}:\${listen}\"; exit 0
+         fi
+         if [[ \"\${role}\" == exit ]]; then
+           echo \"UP:exit:\${name}:\${listen}\"; exit 0
+         fi
+       fi
+       if [[ \"\${role}\" == entry && \"\${remote}\" == \"\${toward}\" ]]; then
+         found_stop=\"STOP:entry:\${name}:\${remote}\"
+       fi
+       if [[ \"\${role}\" == exit ]]; then
+         found_stop=\"STOP:exit:\${name}:\${listen}\"
+       fi
+     done
+     [[ -n \"\${found_stop}\" ]] && echo \"\${found_stop}\" && exit 0
+     echo NONE" 2>/dev/null | tr -d '\r' | head -n1
+}
+
+layer_bridge_start_hint() {
+  local name="$1" role="$2"
+  if [[ "${role}" == "entry" ]]; then
+    printf 'systemctl enable --now phormal-core@%s phormal-guard@%s phormal-bfwd@%s' "${name}" "${name}" "${name}"
+  else
+    printf 'systemctl enable --now phormal-core@%s phormal-guard@%s' "${name}" "${name}"
+  fi
+}
+
+layer_ssh_peer_bridge_meta() {
+  local toward_v4="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
+  [[ -n "${toward_v4}" ]] || { printf 'NONE'; return 0; }
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "toward='${toward_v4}'
+     for f in ${BRIDGE_DIR}/*/meta.conf; do
+       [[ -f \"\${f}\" ]] || continue
+       r=\$(grep -E '^REMOTE_V4=' \"\${f}\" | head -n1 | cut -d= -f2-)
+       [[ \"\${r}\" == \"\${toward}\" ]] || continue
+       name=\$(basename \"\$(dirname \"\${f}\")\")
+       role=\$(grep -E '^ROLE=' \"\${f}\" | head -n1 | cut -d= -f2-)
+       iface=\$(grep -E '^IFACE=' \"\${f}\" | head -n1 | cut -d= -f2-)
+       self_core=\$(grep -E '^SELF_CORE=' \"\${f}\" | head -n1 | cut -d= -f2-)
+       peer_core=\$(grep -E '^PEER_CORE=' \"\${f}\" | head -n1 | cut -d= -f2-)
+       if ip link show \"\${iface}\" 2>/dev/null | grep -qE 'UP|LOWER_UP'; then
+         st=up
+       else
+         st=stopped
+       fi
+       echo \"\${name}|\${role}|\${iface}|\${st}|\${self_core}|\${peer_core}\"
+       exit 0
+     done
+     echo NONE" 2>/dev/null | tr -d '\r' | head -n1
+}
+
+layer_ssh_peer_relay_meta() {
   local toward_v4="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
   layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "toward='${toward_v4}'
@@ -4067,18 +4139,96 @@ layer_ssh_peer_relay_status() {
        remote=\$(grep -E '^REMOTE_V4=' \"\${f}\" | head -n1 | cut -d= -f2-)
        listen=\$(grep -E '^LISTEN=' \"\${f}\" | head -n1 | cut -d= -f2-)
        listen=\${listen:-443}
-       st=\$(systemctl is-active phormal-relay@\${name}.service 2>/dev/null || echo down)
-       [[ \"\${st}\" == active ]] || continue
+       st=\$(systemctl is-active phormal-relay@\${name}.service 2>/dev/null || echo stopped)
+       [[ \"\${st}\" == active ]] && st=up || st=stopped
        if [[ \"\${role}\" == entry && \"\${remote}\" == \"\${toward}\" ]]; then
-         echo \"entry:\${name}:\${remote}:\${listen}\"; exit 0
+         echo \"\${name}|\${role}|\${st}|\${remote}|\${listen}\"
+         exit 0
        fi
        if [[ \"\${role}\" == exit ]]; then
-         echo \"exit:\${name}:\${listen}\"; exit 0
+         echo \"\${name}|\${role}|\${st}||\${listen}\"
+         exit 0
        fi
      done
-     systemctl list-units 'phormal-relay@*' --state=active --no-legend 2>/dev/null | head -n1 | grep -q . \
-       && echo relay-active && exit 0
-     echo none" 2>/dev/null | tr -d '\r' | head -n1
+     echo NONE" 2>/dev/null | tr -d '\r' | head -n1
+}
+
+layer_bridge_start_local() {
+  local name="$1" role="$2"
+  if [[ "${role}" == "entry" ]]; then
+    systemctl start "$(bcore_svc "${name}")" "$(bguard_svc "${name}")" "$(bfwd_svc "${name}")" 2>/dev/null \
+      || systemctl start "$(bcore_svc "${name}")" 2>/dev/null || true
+  else
+    systemctl start "$(bcore_svc "${name}")" "$(bguard_svc "${name}")" 2>/dev/null \
+      || systemctl start "$(bcore_svc "${name}")" 2>/dev/null || true
+  fi
+  sleep 2
+}
+
+layer_bridge_start_remote() {
+  local name="$1" role="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
+  if [[ "${role}" == "entry" ]]; then
+    layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "systemctl start phormal-core@${name} phormal-guard@${name} phormal-bfwd@${name}" 2>/dev/null || true
+  else
+    layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "systemctl start phormal-core@${name} phormal-guard@${name}" 2>/dev/null || true
+  fi
+  sleep 2
+}
+
+layer_bridge_local_iface_state() {
+  local name="$1" iface self_core
+  iface="$(bmeta_get "${name}" IFACE)"
+  self_core="$(bmeta_get "${name}" SELF_CORE)"
+  bridge_iface_operational "${iface}" "${self_core}" && printf up || printf stopped
+}
+
+layer_bridge_bidir_ping6() {
+  local peer_core="$1" self_core="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
+  local local_ok=0 peer_ok=0
+  ping6 -c 3 -W 3 "${peer_core}" >/dev/null 2>&1 &
+  local pa=$!
+  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "ping6 -c 3 -W 3 ${self_core}" >/dev/null 2>&1 &
+  local pb=$!
+  wait "${pa}" 2>/dev/null && local_ok=1
+  wait "${pb}" 2>/dev/null && peer_ok=1
+  printf '%s|%s' "${local_ok}" "${peer_ok}"
+}
+
+layer_autotest_verify_peer_pairing() {
+  local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
+  local peer_bridge peer_relay local_relay n remote role
+  peer_bridge="$(layer_ssh_peer_bridge_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+  peer_relay="$(layer_ssh_peer_relay_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+  info "Peer pairing check (this host ${local_v4} ↔ peer ${peer_v4}):"
+  if layer_local_bridge_meta_to_peer "${peer_v4}" >/dev/null 2>&1; then
+    info "  Bridge: this host has meta toward ${peer_v4}"
+  else
+    warn "  Bridge: no meta on THIS host toward ${peer_v4}"
+  fi
+  case "${peer_bridge}" in
+    NONE|'')
+      warn "  Bridge: peer has no meta toward ${local_v4} — paired Bridge test needs both sides configured"
+      ;;
+    *)
+      info "  Bridge: peer has link '${peer_bridge%%|*}' toward ${local_v4}"
+      ;;
+  esac
+  while read -r n; do
+    [[ -n "${n}" ]] || continue
+    remote="$(imeta_get "${n}" REMOTE_V4)"
+    role="$(imeta_get "${n}" ROLE)"
+    [[ "${remote}" == "${peer_v4}" && "${role}" == entry ]] && \
+      info "  Relay: this host has entry '${n}' toward ${peer_v4}"
+  done < <(relay_instances 2>/dev/null)
+  case "${peer_relay}" in
+    NONE|'') ;;
+    *)
+      info "  Relay: peer has '${peer_relay%%|*}' (${peer_relay#*|*|}) toward this path"
+      ;;
+  esac
 }
 
 bridge_core_running() {
@@ -4309,11 +4459,27 @@ layer_test_kernel_pair() {
     [[ -n "${note}" && -n "${rerr}" ]] && note="${note}: ${rerr##*$'\n'}"
   fi
   if [[ -z "${note}" ]]; then
-    if ping -c 3 -W 2 -I "${iface}" "${rpriv}" >/dev/null 2>&1 \
-      && layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-        "ping -c 3 -W 2 -I ${iface} ${lpriv}" >/dev/null 2>&1; then
+    sleep 1
+    layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "ip link show ${iface} 2>/dev/null | grep -qE 'UP|LOWER_UP'" >/dev/null 2>&1 \
+      || note="remote ${mode} iface not UP after setup"
+  fi
+  if [[ -z "${note}" ]]; then
+    info "  Bidirectional ping on ${mode} (both sides up concurrently)…"
+    ping -c 3 -W 2 -I "${iface}" "${rpriv}" >/dev/null 2>&1 &
+    local pa=$!
+    layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "ping -c 3 -W 2 -I ${iface} ${lpriv}" >/dev/null 2>&1 &
+    local pb=$!
+    local local_ok=0 peer_ok=0
+    wait "${pa}" 2>/dev/null && local_ok=1
+    wait "${pb}" 2>/dev/null && peer_ok=1
+    if [[ "${local_ok}" -eq 1 && "${peer_ok}" -eq 1 ]]; then
       ok=PASS
-      note="bidirectional ping on ${mode} (synthetic probe)"
+      note="bidirectional ping on ${mode} (synthetic paired probe)"
+    elif [[ "${local_ok}" -eq 1 || "${peer_ok}" -eq 1 ]]; then
+      ok=PASS; conf=med
+      note="one-way ping on ${mode} probe (local:${local_ok} peer:${peer_ok})"
     else
       note="no bidirectional ping on synthetic ${mode} tunnel"
     fi
@@ -4326,73 +4492,102 @@ layer_test_kernel_pair() {
 layer_test_bridge_configured() {
   local peer_v4="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
   local local_v4="$5"
-  local n remote peer_core self_core iface role link_local_v4 info peer_info ok=FAIL conf=high
-  local note="no active Bridge link to ${peer_v4} (run test from Iran or kharej where Bridge is configured)"
-  layer_autotest_probe_begin "Phormal Bridge (your configured links)"
+  local info peer_meta ok=FAIL conf=high note hint started_any=0
+  local n role iface lst peer_n peer_role peer_iface pst peer_self peer_peer
+  local self_core peer_core local_ok peer_ok ping_res
+  local note_fail="Bridge not installed toward ${peer_v4} — menu 3 (exit) on kharej, menu 4 (entry) on Iran"
+
+  layer_autotest_probe_begin "Phormal Bridge (paired — both servers)"
   info="$(layer_local_bridge_meta_to_peer "${peer_v4}" 2>/dev/null || true)"
-  if [[ -n "${info}" ]]; then
-    IFS='|' read -r n role iface <<<"${info}"
-    peer_core="$(bmeta_get "${n}" PEER_CORE)"
-    self_core="$(bmeta_get "${n}" SELF_CORE)"
-    ok=PASS
-    bridge_core_running "${n}" && conf=high
-    if ping6 -c 2 -W 2 "${peer_core}" >/dev/null 2>&1; then
-      conf=high
-      note="link '${n}' (${role}) — SIT ${iface} UP, ping6 to ${peer_core} OK"
-    else
-      [[ "${conf}" == high ]] || conf=med
-      note="link '${n}' (${role}) — SIT ${iface} UP toward ${peer_v4} (your Bridge is running)"
+  peer_meta="$(layer_ssh_peer_bridge_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+
+  if [[ -z "${info}" && ( -z "${peer_meta}" || "${peer_meta}" == NONE ) ]]; then
+    if layer_local_sit_to_peer "${peer_v4}"; then
+      layer_autotest_record "Phormal Bridge" "PASS" "med" \
+        "kernel SIT UP toward ${peer_v4} (no phormal meta on either side)"
+      return 0
     fi
-    layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
+    layer_autotest_record "Phormal Bridge" "FAIL" "high" "${note_fail}"
     return 0
   fi
-  if layer_local_sit_to_peer "${peer_v4}"; then
+
+  if [[ -z "${info}" ]]; then
+    IFS='|' read -r peer_n peer_role peer_iface pst peer_self peer_peer <<<"${peer_meta}"
+    layer_autotest_record "Phormal Bridge" "inconclusive" "med" \
+      "peer has Bridge '${peer_n}' (${peer_role}) toward ${local_v4} but THIS host has no matching link — add Bridge here (menu 3/4)"
+    return 0
+  fi
+
+  if [[ -z "${peer_meta}" || "${peer_meta}" == NONE ]]; then
+    IFS='|' read -r n role iface lst <<<"${info}"
+    hint="$(layer_bridge_start_hint "${n}" "${role}")"
+    layer_autotest_record "Phormal Bridge" "inconclusive" "med" \
+      "local '${n}' (${role}) exists but peer has no Bridge toward ${local_v4} — configure peer first, then ${hint}"
+    return 0
+  fi
+
+  IFS='|' read -r n role iface lst <<<"${info}"
+  IFS='|' read -r peer_n peer_role peer_iface pst peer_self peer_peer <<<"${peer_meta}"
+  self_core="$(bmeta_get "${n}" SELF_CORE)"
+  peer_core="$(bmeta_get "${n}" PEER_CORE)"
+
+  if [[ "${role}" == "${peer_role}" ]]; then
+    warn "  Both sides report role '${role}' — Bridge expects entry on one host and exit on the other"
+  fi
+  if [[ -n "${self_core}" && -n "${peer_self}" ]]; then
+    if [[ "${self_core%::*}::" != "${peer_self%::*}::" ]]; then
+      warn "  IPv6 prefix mismatch (local ${self_core} vs peer ${peer_self}) — links may not be paired"
+    fi
+  fi
+
+  if [[ "${lst}" == stopped ]]; then
+    info "  Local link '${n}' stopped — starting Bridge on this host…"
+    layer_bridge_start_local "${n}" "${role}"
+    started_any=1
+    lst="$(layer_bridge_local_iface_state "${n}")"
+  fi
+  if [[ "${pst}" == stopped ]]; then
+    info "  Peer link '${peer_n}' stopped — starting Bridge on peer via SSH…"
+    layer_bridge_start_remote "${peer_n}" "${peer_role}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+    started_any=1
+    peer_meta="$(layer_ssh_peer_bridge_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+    if [[ -n "${peer_meta}" && "${peer_meta}" != NONE ]]; then
+      IFS='|' read -r peer_n peer_role peer_iface pst peer_self peer_peer <<<"${peer_meta}"
+    else
+      pst=stopped
+    fi
+  fi
+  [[ "${started_any}" -eq 1 ]] && sleep 2
+
+  lst="$(layer_bridge_local_iface_state "${n}")"
+  if [[ "${lst}" != up || "${pst}" != up ]]; then
+    hint="$(layer_bridge_start_hint "${n}" "${role}")"
+    layer_autotest_record "Phormal Bridge" "inconclusive" "med" \
+      "paired Bridge needs both SIT ifaces UP (local:${lst} peer:${pst}) — ${hint} on each host"
+    return 0
+  fi
+
+  info "  Bidirectional ping6 on internal Bridge IPv6 (local→${peer_core}, peer→${self_core})…"
+  ping_res="$(layer_bridge_bidir_ping6 "${peer_core}" "${self_core}" \
+    "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+  IFS='|' read -r local_ok peer_ok <<<"${ping_res}"
+
+  if [[ "${local_ok}" -eq 1 && "${peer_ok}" -eq 1 ]]; then
+    ok=PASS; conf=high
+    note="paired '${n}'↔'${peer_n}' — bidirectional ping6 ${self_core}↔${peer_core}"
+  elif [[ "${local_ok}" -eq 1 || "${peer_ok}" -eq 1 ]]; then
     ok=PASS; conf=med
-    note="kernel SIT tunnel UP toward ${peer_v4} (phormal meta not matched — legacy or remote host)"
-    layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
-    return 0
+    note="paired link UP — one-way ping6 (local→peer:${local_ok} peer→local:${peer_ok})"
+  else
+    conf=med
+    note="both SIT ifaces UP but ping6 failed — check bridge key, gost (entry), or firewall"
   fi
-  peer_info="$(layer_ssh_peer_bridge_status "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
-  if [[ -z "${peer_info}" || "${peer_info}" == "none" ]]; then
-    peer_info="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-      "for f in ${BRIDGE_DIR}/*/meta.conf; do
-         [[ -f \"\${f}\" ]] || continue
-         i=\$(grep -E '^IFACE=' \"\${f}\" | head -n1 | cut -d= -f2-)
-         r=\$(grep -E '^REMOTE_V4=' \"\${f}\" | head -n1 | cut -d= -f2-)
-         role=\$(grep -E '^ROLE=' \"\${f}\" | head -n1 | cut -d= -f2-)
-         name=\$(basename \"\$(dirname \"\${f}\")\")
-         ip link show \"\${i}\" 2>/dev/null | grep -qE 'UP|LOWER_UP' && echo \"\${role}:\${name}:\${i}->\${r}\" && exit 0
-       done
-       echo none" 2>/dev/null | tr -d '\r' | head -n1)"
-  fi
-  if [[ -n "${peer_info}" && "${peer_info}" != "none" ]]; then
-    ok=PASS; conf=med
-    note="peer Bridge active toward ${local_v4} (${peer_info})"
-    layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
-    return 0
-  fi
-  while read -r n; do
-    [[ -n "${n}" ]] || continue
-    remote="$(bmeta_get "${n}" REMOTE_V4)"
-    [[ "${remote}" == "${peer_v4}" ]] || continue
-    role="$(bmeta_get "${n}" ROLE)"
-    ok=PASS; conf=med
-    note="link '${n}' (${role}) configured for ${peer_v4} — start: systemctl start phormal-core@${n}"
-    layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
-    return 0
-  done < <(bridge_instances 2>/dev/null)
   layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
 }
 
 layer_test_bridge_path() {
   local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
   layer_test_bridge_configured "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "${local_v4}"
-  if [[ "$(layer_autotest_row_get "Phormal Bridge" result 2>/dev/null)" == "PASS" ]]; then
-    return 0
-  fi
-  info "  No live Bridge detected — optional synthetic SIT probe (may fail if filters block probes)…"
-  layer_autotest_pop_row "Phormal Bridge"
-  layer_test_kernel_pair sit "Phormal Bridge" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
 }
 
 layer_test_udp_echo() {
@@ -4428,8 +4623,10 @@ layer_test_udp_echo() {
 
 layer_test_relay_path() {
   local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
-  local n role remote listen st peer_info ok=FAIL conf=high note=""
-  layer_autotest_probe_begin "Phormal Relay (your configured Hysteria tunnel)"
+  local n role remote listen st peer_info peer_meta ok=FAIL conf=high note=""
+  local peer_n peer_role peer_st peer_listen started_any=0 local_st
+
+  layer_autotest_probe_begin "Phormal Relay (paired Hysteria — both servers)"
   while read -r n; do
     [[ -n "${n}" ]] || continue
     role="$(imeta_get "${n}" ROLE)"
@@ -4439,39 +4636,91 @@ layer_test_relay_path() {
     case "${role}" in
       entry)
         [[ "${remote}" == "${peer_v4}" ]] || continue
-        [[ "${st}" == "active" ]] || continue
-        ok=PASS
-        note="entry '${n}' — phormal-relay@${n} active toward ${peer_v4}:${listen}"
+        peer_meta="$(layer_ssh_peer_relay_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+        if [[ -z "${peer_meta}" || "${peer_meta}" == NONE ]]; then
+          layer_autotest_record "Phormal Relay" "inconclusive" "med" \
+            "local entry '${n}' toward ${peer_v4} but peer has no Relay exit — install exit on peer (menu 6)"
+          info "  (UDP echo skipped — Hysteria needs entry+exit pair)"
+          return 0
+        fi
+        IFS='|' read -r peer_n peer_role peer_st _ peer_listen <<<"${peer_meta}"
+        [[ "${peer_role}" == exit ]] || warn "  Peer Relay role is '${peer_role}' — expected exit for entry '${n}'"
+        if [[ "${st}" != active ]]; then
+          info "  Local Relay '${n}' stopped — starting on this host…"
+          systemctl start "phormal-relay@${n}" 2>/dev/null || true
+          started_any=1
+          st="$(relay_svc_state "${n}")"
+        fi
+        if [[ "${peer_st}" == stopped ]]; then
+          info "  Peer Relay '${peer_n}' stopped — starting on peer via SSH…"
+          layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+            "systemctl start phormal-relay@${peer_n}" 2>/dev/null || true
+          started_any=1
+          sleep 2
+          peer_meta="$(layer_ssh_peer_relay_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+          IFS='|' read -r peer_n peer_role peer_st _ peer_listen <<<"${peer_meta}"
+        fi
+        [[ "${started_any}" -eq 1 ]] && sleep 2
+        if [[ "${st}" == active && "${peer_st}" == up ]]; then
+          ok=PASS; conf=high
+          note="paired entry '${n}' ↔ exit '${peer_n}' — both phormal-relay@ active (${peer_v4}:${listen})"
+        elif [[ "${st}" == active || "${peer_st}" == up ]]; then
+          ok=PASS; conf=med
+          note="Relay partial — local:${st} peer:${peer_st} (both must be active for traffic)"
+        else
+          layer_autotest_record "Phormal Relay" "inconclusive" "med" \
+            "paired Relay configured but both stopped — systemctl enable --now phormal-relay@${n} and on peer phormal-relay@${peer_n}"
+          info "  (UDP echo skipped — start both sides)"
+          return 0
+        fi
         layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
         info "  (UDP echo skipped — Hysteria/QUIC does not echo arbitrary UDP)"
         return 0
         ;;
       exit)
         [[ "${st}" == "active" ]] || continue
+        peer_meta="$(layer_ssh_peer_relay_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
         ok=PASS; conf=med
-        note="exit '${n}' — phormal-relay@${n} listening (entries connect here)"
+        if [[ -n "${peer_meta}" && "${peer_meta}" != NONE ]]; then
+          note="exit '${n}' active + peer entry '${peer_meta%%|*}' (${peer_meta#*|*|})"
+        else
+          note="exit '${n}' — phormal-relay@${n} listening (no matching peer entry seen via SSH)"
+        fi
         layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
         info "  (UDP echo skipped — Relay exit is up on this host)"
         return 0
         ;;
     esac
   done < <(relay_instances 2>/dev/null)
-  peer_info="$(layer_ssh_peer_relay_status "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
-  if [[ -n "${peer_info}" && "${peer_info}" != "none" ]]; then
-    ok=PASS; conf=med
-    note="peer Relay active (${peer_info})"
-    layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
-    info "  (UDP echo skipped — configured Relay seen on peer via SSH)"
-    return 0
-  fi
+  peer_info="$(layer_ssh_peer_relay_lookup "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+  case "${peer_info}" in
+    UP:*)
+      ok=PASS; conf=med
+      note="peer Relay active (${peer_info#UP:})"
+      layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
+      info "  (UDP echo skipped — configured Relay seen on peer via SSH)"
+      return 0
+      ;;
+    STOP:*)
+      layer_autotest_record "Phormal Relay" "inconclusive" "med" \
+        "peer Relay '${peer_info#STOP:}' configured but STOPPED — systemctl enable --now phormal-relay@<name> on peer"
+      info "  (UDP echo skipped — Relay meta on peer but service not active)"
+      return 0
+      ;;
+  esac
   while read -r n; do
     [[ -n "${n}" ]] || continue
     remote="$(imeta_get "${n}" REMOTE_V4)"
-    [[ "${remote}" == "${peer_v4}" ]] || continue
     role="$(imeta_get "${n}" ROLE)"
-    ok=PASS; conf=med
-    note="Relay '${n}' (${role}) configured for ${peer_v4} — start: systemctl start phormal-relay@${n}"
-    layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
+    st="$(relay_svc_state "${n}")"
+    case "${role}" in
+      entry) [[ "${remote}" == "${peer_v4}" ]] || continue ;;
+      exit) ;;
+      *) continue ;;
+    esac
+    [[ "${st}" == "active" ]] && continue
+    layer_autotest_record "Phormal Relay" "inconclusive" "med" \
+      "Relay '${n}' (${role}) configured but STOPPED — systemctl enable --now phormal-relay@${n}"
     info "  (UDP echo skipped — tunnel configured but service not active)"
     return 0
   done < <(relay_instances 2>/dev/null)
@@ -4530,6 +4779,7 @@ layer_autotest_main() {
   rule
   info "Phormal Path Test — every product (Bridge, Relay, Reverse, GRE, Echo, Raw, Stream, Cloak, DNS, Edge)"
   info "Each test prints its result live below, then a summary table and verdict."
+  info "Bridge/Relay/GRE need BOTH servers — SSH to peer verifies pairing and runs bidirectional probes."
   rule
   apt_install_quiet python3 tcpdump iproute2 openssh-client netcat-openbsd dnsutils 2>/dev/null || true
   have python3 || { fail "python3 required."; return 1; }
@@ -4558,7 +4808,9 @@ layer_autotest_main() {
   sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
   layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0" >/dev/null 2>&1 || true
-
+  printf '\n'
+  layer_autotest_verify_peer_pairing "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+  printf '\n'
   [[ "${only}" == "all" || "${only}" == *bridge* || "${only}" == *sit* ]] && \
     layer_test_bridge_path "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
   [[ "${only}" == "all" || "${only}" == *gre* ]] && \
