@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.3.0"
+readonly PHORMAL_VERSION="5.3.2"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -168,9 +168,23 @@ pkg_install_name() {
   esac
 }
 
+# Debian/RHEL package name → binary used to detect if already installed.
+pkg_cmd_for() {
+  case "$1" in
+    iproute2|iproute)        printf 'ip' ;;
+    openssh-client|openssh-clients) printf 'ssh' ;;
+    netcat-openbsd|netcat|nmap-ncat) printf 'nc' ;;
+    dnsutils|bind9-dnsutils|bind-utils) printf 'dig' ;;
+    *)                       printf '%s' "$1" ;;
+  esac
+}
+
 apt_install_quiet() {
-  local missing=() install_pkgs=() p mapped
-  for p in "$@"; do have "${p}" || missing+=("${p}"); done
+  local missing=() install_pkgs=() p mapped cmd
+  for p in "$@"; do
+    cmd="$(pkg_cmd_for "${p}")"
+    have "${cmd}" || missing+=("${p}")
+  done
   [[ ${#missing[@]} -eq 0 ]] && return 0
   info "Installing packages: ${missing[*]}…"
   if have apt-get; then
@@ -3810,6 +3824,13 @@ systemctl restart 'phormal-bfwd@*.service'  2>/dev/null || true
 systemctl restart 'phormal-relay@*.service' 2>/dev/null || true
 systemctl restart 'phormal-reverse@*.service' 2>/dev/null || true
 systemctl restart 'phormal-spoof@*.service'   2>/dev/null || true
+systemctl restart 'phormal-gre@*.service'    2>/dev/null || true
+systemctl restart 'phormal-icmp@*.service'   2>/dev/null || true
+systemctl restart 'phormal-udp2raw@*.service' 2>/dev/null || true
+systemctl restart 'phormal-btcp@*.service'   2>/dev/null || true
+systemctl restart 'phormal-bwss@*.service'   2>/dev/null || true
+systemctl restart 'phormal-dns@*.service'    2>/dev/null || true
+systemctl restart 'phormal-fwd@*.service'    2>/dev/null || true
 EOF
     chmod +x /usr/bin/phormal-refresh.sh
     ( crontab -l 2>/dev/null; echo "0 */${hrs} * * * /usr/bin/phormal-refresh.sh # phormal-refresh" ) | crontab -
@@ -3878,13 +3899,14 @@ status() {
   done < <(spoof_instances)
   [[ ${sany} -eq 0 ]] && warn "no spoof tunnels configured"
   echo
-  info "LAYER TUNNELS"
-  local lany=0 lk ln
+  info "PHORMAL GRE / ECHO / RAW / STREAM / CLOAK / DNS / EDGE"
+  local lany=0 lk ln pname
   for lk in gre icmp udp2raw btcp bwss dns fwd; do
+    pname="$(layer_phormal_name "${lk}")"
     while read -r ln; do
       [[ -n "${ln}" ]] || continue
       lany=1
-      printf '    %-10s %-16s %s\n' "${lk}" "${ln}" "$(layer_svc_state "$(layer_svc "${lk}" "${ln}")")"
+      printf '    %-18s %-16s %s\n' "${pname}" "${ln}" "$(layer_svc_state "$(layer_svc "${lk}" "${ln}")")"
     done < <(layer_instances "${lk}" 2>/dev/null || true)
   done
   [[ ${lany} -eq 0 ]] && warn "no layer tunnels configured"
@@ -4003,6 +4025,107 @@ readonly LAYER_RUN="/usr/local/bin/phormal-layer-run"
 readonly LAYER_GRE_RUN="/usr/local/bin/phormal-gre-run"
 readonly LAYER_KEYS=(gre icmp udp2raw btcp bwss dns fwd)
 
+# Phormal product display names (internal key → user-facing brand)
+layer_phormal_name() {
+  case "$1" in
+    gre)     printf 'Phormal GRE' ;;
+    icmp)    printf 'Phormal Echo' ;;
+    udp2raw) printf 'Phormal Raw' ;;
+    btcp)    printf 'Phormal Stream' ;;
+    bwss)    printf 'Phormal Cloak' ;;
+    dns)     printf 'Phormal DNS' ;;
+    fwd)     printf 'Phormal Edge' ;;
+    *)       printf 'Phormal Layer' ;;
+  esac
+}
+
+layer_choose_instance() {
+  local key="$1" names=() n pick
+  while read -r n; do [[ -n "${n}" ]] && names+=("${n}"); done < <(layer_instances "${key}")
+  [[ ${#names[@]} -gt 0 ]] || { warn "No $(layer_phormal_name "${key}") tunnels yet."; return 1; }
+  if [[ ${#names[@]} -eq 1 ]]; then printf '%s' "${names[0]}"; return 0; fi
+  info "$(layer_phormal_name "${key}") tunnels:"
+  local i=1; for n in "${names[@]}"; do printf '    %s) %s [%s]\n' "${i}" "${n}" "$(layer_svc_state "$(layer_svc "${key}" "${n}")")"; i=$((i+1)); done
+  pick="$(ask 'Name or number')"
+  [[ "${pick}" =~ ^[0-9]+$ && "${pick}" -ge 1 && "${pick}" -le ${#names[@]} ]] && printf '%s' "${names[$((pick-1))]}" && return 0
+  printf '%s' "${pick}"
+}
+
+layer_list() {
+  local key="$1" n any=0
+  rule
+  info "$(layer_phormal_name "${key}") — tunnels"
+  rule
+  printf '    %-16s %-6s %s\n' "NAME" "ROLE" "STATE"
+  while read -r n; do
+    [[ -n "${n}" ]] || continue
+    any=1
+    printf '    %-16s %-6s %s\n' "${n}" "$(layer_meta_get "${key}" "${n}" ROLE 2>/dev/null || echo '?')" \
+      "$(layer_svc_state "$(layer_svc "${key}" "${n}")")"
+  done < <(layer_instances "${key}")
+  [[ ${any} -eq 0 ]] && warn "no tunnels configured"
+  rule
+}
+
+manage_phormal_layer_menu() {
+  local key="$1" title
+  title="$(layer_phormal_name "${key}")"
+  while :; do
+    layer_list "${key}"
+    printf '  %s1%s  Manage a tunnel\n'     "${ACC}" "${RST}"
+    printf '  %s2%s  Add exit tunnel\n'     "${ACC}" "${RST}"
+    printf '  %s3%s  Add entry tunnel\n'    "${ACC}" "${RST}"
+    printf '  %s4%s  Restart ALL tunnels\n' "${ACC}" "${RST}"
+    printf '  %s0%s  Back\n\n'              "${ACC}" "${RST}"
+    local c; c="$(ask 'Select')"; echo
+    case "${c}" in
+      1) local n; n="$(layer_choose_instance "${key}")"; [[ -n "${n}" ]] && manage_layer_instance_menu "${key}" "${n}" ;;
+      2) layer_create_exit "${key}" || true ;;
+      3) layer_create_entry "${key}" || true ;;
+      4) local n; while read -r n; do [[ -n "${n}" ]] && layer_start_instance "${key}" "${n}" || true; done < <(layer_instances "${key}") ;;
+      0) break ;;
+      *) fail "Invalid selection." ;;
+    esac
+    echo
+  done
+}
+
+layer_create_entry() {
+  local key="$1"
+  case "${key}" in
+    gre)     create_layer_gre_entry ;;
+    icmp)    create_layer_icmp_entry ;;
+    udp2raw) create_layer_udp2raw_entry ;;
+    btcp)    create_layer_backhaul_entry btcp tcp ;;
+    bwss)    create_layer_backhaul_entry bwss wss ;;
+    dns)     create_layer_dns_entry ;;
+    fwd)     create_layer_edge_entry ;;
+    *)       fail "Unknown product."; return 1 ;;
+  esac
+}
+
+layer_create_exit() {
+  local key="$1"
+  case "${key}" in
+    gre)     create_layer_gre_exit ;;
+    icmp)    create_layer_icmp_exit ;;
+    udp2raw) create_layer_udp2raw_exit ;;
+    btcp)    create_layer_backhaul_exit btcp tcp ;;
+    bwss)    create_layer_backhaul_exit bwss wss ;;
+    dns)     create_layer_dns_exit ;;
+    fwd)     create_layer_edge_exit ;;
+    *)       fail "Unknown product."; return 1 ;;
+  esac
+}
+
+manage_gre_menu()    { manage_phormal_layer_menu gre; }
+manage_echo_menu()   { manage_phormal_layer_menu icmp; }
+manage_raw_menu()    { manage_phormal_layer_menu udp2raw; }
+manage_stream_menu() { manage_phormal_layer_menu btcp; }
+manage_cloak_menu()  { manage_phormal_layer_menu bwss; }
+manage_dns_layer_menu() { manage_phormal_layer_menu dns; }
+manage_edge_menu()   { manage_phormal_layer_menu fwd; }
+
 layer_idir() { printf '%s/%s/%s' "${LAYER_HOME}" "$1" "$2"; }
 layer_svc()  { printf 'phormal-%s@%s.service' "$1" "$2"; }
 
@@ -4037,11 +4160,12 @@ layer_instances() {
 }
 
 layer_pick_name() {
-  local key="$1" raw name
-  raw="$(ask "Tunnel name for ${key} (e.g. ir1, khr-de)")"
+  local key="$1" raw name pname
+  pname="$(layer_phormal_name "${key}")"
+  raw="$(ask "Tunnel name for ${pname} (e.g. ir1, khr-de)")"
   name="$(relay_sanitize_name "${raw}")"
   if [[ -f "$(layer_meta_file "${key}" "${name}")" ]]; then
-    warn "Tunnel '${name}' already exists for ${key}." >&2
+    warn "Tunnel '${name}' already exists for ${pname}." >&2
     printf '%s' ""
     return 1
   fi
@@ -4422,20 +4546,33 @@ layer_print_connect_line() {
   fi
 }
 
-create_layer_gre_entry() {
+_create_layer_gre_tunnel() {
+  local role="$1"
+  rule
+  info "Phormal GRE — add ${role} tunnel (kernel GRE / IPIP)"
+  rule
   local name local_v4 remote_v4 mode local_priv remote_priv iface
   name="$(layer_pick_name gre)" || return 1
   mkdir -p "$(layer_idir gre "${name}")"
-  layer_meta_set gre "${name}" ROLE entry
+  layer_meta_set gre "${name}" ROLE "${role}"
   mode="$(ask 'Tunnel mode [gre/ipip]')"; mode="${mode:-gre}"
   layer_meta_set gre "${name}" TUN_MODE "${mode}"
   local_v4="$(ask 'This server public IPv4')"
-  remote_v4="$(ask 'Peer public IPv4')"
+  if [[ "${role}" == exit ]]; then
+    remote_v4="$(ask 'Iran entry public IPv4')"
+  else
+    remote_v4="$(ask 'Peer public IPv4')"
+  fi
   valid_ipv4 "${local_v4}" && valid_ipv4 "${remote_v4}" || return 1
   layer_meta_set gre "${name}" LOCAL_V4 "${local_v4}"
   layer_meta_set gre "${name}" REMOTE_V4 "${remote_v4}"
-  local_priv="$(ask 'Local private /30 IP [10.77.0.1]')"; local_priv="${local_priv:-10.77.0.1}"
-  remote_priv="$(ask 'Remote private /30 IP [10.77.0.2]')"; remote_priv="${remote_priv:-10.77.0.2}"
+  if [[ "${role}" == exit ]]; then
+    local_priv="$(ask 'Local private /30 IP [10.77.0.2]')"; local_priv="${local_priv:-10.77.0.2}"
+    remote_priv="$(ask 'Remote private /30 IP [10.77.0.1]')"; remote_priv="${remote_priv:-10.77.0.1}"
+  else
+    local_priv="$(ask 'Local private /30 IP [10.77.0.1]')"; local_priv="${local_priv:-10.77.0.1}"
+    remote_priv="$(ask 'Remote private /30 IP [10.77.0.2]')"; remote_priv="${remote_priv:-10.77.0.2}"
+  fi
   layer_meta_set gre "${name}" LOCAL_PRIV "${local_priv}"
   layer_meta_set gre "${name}" REMOTE_PRIV "${remote_priv}"
   iface="phgre${name}"
@@ -4444,12 +4581,15 @@ create_layer_gre_entry() {
   layer_start_instance gre "${name}"
 }
 
-create_layer_gre_exit() {
-  create_layer_gre_entry
-}
+create_layer_gre_entry() { _create_layer_gre_tunnel entry; }
+create_layer_gre_exit()  { _create_layer_gre_tunnel exit; }
 
 create_layer_backhaul_entry() {
-  local key="$1" transport name token link_port ports sug
+  local key="$1" transport name token link_port ports sug pname
+  pname="$(layer_phormal_name "${key}")"
+  rule
+  info "${pname} — add entry tunnel (Backhaul ${transport})"
+  rule
   name="$(layer_pick_name "${key}")" || return 1
   install_layer_backhaul || return 1
   layer_install_runtime
@@ -4468,7 +4608,11 @@ create_layer_backhaul_entry() {
 }
 
 create_layer_backhaul_exit() {
-  local key="$1" transport name remote token link_port ports local_host
+  local key="$1" transport name remote token link_port ports local_host pname
+  pname="$(layer_phormal_name "${key}")"
+  rule
+  info "${pname} — add exit tunnel (Backhaul ${transport})"
+  rule
   name="$(layer_pick_name "${key}")" || return 1
   install_layer_backhaul || return 1
   layer_install_runtime
@@ -4486,10 +4630,13 @@ create_layer_backhaul_exit() {
   layer_meta_set "${key}" "${name}" LOCAL_HOST "${local_host}"
   layer_write_backhaul_exit "${key}" "${name}" "${transport}"
   layer_start_instance "${key}" "${name}"
-  good "Exit ${key}/${name} dials ${remote}:${link_port}"
+  good "Exit ${pname}/${name} dials ${remote}:${link_port}"
 }
 
 create_layer_icmp_entry() {
+  rule
+  info "Phormal Echo — add entry tunnel (ICMP icmp_tun)"
+  rule
   local name local_v4 remote_v4 local_priv remote_priv tid args
   install_layer_icmp_tun || return 1
   layer_install_runtime
@@ -4508,6 +4655,9 @@ create_layer_icmp_entry() {
 }
 
 create_layer_icmp_exit() {
+  rule
+  info "Phormal Echo — add exit tunnel (ICMP icmp_tun)"
+  rule
   local name local_v4 remote_v4 local_priv remote_priv tid args
   install_layer_icmp_tun || return 1
   layer_install_runtime
@@ -4526,6 +4676,9 @@ create_layer_icmp_exit() {
 }
 
 create_layer_udp2raw_exit() {
+  rule
+  info "Phormal Raw — add exit tunnel (udp2raw faketcp)"
+  rule
   local name remote listen relay key mode args
   install_layer_udp2raw || return 1
   layer_install_runtime
@@ -4543,6 +4696,9 @@ create_layer_udp2raw_exit() {
 }
 
 create_layer_udp2raw_entry() {
+  rule
+  info "Phormal Raw — add entry tunnel (udp2raw faketcp)"
+  rule
   local name listen relay key mode args
   install_layer_udp2raw || return 1
   layer_install_runtime
@@ -4558,8 +4714,95 @@ create_layer_udp2raw_entry() {
   layer_start_instance udp2raw "${name}"
 }
 
+create_layer_dns_entry() {
+  rule
+  info "Phormal DNS — add entry tunnel (iodine DNS tunnel)"
+  rule
+  install_layer_iodine_pair || return 1
+  layer_install_runtime
+  local name listen domain password
+  name="$(layer_pick_name dns)" || return 1
+  mkdir -p "$(layer_idir dns "${name}")"
+  layer_meta_set dns "${name}" ROLE entry
+  domain="$(ask 'Delegated NS subdomain (e.g. t1.example.com)')"
+  [[ -n "${domain}" ]] || { fail "Domain required."; return 1; }
+  layer_meta_set dns "${name}" DOMAIN "${domain}"
+  listen="$(ask 'iodined listen port [53]')"; listen="${listen:-53}"
+  layer_meta_set dns "${name}" LISTEN "${listen}"
+  password="$(ask 'iodine password')" || return 1
+  layer_meta_set dns "${name}" PASSWORD "${password}"
+  layer_meta_set dns "${name}" IODINED_ARGS "-c -P ${password} ${listen} ${domain}"
+  warn "Delegate NS for ${domain} to this server's public IP before starting."
+  layer_start_instance dns "${name}"
+  good "Phormal DNS entry ${name} — users: iodine -f -P <pass> ${domain}"
+}
+
+create_layer_dns_exit() {
+  rule
+  info "Phormal DNS — add exit tunnel (iodine client)"
+  rule
+  install_layer_iodine_pair || return 1
+  layer_install_runtime
+  local name domain password remote args
+  name="$(layer_pick_name dns)" || return 1
+  mkdir -p "$(layer_idir dns "${name}")"
+  layer_meta_set dns "${name}" ROLE exit
+  domain="$(ask 'NS subdomain (match entry)')"
+  [[ -n "${domain}" ]] || return 1
+  layer_meta_set dns "${name}" DOMAIN "${domain}"
+  password="$(ask 'iodine password (match entry)')" || return 1
+  layer_meta_set dns "${name}" PASSWORD "${password}"
+  remote="$(ask 'Iran entry public IPv4 (optional resolver hint)')"; remote="${remote:-}"
+  [[ -n "${remote}" ]] && layer_meta_set dns "${name}" REMOTE_V4 "${remote}"
+  layer_meta_set dns "${name}" IODINE_ARGS "-f -P ${password} ${domain}"
+  layer_start_instance dns "${name}"
+  good "Phormal DNS exit ${name} dials ${domain}"
+}
+
+create_layer_edge_entry() {
+  rule
+  info "Phormal Edge — add entry tunnel (proxyforwarder)"
+  rule
+  install_layer_proxyfwd || return 1
+  layer_install_runtime
+  local name listen_port remote_v4 args
+  name="$(layer_pick_name fwd)" || return 1
+  mkdir -p "$(layer_idir fwd "${name}")"
+  layer_meta_set fwd "${name}" ROLE entry
+  listen_port="$(ask 'Edge listen port [8443]')"; listen_port="${listen_port:-8443}"
+  layer_meta_set fwd "${name}" LISTEN "${listen_port}"
+  remote_v4="$(ask 'Kharej exit public IPv4')"
+  valid_ipv4 "${remote_v4}" || return 1
+  layer_meta_set fwd "${name}" REMOTE_V4 "${remote_v4}"
+  args="-l 0.0.0.0:${listen_port} -r ${remote_v4}"
+  layer_meta_set fwd "${name}" FWD_ARGS "${args}"
+  layer_start_instance fwd "${name}"
+  good "Phormal Edge entry ${name} listening on :${listen_port}"
+}
+
+create_layer_edge_exit() {
+  rule
+  info "Phormal Edge — add exit tunnel (proxyforwarder)"
+  rule
+  install_layer_proxyfwd || return 1
+  layer_install_runtime
+  local name listen_port local_host args
+  name="$(layer_pick_name fwd)" || return 1
+  mkdir -p "$(layer_idir fwd "${name}")"
+  layer_meta_set fwd "${name}" ROLE exit
+  listen_port="$(ask 'Edge listen port [8443]')"; listen_port="${listen_port:-8443}"
+  layer_meta_set fwd "${name}" LISTEN "${listen_port}"
+  local_host="$(ask 'Local upstream host [127.0.0.1]')"; local_host="${local_host:-127.0.0.1}"
+  layer_meta_set fwd "${name}" LOCAL_HOST "${local_host}"
+  args="-l 0.0.0.0:${listen_port} -f ${local_host}"
+  layer_meta_set fwd "${name}" FWD_ARGS "${args}"
+  layer_start_instance fwd "${name}"
+  good "Phormal Edge exit ${name} on :${listen_port} → ${local_host}"
+}
+
 layer_delete_instance() {
-  local key="$1" name="$2" svc iface
+  local key="$1" name="$2" svc iface pname
+  pname="$(layer_phormal_name "${key}")"
   svc="$(layer_svc "${key}" "${name}")"
   systemctl stop "${svc}" 2>/dev/null || true
   systemctl disable "${svc}" 2>/dev/null || true
@@ -4568,16 +4811,17 @@ layer_delete_instance() {
     [[ -n "${iface}" ]] && ip link del "${iface}" 2>/dev/null || true
   fi
   rm -rf "$(layer_idir "${key}" "${name}")"
-  good "Deleted ${key}/${name}."
+  good "Deleted ${pname}/${name}."
 }
 
 manage_layer_instance_menu() {
-  local key="$1" name="$2" c svc
+  local key="$1" name="$2" c svc pname
+  pname="$(layer_phormal_name "${key}")"
   svc="$(layer_svc "${key}" "${name}")"
   while :; do
     banner
     rule
-    info "Layer ${key} / ${name}  [$(layer_svc_state "${svc}")]"
+    info "${pname} / ${name}  [$(layer_svc_state "${svc}")]"
     rule
     printf '    %s1%s  Start/restart\n' "${ACC}" "${RST}"
     printf '    %s2%s  Stop\n' "${ACC}" "${RST}"
@@ -4594,58 +4838,6 @@ manage_layer_instance_menu() {
     esac
     echo; read -n1 -s -r -p "  ${MUT}Press any key…${RST}"; echo
   done
-}
-
-manage_layer_menu() {
-  local c key name n
-  while :; do
-    banner
-    rule
-    info "Multi-layer tunnels"
-    rule
-    for key in "${LAYER_KEYS[@]}"; do
-      while read -r n; do
-        [[ -n "${n}" ]] || continue
-        printf '    %-10s %-16s %s\n' "${key}" "${n}" "$(layer_svc_state "$(layer_svc "${key}" "${n}")")"
-      done < <(layer_instances "${key}")
-    done
-    printf '\n    %s1%s  Pick instance to manage\n' "${ACC}" "${RST}"
-    printf '    %s0%s  Back\n\n' "${ACC}" "${RST}"
-    c="$(ask 'Select')"; echo
-    [[ "${c}" == "0" ]] && break
-    [[ "${c}" != "1" ]] && continue
-    key="$(ask 'Layer key (gre|icmp|udp2raw|btcp|bwss|dns|fwd)')"
-    name="$(ask 'Instance name')"
-    [[ -f "$(layer_meta_file "${key}" "${name}")" ]] || { fail "Not found."; continue; }
-    manage_layer_instance_menu "${key}" "${name}"
-  done
-}
-
-layer_add_menu() {
-  local c
-  banner
-  rule
-  info "Add layer tunnel (pick engine)"
-  rule
-  printf '    %s1%s  GRE/IPIP (kernel)\n' "${ACC}" "${RST}"
-  printf '    %s2%s  ICMP (icmp_tun)\n' "${ACC}" "${RST}"
-  printf '    %s3%s  UDP raw (udp2raw)\n' "${ACC}" "${RST}"
-  printf '    %s4%s  TCP (Backhaul btcp)\n' "${ACC}" "${RST}"
-  printf '    %s5%s  TLS/WS (Backhaul bwss)\n' "${ACC}" "${RST}"
-  printf '    %s6%s  DNS (iodine)\n' "${ACC}" "${RST}"
-  printf '    %s0%s  Cancel\n\n' "${ACC}" "${RST}"
-  c="$(ask 'Select')"; echo
-  local role; role="$(ask 'Role [entry/exit]')"; role="${role:-entry}"
-  case "${c}" in
-    1) [[ "${role}" == entry ]] && create_layer_gre_entry || create_layer_gre_exit ;;
-    2) [[ "${role}" == entry ]] && create_layer_icmp_entry || create_layer_icmp_exit ;;
-    3) [[ "${role}" == entry ]] && create_layer_udp2raw_entry || create_layer_udp2raw_exit ;;
-    4) [[ "${role}" == entry ]] && create_layer_backhaul_entry btcp tcp || create_layer_backhaul_exit btcp tcp ;;
-    5) [[ "${role}" == entry ]] && create_layer_backhaul_entry bwss wss || create_layer_backhaul_exit bwss wss ;;
-    6) warn "DNS layer wizard: install iodine pair on both nodes, delegate NS subdomain." ;;
-    0) return 0 ;;
-    *) fail "Invalid." ;;
-  esac
 }
 
 # ---- Auto-test helpers ----
@@ -4668,8 +4860,60 @@ layer_pick_probe_port() {
 
 layer_ssh_cmd() {
   local host="$1" port="$2" user="$3" cmd="$4"
-  ssh -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new \
+  local -a ssh_extra=()
+  if [[ -n "${LAYER_SSH_CTRL_PATH:-}" ]]; then
+    ssh_extra=(-o "ControlPath=${LAYER_SSH_CTRL_PATH}")
+  else
+    ssh_extra=(-o BatchMode=yes)
+  fi
+  ssh "${ssh_extra[@]}" -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new \
     -p "${port}" "${user}@${host}" "${cmd}"
+}
+
+layer_ssh_scp_to() {
+  local port="$1" user="$2" host="$3" local_path="$4" remote_path="$5"
+  local -a scp_extra=()
+  if [[ -n "${LAYER_SSH_CTRL_PATH:-}" ]]; then
+    scp_extra=(-o "ControlPath=${LAYER_SSH_CTRL_PATH}")
+  else
+    scp_extra=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new)
+  fi
+  scp -q -P "${port}" "${scp_extra[@]}" "${local_path}" "${user}@${host}:${remote_path}"
+}
+
+layer_ssh_session_open() {
+  local host="$1" port="$2" user="$3"
+  local ctrl="/tmp/phormal-ssh-${user}@${host}-${port}-$$"
+  LAYER_SSH_CTRL_PATH="${ctrl}"
+
+  if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+      -p "${port}" "${user}@${host}" "echo PHORMAL-SSH-OK" 2>/dev/null | grep -q OK; then
+    ssh -o BatchMode=yes -o ControlMaster=yes -o "ControlPath=${ctrl}" -o ControlPersist=600 \
+      -o StrictHostKeyChecking=accept-new -p "${port}" -fN "${user}@${host}" 2>/dev/null || true
+    if layer_ssh_cmd "${host}" "${port}" "${user}" "echo PHORMAL-SSH-OK" 2>/dev/null | grep -q OK; then
+      good "SSH link OK (key auth)."
+      return 0
+    fi
+  fi
+
+  info "SSH key not configured — you will be prompted for the peer password (once per test)."
+  if ! ssh -o PreferredAuthentications=keyboard-interactive,password \
+      -o ControlMaster=yes -o "ControlPath=${ctrl}" -o ControlPersist=600 \
+      -o StrictHostKeyChecking=accept-new -p "${port}" \
+      "${user}@${host}" "echo PHORMAL-SSH-OK"; then
+    LAYER_SSH_CTRL_PATH=""
+    fail "SSH to ${user}@${host}:${port} failed."
+    return 1
+  fi
+  good "SSH link OK."
+  return 0
+}
+
+layer_ssh_session_close() {
+  local host="$1" port="$2" user="$3"
+  [[ -n "${LAYER_SSH_CTRL_PATH:-}" ]] || return 0
+  ssh -o "ControlPath=${LAYER_SSH_CTRL_PATH}" -O exit -p "${port}" "${user}@${host}" 2>/dev/null || true
+  LAYER_SSH_CTRL_PATH=""
 }
 
 layer_probe_py() {
@@ -4746,13 +4990,125 @@ layer_autotest_record() {
 layer_autotest_print_table() {
   local row
   rule
-  printf '  %-28s %-10s %-10s %s\n' "LAYER / TUNNEL" "RESULT" "CONFIDENCE" "NOTE"
+  printf '  %-28s %-10s %-10s %s\n' "PHORMAL PRODUCT" "RESULT" "CONFIDENCE" "NOTE"
   rule
   for row in "${LAYER_TEST_ROWS[@]}"; do
     IFS='|' read -r a b c d <<<"${row}"
     printf '  %-28s %-10s %-10s %s\n' "${a}" "${b}" "${c}" "${d}"
   done
   rule
+}
+
+layer_autotest_last_result() {
+  local key="$1" row a b c d
+  [[ ${#LAYER_TEST_ROWS[@]} -gt 0 ]] || return 1
+  row="${LAYER_TEST_ROWS[$((${#LAYER_TEST_ROWS[@]}-1))]}"
+  IFS='|' read -r a b c d <<<"${row}"
+  case "${key}" in
+    result) printf '%s' "${b}" ;;
+    conf)   printf '%s' "${c}" ;;
+    note)   printf '%s' "${d}" ;;
+    *)      printf '%s' "${b}" ;;
+  esac
+}
+
+layer_autotest_mirror_row() {
+  local label="$1" note_suffix="$2" res conf note
+  res="$(layer_autotest_last_result result)"
+  conf="$(layer_autotest_last_result conf)"
+  note="$(layer_autotest_last_result note)"
+  layer_autotest_record "${label}" "${res}" "${conf}" "${note}${note_suffix}"
+}
+
+layer_autotest_recommendation() {
+  local row product result menu_hint any=0
+  rule
+  info "Which menu option to use (PASS products only)"
+  rule
+  for row in "${LAYER_TEST_ROWS[@]}"; do
+    IFS='|' read -r product result _ _ <<<"${row}"
+    [[ "${result}" == "PASS" ]] || continue
+    any=1
+    case "${product}" in
+      "Phormal Bridge")       menu_hint="options 2–5 (Bridge)" ;;
+      "Phormal Relay"*)       menu_hint="options 6–9 (Relay)" ;;
+      "Phormal Reverse")      menu_hint="options 10–12 (Reverse)" ;;
+      "Phormal Spoof")        menu_hint="options 13–15 (Spoof)" ;;
+      "Phormal GRE")          menu_hint="options 16–18 (GRE)" ;;
+      "Phormal GRE (IPIP)")   menu_hint="options 16–18 (GRE, IPIP mode)" ;;
+      "Phormal Echo")         menu_hint="options 19–21 (Echo)" ;;
+      "Phormal Raw")          menu_hint="options 22–24 (Raw)" ;;
+      "Phormal Stream")       menu_hint="options 25–27 (Stream)" ;;
+      "Phormal Cloak")        menu_hint="options 28–30 (Cloak)" ;;
+      "Phormal DNS")          menu_hint="options 31–33 (DNS)" ;;
+      "Phormal Edge")         menu_hint="options 34–36 (Edge)" ;;
+      *)                      menu_hint="see menu" ;;
+    esac
+    printf '  %-28s → %s\n' "${product}" "${menu_hint}"
+  done
+  [[ ${any} -eq 0 ]] && warn "No product passed — review FAIL rows or try another peer path."
+  rule
+}
+
+layer_test_spoof_autotest() {
+  local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5" spoof_src="$6"
+  local iface real_ip ok=FAIL conf=high note="" probe pcap pcap2 tdp tdp2 captured=0 n sent=6
+  apt_install_quiet tcpdump python3 2>/dev/null || true
+  iface="$(primary_iface)"
+  real_ip="$(spoof_iface_ipv4 "${iface}")"
+  [[ -n "${iface}" ]] || { layer_autotest_record "Phormal Spoof" "inconclusive" "low" "no iface"; return; }
+  if [[ -n "${real_ip}" && "${spoof_src}" == "${real_ip}" ]]; then
+    layer_autotest_record "Phormal Spoof" "inconclusive" "low" "spoof src equals real IP"
+    return
+  fi
+  sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w "net.ipv4.conf.${iface}.rp_filter=0" >/dev/null 2>&1 || true
+  layer_write_probe_py "${probe:=/tmp/phormal-probe-$$.py}"
+  layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${probe}" "/tmp/phormal-probe.py" 2>/dev/null || true
+
+  # Local egress: forged ICMP leaves this host
+  pcap="$(mktemp)"; pcap2="$(mktemp)"
+  timeout 15 tcpdump -ni any -s 160 -w "${pcap}" "icmp and dst host ${peer_v4}" >/dev/null 2>&1 &
+  tdp=$!
+  timeout 15 tcpdump -ni "${iface}" -s 160 -w "${pcap2}" "icmp and dst host ${peer_v4}" >/dev/null 2>&1 &
+  tdp2=$!
+  sleep 1
+  if spoof_send_probe "${spoof_src}" "${peer_v4}" "${sent}" 2>/dev/null \
+    || python3 "${probe}" icmp_send "${spoof_src}" "${peer_v4}" >/dev/null 2>&1; then
+    sleep 2
+  fi
+  kill "${tdp}" "${tdp2}" 2>/dev/null || true
+  wait "${tdp}" "${tdp2}" 2>/dev/null || true
+  for capf in "${pcap}" "${pcap2}"; do
+    [[ -f "${capf}" && -s "${capf}" ]] || continue
+    n="$(spoof_count_captured_probes "${capf}" "${spoof_src}" "${peer_v4}" 2>/dev/null || echo 0)"
+    [[ "${n}" -gt "${captured}" ]] && captured="${n}"
+  done
+  rm -f "${pcap}" "${pcap2}"
+
+  # Peer ingress: peer sends forged ICMP toward us
+  local peer_ok=0 peer_pcap="/tmp/phormal-spoof-in-$$"
+  timeout 18 tcpdump -ni any -c 6 "icmp and src host ${spoof_src}" >"${peer_pcap}" 2>&1 &
+  tdp=$!
+  sleep 1
+  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "python3 /tmp/phormal-probe.py icmp_send ${spoof_src} ${local_v4}" 2>/dev/null || true
+  wait "${tdp}" 2>/dev/null || true
+  grep -q "ICMP echo request" "${peer_pcap}" 2>/dev/null && peer_ok=1
+  rm -f "${peer_pcap}" "${probe}"
+  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "rm -f /tmp/phormal-probe.py" 2>/dev/null || true
+
+  if [[ "${captured}" -ge 1 && "${peer_ok}" -eq 1 ]]; then
+    ok=PASS; note="egress ${captured}/${sent} + peer forged ingress"
+  elif [[ "${captured}" -ge 1 ]]; then
+    ok=PASS; conf=med; note="local egress OK; peer→local spoof inconclusive"
+  elif [[ "${peer_ok}" -eq 1 ]]; then
+    ok=PASS; conf=med; note="peer→local OK; local egress inconclusive"
+  else
+    note="no spoof path (src ${spoof_src})"
+    conf=med
+  fi
+  layer_autotest_record "Phormal Spoof" "${ok}" "${conf}" "${note}"
 }
 
 layer_test_kernel_pair() {
@@ -4802,8 +5158,7 @@ layer_test_udp_sizes() {
   port="$(layer_pick_probe_port)" || { layer_autotest_record "${label}" "inconclusive" "low" "no free port"; return; }
   listen=$((port + 1))
   layer_write_probe_py "${probe}"
-  scp -q -P "${ssh_port}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-    "${probe}" "${ssh_user}@${ssh_host}:/tmp/phormal-probe.py" 2>/dev/null || {
+  layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${probe}" "/tmp/phormal-probe.py" 2>/dev/null || {
     rm -f "${probe}"; layer_autotest_record "${label}" "inconclusive" "low" "scp failed"; return; }
   layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "timeout 20 python3 /tmp/phormal-probe.py udp ${listen} ${peer} ${port} ${size} >${rjson}" 2>/dev/null &
@@ -4858,61 +5213,101 @@ layer_test_tcp_bidir() {
 }
 
 layer_autotest_main() {
-  local only="${1:-all}" ssh_host ssh_port ssh_user local_v4 peer_v4
+  local only="${1:-all}" ssh_host ssh_port ssh_user local_v4 peer_v4 spoof_src
+  local def_host def_port def_user saved_host saved_port saved_user
   LAYER_TEST_ROWS=()
+  LAYER_SSH_CTRL_PATH=""
   rule
-  info "Phormal Multi-Layer Auto-Test"
-  info "Probes real traffic bidirectionally via SSH coordination."
+  info "Phormal Path Test — every product (Bridge, Relay, Reverse, Spoof, GRE, Echo, Raw, Stream, Cloak, DNS)"
+  info "Probes real bidirectional traffic via SSH coordination with the peer."
   rule
-  apt_install_quiet python3 tcpdump iproute2 openssh-client netcat-openbsd 2>/dev/null || true
+  apt_install_quiet python3 tcpdump iproute2 openssh-client netcat-openbsd dnsutils 2>/dev/null || true
   have python3 || { fail "python3 required."; return 1; }
   local_v4="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-  ssh_host="$(ask 'Peer SSH host (IP or hostname)')"
-  ssh_port="$(ask 'Peer SSH port [22]')"; ssh_port="${ssh_port:-22}"
-  ssh_user="$(ask 'Peer SSH user [root]')"; ssh_user="${ssh_user:-root}"
+  def_host="$(conf_get PATH_TEST_SSH_HOST)"
+  def_port="$(conf_get PATH_TEST_SSH_PORT)"; def_port="${def_port:-22}"
+  def_user="$(conf_get PATH_TEST_SSH_USER)"; def_user="${def_user:-root}"
+  if [[ -n "${def_host}" ]]; then
+    ssh_host="$(ask "Peer SSH host (IP or hostname) [${def_host}]")"
+    ssh_host="${ssh_host:-${def_host}}"
+    ssh_port="$(ask "Peer SSH port [${def_port}]")"; ssh_port="${ssh_port:-${def_port}}"
+    ssh_user="$(ask "Peer SSH user [${def_user}]")"; ssh_user="${ssh_user:-${def_user}}"
+  else
+    ssh_host="$(ask 'Peer SSH host (IP or hostname)')"
+    ssh_port="$(ask 'Peer SSH port [22]')"; ssh_port="${ssh_port:-22}"
+    ssh_user="$(ask 'Peer SSH user [root]')"; ssh_user="${ssh_user:-root}"
+  fi
+  saved_host="${ssh_host}"; saved_port="${ssh_port}"; saved_user="${ssh_user}"
+  trap 'layer_ssh_session_close "${saved_host}" "${saved_port}" "${saved_user}"' RETURN
   peer_v4="${ssh_host}"
   valid_ipv4 "${peer_v4}" || peer_v4="$(getent ahostsv4 "${ssh_host}" 2>/dev/null | awk '{print $1; exit}')"
   [[ -n "${peer_v4}" ]] || { fail "Cannot resolve peer."; return 1; }
-  if ! layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "echo PHORMAL-SSH-OK" 2>/dev/null | grep -q OK; then
-    fail "SSH to ${ssh_user}@${ssh_host}:${ssh_port} failed (key auth required)."
-    return 1
-  fi
-  good "SSH link OK."
+  layer_ssh_session_open "${ssh_host}" "${ssh_port}" "${ssh_user}" || return 1
+  conf_set PATH_TEST_SSH_HOST "${ssh_host}"
+  conf_set PATH_TEST_SSH_PORT "${ssh_port}"
+  conf_set PATH_TEST_SSH_USER "${ssh_user}"
+  spoof_src="$(ask 'White/spoof source IP for Phormal Spoof test [62.60.212.199]')"
+  spoof_src="${spoof_src:-62.60.212.199}"
   sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
   layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0" >/dev/null 2>&1 || true
 
-  [[ "${only}" == "all" || "${only}" == *sit* ]] && \
-    layer_test_kernel_pair sit "L3 SIT (Bridge)" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+  [[ "${only}" == "all" || "${only}" == *bridge* || "${only}" == *sit* ]] && \
+    layer_test_kernel_pair sit "Phormal Bridge" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
   [[ "${only}" == "all" || "${only}" == *gre* ]] && \
-    layer_test_kernel_pair gre "L3 GRE" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+    layer_test_kernel_pair gre "Phormal GRE" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
   [[ "${only}" == "all" || "${only}" == *ipip* ]] && \
-    layer_test_kernel_pair ipip "L3 IPIP" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+    layer_test_kernel_pair ipip "Phormal GRE (IPIP)" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
 
-  if [[ "${only}" == "all" || "${only}" == *icmp* ]]; then
-    local pcap ok=FAIL note="" probe="/tmp/phormal-probe-$$.py"
-    pcap="$(mktemp)"
+  if [[ "${only}" == "all" || "${only}" == *echo* || "${only}" == *icmp* ]]; then
+    local pcap pcap2 ok=FAIL note="" probe="/tmp/phormal-probe-$$.py" peer_ok=0 local_ok=0
+    pcap="$(mktemp)"; pcap2="$(mktemp)"
     layer_write_probe_py "${probe}"
-    scp -q -P "${ssh_port}" -o BatchMode=yes "${probe}" "${ssh_user}@${ssh_host}:/tmp/phormal-probe.py" 2>/dev/null || true
+    layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${probe}" "/tmp/phormal-probe.py" 2>/dev/null || true
     timeout 18 tcpdump -ni any -c 5 "icmp and src host ${peer_v4}" >"${pcap}" 2>&1 &
     local td=$!
     sleep 1
     layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-      "python3 /tmp/phormal-probe.py icmp_send ${local_v4} ${peer_v4}" 2>/dev/null || true
+      "python3 /tmp/phormal-probe.py icmp_send ${peer_v4} ${local_v4}" 2>/dev/null || true
     wait "${td}" 2>/dev/null || true
-    if grep -q "ICMP echo request" "${pcap}" 2>/dev/null; then ok=PASS; note="peer->local icmp seen"; else note="no icmp arrival"; fi
-    rm -f "${pcap}" "${probe}"
+    grep -q "ICMP echo request" "${pcap}" 2>/dev/null && peer_ok=1
+    timeout 18 tcpdump -ni any -c 5 "icmp and src host ${local_v4}" >"${pcap2}" 2>&1 &
+    td=$!
+    sleep 1
+    python3 "${probe}" icmp_send "${local_v4}" "${peer_v4}" >/dev/null 2>&1 || true
+    wait "${td}" 2>/dev/null || true
+    grep -q "ICMP echo request" "${pcap2}" 2>/dev/null && local_ok=1
+    rm -f "${pcap}" "${pcap2}" "${probe}"
     layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "rm -f /tmp/phormal-probe.py" 2>/dev/null || true
-    layer_autotest_record "L3 ICMP echo" "${ok}" "high" "${note}"
+    if [[ "${peer_ok}" -eq 1 && "${local_ok}" -eq 1 ]]; then ok=PASS; note="bidirectional ICMP echo"
+    elif [[ "${peer_ok}" -eq 1 || "${local_ok}" -eq 1 ]]; then ok=PASS; note="one-way ICMP OK"; else note="no icmp echo path"; fi
+    layer_autotest_record "Phormal Echo" "${ok}" "high" "${note}"
   fi
 
-  [[ "${only}" == "all" || "${only}" == *udp* ]] && layer_test_udp_sizes "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" 64 "L4 UDP small"
-  [[ "${only}" == "all" || "${only}" == *udp* ]] && layer_test_udp_sizes "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" 1400 "L4 UDP large/MTU"
+  [[ "${only}" == "all" || "${only}" == *relay* || "${only}" == *udp* ]] && \
+    layer_test_udp_sizes "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" 64 "Phormal Relay (UDP small)"
+  [[ "${only}" == "all" || "${only}" == *relay* || "${only}" == *udp* ]] && \
+    layer_test_udp_sizes "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" 1400 "Phormal Relay (UDP large)"
+  if [[ "${only}" == *raw* && "${only}" != "all" ]]; then
+    layer_test_udp_sizes "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" 1400 "Phormal Raw"
+  elif [[ "${only}" == "all" || "${only}" == *raw* ]]; then
+    layer_autotest_mirror_row "Phormal Raw" " — faketcp needs TCP-looking UDP path"
+  fi
 
-  [[ "${only}" == "all" || "${only}" == *tcp* ]] && \
-    layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "L4 TCP connect+data"
+  if [[ "${only}" == "all" || "${only}" == *reverse* || "${only}" == *tcp* ]]; then
+    layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Reverse"
+    if [[ "${only}" == "all" || "${only}" == *stream* ]]; then
+      layer_autotest_mirror_row "Phormal Stream" " — same TCP path as Reverse/Backhaul"
+    fi
+  elif [[ "${only}" == *stream* ]]; then
+    layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Stream"
+  fi
 
-  if [[ "${only}" == "all" || "${only}" == *tls* || "${only}" == *wss* ]]; then
+  if [[ "${only}" == "all" || "${only}" == *spoof* ]]; then
+    layer_test_spoof_autotest "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "${spoof_src}"
+  fi
+
+  if [[ "${only}" == "all" || "${only}" == *cloak* || "${only}" == *tls* || "${only}" == *wss* ]]; then
     local ok=FAIL note="not probed"
     if have openssl; then
       if echo | timeout 8 openssl s_client -connect "${peer_v4}:443" -servername github.com 2>/dev/null | grep -qi "BEGIN CERTIFICATE"; then
@@ -4923,7 +5318,7 @@ layer_autotest_main() {
     else
       note="openssl missing"; ok=inconclusive
     fi
-    layer_autotest_record "L7 TLS :443" "${ok}" "med" "${note}"
+    layer_autotest_record "Phormal Cloak" "${ok}" "med" "${note}"
   fi
 
   if [[ "${only}" == "all" || "${only}" == *dns* ]]; then
@@ -4933,12 +5328,20 @@ layer_autotest_main() {
     else
       note="DNS probe failed/inconclusive"; ok=inconclusive
     fi
-    layer_autotest_record "L7 DNS" "${ok}" "low" "${note}"
+    layer_autotest_record "Phormal DNS" "${ok}" "low" "${note}"
+  fi
+
+  if [[ "${only}" == "all" || "${only}" == *edge* ]]; then
+    if [[ "${only}" == *edge* && "${only}" != "all" ]]; then
+      layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Edge"
+    else
+      layer_autotest_mirror_row "Phormal Edge" " — TCP forwarding path (proxyforwarder)"
+    fi
   fi
 
   layer_autotest_print_table
-  info "Recommendation: pick the fastest layer marked PASS above."
-  warn "Existing Phormal Relay (UDP/QUIC) and Bridge (SIT) are probed — do not rebuild if FAIL."
+  layer_autotest_recommendation
+  info "Run option 1 first whenever you add a new peer — then pick the PASS product from the menu."
 }
 
 layer_autotest_cli() {
@@ -4953,67 +5356,120 @@ layer_autotest_cli() {
   layer_autotest_main "${only}"
 }
 
+phormal_path_test_menu() {
+  rule
+  info "Phormal Path Test — option 1"
+  info "Tests Bridge, Relay, Reverse, Spoof, GRE, Echo, Raw, Stream, Cloak, DNS, Edge."
+  rule
+  layer_autotest_cli
+}
+
 # ------------------------------------------------------------------------------
 #  Menu
 # ------------------------------------------------------------------------------
 menu() {
   while :; do
     banner
-    printf '  %sPHORMAL BRIDGE%s  %s(multi-tunnel)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
-    printf '    %s1%s  Add exit link\n' "${ACC}" "${RST}"
-    printf '    %s2%s  Add entry link\n' "${ACC}" "${RST}"
-    printf '    %s3%s  Manage links\n' "${ACC}" "${RST}"
-    printf '    %s4%s  Speedtest\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL RELAY%s  %s(multi-tunnel)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
-    printf '    %s5%s  Add exit tunnel\n' "${ACC}" "${RST}"
-    printf '    %s6%s  Add entry tunnel\n' "${ACC}" "${RST}"
-    printf '    %s7%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '    %s8%s  Speedtest\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL REVERSE%s  %s(multi-tunnel)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
-    printf '    %s9%s  Add exit tunnel\n' "${ACC}" "${RST}"
-    printf '   %s10%s  Add entry tunnel\n' "${ACC}" "${RST}"
-    printf '   %s11%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL SPOOF%s  %s(multi-tunnel)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
-    printf '   %s12%s  Add exit tunnel\n' "${ACC}" "${RST}"
-    printf '   %s13%s  Add entry tunnel\n' "${ACC}" "${RST}"
-    printf '   %s14%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sMULTI-LAYER%s  %s(auto-test + per-layer tunnels)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
-    printf '   %s15%s  Auto-test path (SSH to peer)\n' "${ACC}" "${RST}"
-    printf '   %s16%s  Add a layer tunnel\n' "${ACC}" "${RST}"
-    printf '   %s17%s  Manage layer tunnels\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL PATH TEST%s\n' "${BOLD}" "${RST}"
+    printf '    %s1%s  Run path auto-test (SSH to peer — try every product)\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL BRIDGE%s  %s(SIT / gost)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '    %s2%s  Add exit link\n' "${ACC}" "${RST}"
+    printf '    %s3%s  Add entry link\n' "${ACC}" "${RST}"
+    printf '    %s4%s  Manage links\n' "${ACC}" "${RST}"
+    printf '    %s5%s  Speedtest\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL RELAY%s  %s(Hysteria2 / QUIC)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '    %s6%s  Add exit tunnel\n' "${ACC}" "${RST}"
+    printf '    %s7%s  Add entry tunnel\n' "${ACC}" "${RST}"
+    printf '    %s8%s  Manage tunnels\n' "${ACC}" "${RST}"
+    printf '    %s9%s  Speedtest\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL REVERSE%s  %s(rathole)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '   %s10%s  Add exit tunnel\n' "${ACC}" "${RST}"
+    printf '   %s11%s  Add entry tunnel\n' "${ACC}" "${RST}"
+    printf '   %s12%s  Manage tunnels\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL SPOOF%s  %s(Backhaul + IPX)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '   %s13%s  Add exit tunnel\n' "${ACC}" "${RST}"
+    printf '   %s14%s  Add entry tunnel\n' "${ACC}" "${RST}"
+    printf '   %s15%s  Manage tunnels\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL GRE%s  %s(kernel GRE / IPIP)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '   %s16%s  Add exit tunnel\n' "${ACC}" "${RST}"
+    printf '   %s17%s  Add entry tunnel\n' "${ACC}" "${RST}"
+    printf '   %s18%s  Manage tunnels\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL ECHO%s  %s(ICMP icmp_tun)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '   %s19%s  Add exit tunnel\n' "${ACC}" "${RST}"
+    printf '   %s20%s  Add entry tunnel\n' "${ACC}" "${RST}"
+    printf '   %s21%s  Manage tunnels\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL RAW%s  %s(udp2raw faketcp)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '   %s22%s  Add exit tunnel\n' "${ACC}" "${RST}"
+    printf '   %s23%s  Add entry tunnel\n' "${ACC}" "${RST}"
+    printf '   %s24%s  Manage tunnels\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL STREAM%s  %s(Backhaul TCP)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '   %s25%s  Add exit tunnel\n' "${ACC}" "${RST}"
+    printf '   %s26%s  Add entry tunnel\n' "${ACC}" "${RST}"
+    printf '   %s27%s  Manage tunnels\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL CLOAK%s  %s(Backhaul WSS / TLS)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '   %s28%s  Add exit tunnel\n' "${ACC}" "${RST}"
+    printf '   %s29%s  Add entry tunnel\n' "${ACC}" "${RST}"
+    printf '   %s30%s  Manage tunnels\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL DNS%s  %s(iodine)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '   %s31%s  Add exit tunnel\n' "${ACC}" "${RST}"
+    printf '   %s32%s  Add entry tunnel\n' "${ACC}" "${RST}"
+    printf '   %s33%s  Manage tunnels\n' "${ACC}" "${RST}"
+    printf '\n  %sPHORMAL EDGE%s  %s(proxyforwarder)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '   %s34%s  Add exit tunnel\n' "${ACC}" "${RST}"
+    printf '   %s35%s  Add entry tunnel\n' "${ACC}" "${RST}"
+    printf '   %s36%s  Manage tunnels\n' "${ACC}" "${RST}"
     printf '\n  %sMANAGE%s\n' "${BOLD}" "${RST}"
-    printf '   %s18%s  Status\n' "${ACC}" "${RST}"
-    printf '   %s19%s  Phormal tuning\n' "${ACC}" "${RST}"
-    printf '   %s20%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
-    printf '   %s21%s  Uninstall\n' "${ACC}" "${RST}"
+    printf '   %s37%s  Status\n' "${ACC}" "${RST}"
+    printf '   %s38%s  Phormal tuning\n' "${ACC}" "${RST}"
+    printf '   %s39%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
+    printf '   %s40%s  Uninstall\n' "${ACC}" "${RST}"
     printf '    %s0%s  Exit\n\n' "${ACC}" "${RST}"
 
     local choice; choice="$(ask 'Select')"
     echo
     case "${choice}" in
-      1) create_bridge_exit || true ;;
-      2) create_bridge_entry || true ;;
-      3) manage_bridge_menu || true ;;
-      4) local bn; bn="$(bridge_choose_instance)"; [[ -n "${bn}" ]] && bridge_instance_speedtest "${bn}" || true ;;
-      5) create_exit_tunnel || true ;;
-      6) create_entry_tunnel || true ;;
-      7) manage_relay_menu || true ;;
-      8) relay_speedtest || true ;;
-      9) create_reverse_exit || true ;;
-      10) create_reverse_entry || true ;;
-      11) manage_reverse_menu || true ;;
-      12) create_spoof_exit || true ;;
-      13) create_spoof_entry || true ;;
-      14) manage_spoof_menu || true ;;
-      15) layer_autotest_cli || true ;;
-      16) layer_add_menu || true ;;
-      17) manage_layer_menu || true ;;
-      18) status || true ;;
-      19) tune_menu || true ;;
-      20) schedule_refresh || true ;;
-      21) purge || true ;;
-      0) good "Goodbye — @SchmitzWS"; exit 0 ;;
-      *) fail "Invalid selection." ;;
+      1)  phormal_path_test_menu || true ;;
+      2)  create_bridge_exit || true ;;
+      3)  create_bridge_entry || true ;;
+      4)  manage_bridge_menu || true ;;
+      5)  local bn; bn="$(bridge_choose_instance)"; [[ -n "${bn}" ]] && bridge_instance_speedtest "${bn}" || true ;;
+      6)  create_exit_tunnel || true ;;
+      7)  create_entry_tunnel || true ;;
+      8)  manage_relay_menu || true ;;
+      9)  relay_speedtest || true ;;
+      10) create_reverse_exit || true ;;
+      11) create_reverse_entry || true ;;
+      12) manage_reverse_menu || true ;;
+      13) create_spoof_exit || true ;;
+      14) create_spoof_entry || true ;;
+      15) manage_spoof_menu || true ;;
+      16) create_layer_gre_exit || true ;;
+      17) create_layer_gre_entry || true ;;
+      18) manage_gre_menu || true ;;
+      19) create_layer_icmp_exit || true ;;
+      20) create_layer_icmp_entry || true ;;
+      21) manage_echo_menu || true ;;
+      22) create_layer_udp2raw_exit || true ;;
+      23) create_layer_udp2raw_entry || true ;;
+      24) manage_raw_menu || true ;;
+      25) create_layer_backhaul_exit btcp tcp || true ;;
+      26) create_layer_backhaul_entry btcp tcp || true ;;
+      27) manage_stream_menu || true ;;
+      28) create_layer_backhaul_exit bwss wss || true ;;
+      29) create_layer_backhaul_entry bwss wss || true ;;
+      30) manage_cloak_menu || true ;;
+      31) create_layer_dns_exit || true ;;
+      32) create_layer_dns_entry || true ;;
+      33) manage_dns_layer_menu || true ;;
+      34) create_layer_edge_exit || true ;;
+      35) create_layer_edge_entry || true ;;
+      36) manage_edge_menu || true ;;
+      37) status || true ;;
+      38) tune_menu || true ;;
+      39) schedule_refresh || true ;;
+      40) purge || true ;;
+      0)  good "Goodbye — @SchmitzWS"; exit 0 ;;
+      *)  fail "Invalid selection." ;;
     esac
     echo; read -n1 -s -r -p "  ${MUT}Press any key to continue…${RST}"; echo
   done
