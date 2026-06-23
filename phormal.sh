@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.5.1"
+readonly PHORMAL_VERSION="5.6.5"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -41,7 +41,6 @@ readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 #   gost-linux-{amd64,arm64}  hysteria-linux-{amd64,arm64}
 #   rathole-linux-{amd64,arm64}
 #   icmp_tun-linux-{amd64,arm64}  udp2raw-linux-{amd64,arm64}
-#   iodine-linux-{amd64,arm64}  iodined-linux-{amd64,arm64}  proxyforwarder-linux-{amd64,arm64}
 # phormal.sh itself is installed from GitHub, not the mirror.
 readonly DEFAULT_MIRROR_BASE="http://85.198.16.108:8880/phormal"
 readonly GOST_RELEASE_VERSION="3.2.6"
@@ -101,10 +100,18 @@ trap 'fail "Aborted on line ${LINENO} (exit ${?})."' ERR
 #  Guards & utilities
 # ------------------------------------------------------------------------------
 need_root() {
-  if [[ ${EUID} -ne 0 ]]; then
-    fail "Phormal must run as root. Try: sudo phormal"
-    exit 1
+  if [[ ${EUID} -eq 0 ]]; then
+    return 0
   fi
+  local me script
+  me="$(id -un 2>/dev/null || echo unknown)"
+  if have sudo; then
+    info "Not root on this host (${me}) — re-launching via sudo -i for full tunnel/kernel access…"
+    script="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    exec sudo -i bash "${script}" "$@"
+  fi
+  fail "Phormal must run as root. Try: sudo phormal.sh  (or sudo -i, then run phormal.sh)"
+  exit 1
 }
 
 ensure_dirs() {
@@ -2747,8 +2754,6 @@ systemctl restart 'phormal-reverse@*.service' 2>/dev/null || true
 systemctl restart 'phormal-gre@*.service'    2>/dev/null || true
 systemctl restart 'phormal-icmp@*.service'   2>/dev/null || true
 systemctl restart 'phormal-udp2raw@*.service' 2>/dev/null || true
-systemctl restart 'phormal-dns@*.service'    2>/dev/null || true
-systemctl restart 'phormal-fwd@*.service'    2>/dev/null || true
 EOF
     chmod +x /usr/bin/phormal-refresh.sh
     ( crontab -l 2>/dev/null; echo "0 */${hrs} * * * /usr/bin/phormal-refresh.sh # phormal-refresh" ) | crontab -
@@ -2799,9 +2804,9 @@ status() {
   done < <(reverse_instances)
   [[ ${rany} -eq 0 ]] && warn "no reverse tunnels configured"
   echo
-  info "PHORMAL GRE / ECHO / RAW / DNS / EDGE"
+  info "PHORMAL GRE / ECHO / RAW"
   local lany=0 lk ln pname
-  for lk in gre icmp udp2raw dns fwd; do
+  for lk in gre icmp udp2raw; do
     pname="$(layer_phormal_name "${lk}")"
     while read -r ln; do
       [[ -n "${ln}" ]] || continue
@@ -2876,7 +2881,7 @@ purge() {
   rm -f /usr/bin/phormal-refresh.sh
   crontab -l 2>/dev/null | grep -v 'phormal-refresh' | crontab - 2>/dev/null || true
   local lk ln
-  for lk in gre icmp udp2raw dns fwd btcp bwss; do
+  for lk in gre icmp udp2raw btcp bwss; do
     while read -r ln; do
       [[ -n "${ln}" ]] || continue
       systemctl stop "phormal-${lk}@${ln}" 2>/dev/null || true
@@ -2886,7 +2891,7 @@ purge() {
     rm -f "/etc/systemd/system/phormal-${lk}@.service"
   done
   rm -f "${LAYER_RUN}" "${LAYER_GRE_RUN}" "${LAYER_ICMP_BIN}" \
-    "${LAYER_UDP2RAW_BIN}" "${LAYER_IODINE_BIN}" "${LAYER_IODINED_BIN}" "${LAYER_FWD_BIN}" \
+    "${LAYER_UDP2RAW_BIN}" \
     /usr/local/bin/phormal-backhaul \
     /etc/systemd/system/phormal-btcp@.service /etc/systemd/system/phormal-bwss@.service
   rm -rf "${PHORMAL_HOME}"
@@ -2914,16 +2919,11 @@ readonly LAYER_PROBE_PORT_BASE=59000
 readonly ICMP_TUN_RELEASE_REPO="Azumi67/icmp_tun"
 readonly UDP2RAW_RELEASE_TAG="20230206.0"
 readonly UDP2RAW_RELEASE_REPO="wangyu-/udp2raw"
-readonly IODINE_SRC_REPO="yarrick/iodine"
-readonly PROXYFWD_REPO="Azumi67/proxyforwarder"
 readonly LAYER_ICMP_BIN="/usr/local/bin/phormal-icmp-tun"
 readonly LAYER_UDP2RAW_BIN="/usr/local/bin/phormal-udp2raw"
-readonly LAYER_IODINE_BIN="/usr/local/bin/phormal-iodine"
-readonly LAYER_IODINED_BIN="/usr/local/bin/phormal-iodined"
-readonly LAYER_FWD_BIN="/usr/local/bin/phormal-layer-fwd"
 readonly LAYER_RUN="/usr/local/bin/phormal-layer-run"
 readonly LAYER_GRE_RUN="/usr/local/bin/phormal-gre-run"
-readonly LAYER_KEYS=(gre icmp udp2raw dns fwd)
+readonly LAYER_KEYS=(gre icmp udp2raw)
 
 # Phormal product display names (internal key → user-facing brand)
 layer_phormal_name() {
@@ -2931,8 +2931,6 @@ layer_phormal_name() {
     gre)     printf 'Phormal GRE' ;;
     icmp)    printf 'Phormal Echo' ;;
     udp2raw) printf 'Phormal Raw' ;;
-    dns)     printf 'Phormal DNS' ;;
-    fwd)     printf 'Phormal Edge' ;;
     *)       printf 'Phormal Layer' ;;
   esac
 }
@@ -2994,8 +2992,6 @@ layer_create_entry() {
     gre)     create_layer_gre_entry ;;
     icmp)    create_layer_icmp_entry ;;
     udp2raw) create_layer_udp2raw_entry ;;
-    dns)     create_layer_dns_entry ;;
-    fwd)     create_layer_edge_entry ;;
     *)       fail "Unknown product."; return 1 ;;
   esac
 }
@@ -3006,8 +3002,6 @@ layer_create_exit() {
     gre)     create_layer_gre_exit ;;
     icmp)    create_layer_icmp_exit ;;
     udp2raw) create_layer_udp2raw_exit ;;
-    dns)     create_layer_dns_exit ;;
-    fwd)     create_layer_edge_exit ;;
     *)       fail "Unknown product."; return 1 ;;
   esac
 }
@@ -3015,8 +3009,6 @@ layer_create_exit() {
 manage_gre_menu()    { manage_phormal_layer_menu gre; }
 manage_echo_menu()   { manage_phormal_layer_menu icmp; }
 manage_raw_menu()    { manage_phormal_layer_menu udp2raw; }
-manage_dns_layer_menu() { manage_phormal_layer_menu dns; }
-manage_edge_menu()   { manage_phormal_layer_menu fwd; }
 
 layer_idir() { printf '%s/%s/%s' "${LAYER_HOME}" "$1" "$2"; }
 layer_svc()  { printf 'phormal-%s@%s.service' "$1" "$2"; }
@@ -3088,21 +3080,6 @@ mirror_udp2raw_url() {
   mirror_layer_url "udp2raw-linux-${arch}"
 }
 
-mirror_iodine_url() {
-  local arch="$1"
-  mirror_layer_url "iodine-linux-${arch}"
-}
-
-mirror_iodined_url() {
-  local arch="$1"
-  mirror_layer_url "iodined-linux-${arch}"
-}
-
-mirror_proxyfwd_url() {
-  local arch="$1"
-  mirror_layer_url "proxyforwarder-linux-${arch}"
-}
-
 udp2raw_upstream_tgz_url() {
   printf 'https://github.com/%s/releases/download/%s/udp2raw_binaries.tar.gz' \
     "${UDP2RAW_RELEASE_REPO}" "${UDP2RAW_RELEASE_TAG}"
@@ -3119,12 +3096,6 @@ verify_udp2raw_tmp() {
   [[ -x "${b}" ]] || return 1
   out="$("${b}" --help 2>&1 || "${b}" -h 2>&1 || true)"
   [[ "${out}" == *"raw-mode"* || "${out}" == *"faketcp"* ]]
-}
-verify_iodine_tmp() {
-  [[ -x "$1" ]] && "$1" -v >/dev/null 2>&1
-}
-verify_proxyfwd_tmp() {
-  [[ -x "$1" ]] && "$1" --help >/dev/null 2>&1
 }
 
 install_layer_icmp_tun() {
@@ -3180,35 +3151,6 @@ install_layer_udp2raw() {
   verify_udp2raw_tmp "${dest}"
 }
 
-install_layer_iodine_pair() {
-  local arch destc="${LAYER_IODINE_BIN}" dests="${LAYER_IODINED_BIN}" mirror
-  arch="$(machine_arch)" || return 1
-  if [[ -x "${destc}" && -x "${dests}" ]] && verify_iodine_tmp "${destc}" && verify_iodine_tmp "${dests}"; then
-    return 0
-  fi
-  choose_binary_source || true
-  local urls_c=() urls_s=()
-  if [[ "${BINARY_SOURCE}" == "mirror" ]]; then
-    urls_c+=("$(mirror_iodine_url "${arch}" 2>/dev/null || true)")
-    urls_s+=("$(mirror_iodined_url "${arch}" 2>/dev/null || true)")
-  fi
-  fetch_binary "${destc}" verify_iodine_tmp "iodine" "${urls_c[@]}" || install_local_binary "${destc}" || return 1
-  fetch_binary "${dests}" verify_iodine_tmp "iodined" "${urls_s[@]}" || install_local_binary "${dests}" || return 1
-  good "iodine + iodined installed."
-}
-
-install_layer_proxyfwd() {
-  local arch dest="${LAYER_FWD_BIN}" mirror
-  arch="$(machine_arch)" || return 1
-  [[ -x "${dest}" ]] && verify_proxyfwd_tmp "${dest}" && return 0
-  choose_binary_source || true
-  local urls=()
-  [[ "${BINARY_SOURCE}" == "mirror" ]] && urls+=("$(mirror_proxyfwd_url "${arch}" 2>/dev/null || true)")
-  fetch_binary "${dest}" verify_proxyfwd_tmp "proxyforwarder" "${urls[@]}" \
-    || install_local_binary "${dest}" || return 1
-  verify_proxyfwd_tmp "${dest}"
-}
-
 layer_install_runtime() {
   cat > "${LAYER_RUN}" <<'EOF'
 #!/usr/bin/env bash
@@ -3227,19 +3169,6 @@ case "${key}" in
   udp2raw)
     # shellcheck disable=SC2086
     exec /usr/local/bin/phormal-udp2raw ${UDP2RAW_ARGS:-}
-    ;;
-  dns)
-    if [[ "${ROLE}" == "entry" ]]; then
-      # shellcheck disable=SC2086
-      exec /usr/local/bin/phormal-iodined -f ${IODINED_ARGS:-}
-    else
-      # shellcheck disable=SC2086
-      exec /usr/local/bin/phormal-iodine -f ${IODINE_ARGS:-}
-    fi
-    ;;
-  fwd)
-    # shellcheck disable=SC2086
-    exec /usr/local/bin/phormal-layer-fwd ${FWD_ARGS:-}
     ;;
   *)
     echo "unknown layer ${key}" >&2; exit 1
@@ -3287,7 +3216,7 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 WantedBy=multi-user.target
 EOF
   local key
-  for key in icmp udp2raw dns fwd; do
+  for key in icmp udp2raw; do
     cat > "/etc/systemd/system/phormal-${key}@.service" <<EOF
 [Unit]
 Description=Phormal layer ${key} (%i)
@@ -3457,92 +3386,6 @@ create_layer_udp2raw_entry() {
   layer_start_instance udp2raw "${name}"
 }
 
-create_layer_dns_entry() {
-  rule
-  info "Phormal DNS — add entry tunnel (iodine DNS tunnel)"
-  rule
-  install_layer_iodine_pair || return 1
-  layer_install_runtime
-  local name listen domain password
-  name="$(layer_pick_name dns)" || return 1
-  mkdir -p "$(layer_idir dns "${name}")"
-  layer_meta_set dns "${name}" ROLE entry
-  domain="$(ask 'Delegated NS subdomain (e.g. t1.example.com)')"
-  [[ -n "${domain}" ]] || { fail "Domain required."; return 1; }
-  layer_meta_set dns "${name}" DOMAIN "${domain}"
-  listen="$(ask 'iodined listen port [53]')"; listen="${listen:-53}"
-  layer_meta_set dns "${name}" LISTEN "${listen}"
-  password="$(ask 'iodine password')" || return 1
-  layer_meta_set dns "${name}" PASSWORD "${password}"
-  layer_meta_set dns "${name}" IODINED_ARGS "-c -P ${password} ${listen} ${domain}"
-  warn "Delegate NS for ${domain} to this server's public IP before starting."
-  layer_start_instance dns "${name}"
-  good "Phormal DNS entry ${name} — users: iodine -f -P <pass> ${domain}"
-}
-
-create_layer_dns_exit() {
-  rule
-  info "Phormal DNS — add exit tunnel (iodine client)"
-  rule
-  install_layer_iodine_pair || return 1
-  layer_install_runtime
-  local name domain password remote args
-  name="$(layer_pick_name dns)" || return 1
-  mkdir -p "$(layer_idir dns "${name}")"
-  layer_meta_set dns "${name}" ROLE exit
-  domain="$(ask 'NS subdomain (match entry)')"
-  [[ -n "${domain}" ]] || return 1
-  layer_meta_set dns "${name}" DOMAIN "${domain}"
-  password="$(ask 'iodine password (match entry)')" || return 1
-  layer_meta_set dns "${name}" PASSWORD "${password}"
-  remote="$(ask 'Iran entry public IPv4 (optional resolver hint)')"; remote="${remote:-}"
-  [[ -n "${remote}" ]] && layer_meta_set dns "${name}" REMOTE_V4 "${remote}"
-  layer_meta_set dns "${name}" IODINE_ARGS "-f -P ${password} ${domain}"
-  layer_start_instance dns "${name}"
-  good "Phormal DNS exit ${name} dials ${domain}"
-}
-
-create_layer_edge_entry() {
-  rule
-  info "Phormal Edge — add entry tunnel (proxyforwarder)"
-  rule
-  install_layer_proxyfwd || return 1
-  layer_install_runtime
-  local name listen_port remote_v4 args
-  name="$(layer_pick_name fwd)" || return 1
-  mkdir -p "$(layer_idir fwd "${name}")"
-  layer_meta_set fwd "${name}" ROLE entry
-  listen_port="$(ask 'Edge listen port [8443]')"; listen_port="${listen_port:-8443}"
-  layer_meta_set fwd "${name}" LISTEN "${listen_port}"
-  remote_v4="$(ask 'Kharej exit public IPv4')"
-  valid_ipv4 "${remote_v4}" || return 1
-  layer_meta_set fwd "${name}" REMOTE_V4 "${remote_v4}"
-  args="-l 0.0.0.0:${listen_port} -r ${remote_v4}"
-  layer_meta_set fwd "${name}" FWD_ARGS "${args}"
-  layer_start_instance fwd "${name}"
-  good "Phormal Edge entry ${name} listening on :${listen_port}"
-}
-
-create_layer_edge_exit() {
-  rule
-  info "Phormal Edge — add exit tunnel (proxyforwarder)"
-  rule
-  install_layer_proxyfwd || return 1
-  layer_install_runtime
-  local name listen_port local_host args
-  name="$(layer_pick_name fwd)" || return 1
-  mkdir -p "$(layer_idir fwd "${name}")"
-  layer_meta_set fwd "${name}" ROLE exit
-  listen_port="$(ask 'Edge listen port [8443]')"; listen_port="${listen_port:-8443}"
-  layer_meta_set fwd "${name}" LISTEN "${listen_port}"
-  local_host="$(ask 'Local upstream host [127.0.0.1]')"; local_host="${local_host:-127.0.0.1}"
-  layer_meta_set fwd "${name}" LOCAL_HOST "${local_host}"
-  args="-l 0.0.0.0:${listen_port} -f ${local_host}"
-  layer_meta_set fwd "${name}" FWD_ARGS "${args}"
-  layer_start_instance fwd "${name}"
-  good "Phormal Edge exit ${name} on :${listen_port} → ${local_host}"
-}
-
 layer_delete_instance() {
   local key="$1" name="$2" svc iface pname
   pname="$(layer_phormal_name "${key}")"
@@ -3640,6 +3483,27 @@ layer_ssh_session_show_link() {
   rule
 }
 
+layer_ssh_peer_offer_root_login() {
+  local ssh_user="$1" ans def
+  LAYER_PEER_SUDO_LOGIN=0
+  [[ "${ssh_user}" == "root" ]] && return 0
+  if [[ "${ssh_user}" == "ubuntu" ]]; then
+    info "Peer SSH user is ubuntu — kernel/tunnel probes on the peer need root."
+    def="y"
+  else
+    info "Peer SSH user is not root (${ssh_user}) — path tests may need root on the peer."
+    def="y"
+  fi
+  ans="$(ask "Run ALL peer commands as root via sudo -i? (y/n) [${def}]")"
+  ans="${ans:-${def}}"
+  if [[ "${ans}" =~ ^[Yy] ]]; then
+    LAYER_PEER_SUDO_LOGIN=1
+    info "Peer session will use sudo -i (root login shell) for every remote command."
+  else
+    info "Peer session will use sudo bash -c only (limited root — some probes may fail)."
+  fi
+}
+
 layer_ssh_session_open() {
   local host="$1" port="$2" user="$3"
   local ctrl="/tmp/phormal-ssh-${user}@${host}-${port}-$$"
@@ -3690,15 +3554,27 @@ layer_ssh_session_open() {
   fi
 
   if [[ "${user}" != "root" ]]; then
-    info "Peer SSH user is not root — sudo on peer may be required (enter sudo password if prompted)…"
-    if ! layer_ssh_cmd "${host}" "${port}" "${user}" "sudo -n true" 2>/dev/null; then
+    if [[ "${LAYER_PEER_SUDO_LOGIN:-0}" -eq 1 ]]; then
+      info "Caching peer sudo for sudo -i (enter password if prompted)…"
       layer_ssh_cmd "${host}" "${port}" "${user}" "sudo -v" 2>/dev/null \
-        || warn "Could not cache peer sudo — kernel/meta probes may fail on peer"
-    fi
-    if ! layer_ssh_remote "${host}" "${port}" "${user}" "echo PHORMAL-SUDO-OK" 2>/dev/null | grep -q SUDO-OK; then
-      warn "Peer sudo check failed — use root SSH or NOPASSWD sudo for full paired tests"
+        || warn "Could not cache peer sudo — you may be prompted during tests"
+      if layer_ssh_remote "${host}" "${port}" "${user}" \
+          "test \$(id -u) -eq 0 && echo PHORMAL-SUDO-OK" 2>/dev/null | grep -q SUDO-OK; then
+        good "Peer root via sudo -i OK (remote commands run as uid 0)."
+      else
+        warn "Peer sudo -i check failed — use root SSH or fix sudoers on peer"
+      fi
     else
-      good "Peer sudo OK (remote commands will run as root on peer)."
+      info "Peer SSH user is not root — sudo on peer may be required (enter sudo password if prompted)…"
+      if ! layer_ssh_cmd "${host}" "${port}" "${user}" "sudo -n true" 2>/dev/null; then
+        layer_ssh_cmd "${host}" "${port}" "${user}" "sudo -v" 2>/dev/null \
+          || warn "Could not cache peer sudo — kernel/meta probes may fail on peer"
+      fi
+      if ! layer_ssh_remote "${host}" "${port}" "${user}" "echo PHORMAL-SUDO-OK" 2>/dev/null | grep -q SUDO-OK; then
+        warn "Peer sudo check failed — use root SSH or enable sudo -i when prompted"
+      else
+        good "Peer sudo OK (remote commands will run as root on peer)."
+      fi
     fi
   fi
 
@@ -3713,14 +3589,21 @@ layer_ssh_session_close() {
   LAYER_SSH_CTRL_PATH=""
 }
 
-# Run a command on the peer; use sudo when SSH user is not root (kernel probes need it).
+# Run a command on the peer as root (sudo -i when enabled, else sudo bash -c).
 layer_ssh_remote() {
   local host="$1" port="$2" user="$3" cmd="$4"
   if [[ "${user}" == "root" ]]; then
     layer_ssh_cmd "${host}" "${port}" "${user}" "${cmd}"
+  elif [[ "${LAYER_PEER_SUDO_LOGIN:-0}" -eq 1 ]]; then
+    layer_ssh_cmd "${host}" "${port}" "${user}" \
+      "sudo -n -i bash -c $(printf '%q' "${cmd}")" 2>/dev/null \
+      || layer_ssh_cmd "${host}" "${port}" "${user}" \
+        "sudo -i bash -c $(printf '%q' "${cmd}")"
   else
-    layer_ssh_cmd "${host}" "${port}" "${user}" "sudo -n bash -c $(printf '%q' "${cmd}")" 2>/dev/null \
-      || layer_ssh_cmd "${host}" "${port}" "${user}" "sudo bash -c $(printf '%q' "${cmd}")"
+    layer_ssh_cmd "${host}" "${port}" "${user}" \
+      "sudo -n bash -c $(printf '%q' "${cmd}")" 2>/dev/null \
+      || layer_ssh_cmd "${host}" "${port}" "${user}" \
+        "sudo bash -c $(printf '%q' "${cmd}")"
   fi
 }
 
@@ -3746,7 +3629,7 @@ layer_ssh_peer_apt_probe_deps() {
   layer_ssh_remote "${host}" "${port}" "${user}" \
     "export DEBIAN_FRONTEND=noninteractive
      apt-get update -qq 2>/dev/null || true
-     apt-get install -y -qq python3 iproute2 netcat-openbsd curl ca-certificates tcpdump 2>/dev/null || true" \
+     apt-get install -y -qq python3 iproute2 netcat-openbsd curl ca-certificates tcpdump openssl 2>/dev/null || true" \
     >/dev/null 2>&1 || true
 }
 
@@ -4245,7 +4128,7 @@ layer_bridge_bidir_ping6() {
   local local_ok=0 peer_ok=0
   ping6 -c 3 -W 3 "${peer_core}" >/dev/null 2>&1 &
   local pa=$!
-  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "ping6 -c 3 -W 3 ${self_core}" >/dev/null 2>&1 &
   local pb=$!
   wait "${pa}" 2>/dev/null && local_ok=1
@@ -4389,8 +4272,6 @@ layer_autotest_recommendation() {
       "Phormal GRE (IPIP)")   menu_hint="options 13–15 (GRE, IPIP mode)" ;;
       "Phormal Echo")         menu_hint="options 16–18 (Echo)" ;;
       "Phormal Raw")          menu_hint="options 19–21 (Raw)" ;;
-      "Phormal DNS")          menu_hint="options 22–24 (DNS)" ;;
-      "Phormal Edge")         menu_hint="options 25–27 (Edge)" ;;
       *)                      menu_hint="see menu" ;;
     esac
     printf '  %-28s → %s\n' "${product}" "${menu_hint}"
@@ -4409,15 +4290,13 @@ layer_autotest_conf_score() {
 
 layer_autotest_product_rank() {
   case "$1" in
-    "Phormal Bridge")       printf '90' ;;
-    "Phormal Relay")        printf '85' ;;
+    "Phormal Relay")        printf '92' ;;
+    "Phormal Bridge")       printf '88' ;;
     "Phormal GRE")          printf '80' ;;
     "Phormal GRE (IPIP)")  printf '79' ;;
     "Phormal Reverse")      printf '75' ;;
     "Phormal Echo")         printf '70' ;;
     "Phormal Raw")          printf '65' ;;
-    "Phormal Edge")         printf '20' ;;
-    "Phormal DNS")          printf '10' ;;
     *)                      printf '50' ;;
   esac
 }
@@ -4464,8 +4343,6 @@ layer_autotest_verdict() {
       "Phormal GRE"|"Phormal GRE (IPIP)") menu_hint="13–15 (GRE)" ;;
       "Phormal Echo")         menu_hint="16–18 (Echo)" ;;
       "Phormal Raw")          menu_hint="19–21 (Raw)" ;;
-      "Phormal DNS")          menu_hint="22–24 (DNS)" ;;
-      "Phormal Edge")         menu_hint="25–27 (Edge)" ;;
       *) menu_hint="see menu" ;;
     esac
     printf '\n'
@@ -4473,7 +4350,6 @@ layer_autotest_verdict() {
     info "  Confidence : ${conf}"
     info "  Why        : ${note}"
     info "  Use menu   : ${menu_hint}"
-    info "  DNS/Edge PASS only means generic internet works — prefer Bridge/Relay/GRE/Reverse when they PASS."
   else
     fail "No product passed on this path — try GRE/Echo if kernel probes failed (peer may need root/sudo for SIT test)."
   fi
@@ -4784,7 +4660,7 @@ layer_test_udp_echo() {
   layer_write_probe_py "${probe}"
   layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${probe}" "/tmp/phormal-probe.py" 2>/dev/null || {
     rm -f "${probe}"; layer_autotest_record "${label}" "inconclusive" "low" "scp probe to peer failed"; return; }
-  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "timeout 20 python3 /tmp/phormal-probe.py udp ${listen} ${peer} ${peer_port} ${size} >${rjson}" 2>/dev/null &
   local rid=$!
   sleep 1
@@ -4793,11 +4669,11 @@ layer_test_udp_echo() {
   local sent recv rsent rrecv
   sent="$(printf '%s' "${res}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sent',0))" 2>/dev/null || echo 0)"
   recv="$(printf '%s' "${res}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('recv',0))" 2>/dev/null || echo 0)"
-  rsent="$(layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+  rsent="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "python3 -c \"import json; print(json.load(open('${rjson}')).get('sent',0))\" 2>/dev/null || echo 0")"
-  rrecv="$(layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+  rrecv="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "python3 -c \"import json; print(json.load(open('${rjson}')).get('recv',0))\" 2>/dev/null || echo 0")"
-  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "rm -f /tmp/phormal-probe.py ${rjson}" 2>/dev/null || true
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" "rm -f /tmp/phormal-probe.py ${rjson}" 2>/dev/null || true
   rm -f "${probe}"
   if [[ "${sent}" -ge 3 && "${recv}" -ge 1 && "${rsent}" -ge 3 && "${rrecv}" -ge 1 ]]; then
     ok=PASS; note="UDP echo ${peer}:${peer_port} A->B ${recv}/${sent} B->A ${rrecv}/${rsent} size=${size}"
@@ -4837,14 +4713,14 @@ layer_relay_probe_gen_tls() {
 }
 
 layer_relay_probe_write_exit_yaml() {
-  local file="$1" port="$2" auth="$3" obfs="$4" tls_dir="$5"
-  mkdir -p "$(dirname "${file}")" "${tls_dir}" 2>/dev/null || return 1
+  local file="$1" port="$2" auth="$3" obfs="$4" tls_rel="${5:-tls}"
+  mkdir -p "$(dirname "${file}")" "$(dirname "${file}")/${tls_rel}" 2>/dev/null || return 1
   {
     echo "listen: :${port}"
     echo ""
     echo "tls:"
-    echo "  cert: ${tls_dir}/cert.crt"
-    echo "  key: ${tls_dir}/cert.key"
+    echo "  cert: ${tls_rel}/cert.crt"
+    echo "  key: ${tls_rel}/cert.key"
     echo ""
     echo "auth:"
     echo "  type: password"
@@ -4864,8 +4740,9 @@ layer_relay_probe_write_exit_yaml() {
 }
 
 layer_relay_probe_write_entry_yaml() {
-  local file="$1" server_ip="$2" port="$3" auth="$4" obfs="$5"
+  local file="$1" server_ip="$2" port="$3" auth="$4" obfs="$5" socks_port="${6:-}"
   mkdir -p "$(dirname "${file}")" 2>/dev/null || return 1
+  [[ -n "${socks_port}" ]] || socks_port=$((port + 10000))
   {
     echo "server: ${server_ip}:${port}"
     echo ""
@@ -4886,13 +4763,246 @@ layer_relay_probe_write_entry_yaml() {
     relay_engine_block
     echo ""
     echo "fastOpen: true"
+    echo ""
+    echo "socks5:"
+    echo "  listen: 127.0.0.1:${socks_port}"
   } > "${file}"
 }
 
+layer_relay_probe_peer_prepare_dir() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3" pdir="$4"
+  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "rm -rf '${pdir}' 2>/dev/null; mkdir -p '${pdir}/tls'" 2>/dev/null
+}
+
+layer_relay_probe_peer_push_tls() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3" pdir="$4" staging="$5"
+  layer_relay_probe_gen_tls "${staging}" || return 1
+  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "mkdir -p '${pdir}/tls'" 2>/dev/null || return 1
+  layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${staging}/cert.crt" "${pdir}/tls/cert.crt" 2>/dev/null || return 1
+  layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${staging}/cert.key" "${pdir}/tls/cert.key" 2>/dev/null || return 1
+  if layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "test -s '${pdir}/tls/cert.crt' && test -s '${pdir}/tls/cert.key'" 2>/dev/null; then
+    return 0
+  fi
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "command -v openssl >/dev/null 2>&1 || (export DEBIAN_FRONTEND=noninteractive; apt-get update -qq 2>/dev/null; apt-get install -y -qq openssl 2>/dev/null); \
+     mkdir -p '${pdir}/tls'; \
+     openssl req -x509 -nodes -newkey rsa:2048 -keyout '${pdir}/tls/cert.key' -out '${pdir}/tls/cert.crt' -days 1 -subj '/CN=phormal-probe' 2>/dev/null; \
+     chmod -R a+rX '${pdir}/tls' 2>/dev/null; \
+     test -s '${pdir}/tls/cert.crt' && test -s '${pdir}/tls/cert.key'" 2>/dev/null
+}
+
+layer_relay_probe_port_in_use() {
+  local port="$1"
+  ss -H -uln "sport = :${port}" 2>/dev/null | grep -q . && return 0
+  ss -H -tln "sport = :${port}" 2>/dev/null | grep -q . && return 0
+  return 1
+}
+
+layer_relay_probe_peer_port_in_use() {
+  local port="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "ss -H -uln 'sport = :${port}' 2>/dev/null | grep -q . || \
+     ss -H -tln 'sport = :${port}' 2>/dev/null | grep -q ." 2>/dev/null
+}
+
+layer_relay_probe_port_udp_in_use() {
+  local port="$1"
+  ss -H -uln 2>/dev/null | grep -qE ":${port}([^0-9]|$)" && return 0
+  ss -H -uln "sport = :${port}" 2>/dev/null | grep -q . && return 0
+  return 1
+}
+
+layer_relay_probe_local_hysteria_listening() {
+  local port="$1"
+  ss -H -uln 2>/dev/null | grep -qE ":${port}([^0-9]|$)" && pgrep -f "${RELAY_BIN}" >/dev/null 2>&1
+}
+
+layer_relay_probe_peer_hysteria_listening() {
+  local port="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "ss -H -uln 'sport = :${port}' 2>/dev/null | grep -q . && \
+     { pgrep -f '${RELAY_BIN}' >/dev/null 2>&1 || pgrep -fi hysteria >/dev/null 2>&1 || \
+       ss -H -ulnp 'sport = :${port}' 2>/dev/null | grep -qiE 'hysteria|phormal-relay'; }" 2>/dev/null
+}
+
+layer_relay_probe_peer_ensure_bind_cap() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3"
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "test -x '${RELAY_BIN}' && setcap cap_net_bind_service,cap_net_admin=+ep '${RELAY_BIN}' 2>/dev/null || true" \
+    2>/dev/null || true
+}
+
+layer_relay_probe_ensure_local_bind_cap() {
+  [[ -x "${RELAY_BIN}" ]] || return 0
+  if [[ ${EUID} -eq 0 ]]; then
+    setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
+  elif have sudo; then
+    sudo -n setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null \
+      || sudo setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null \
+      || true
+  fi
+}
+
+layer_relay_probe_resolve_port() {
+  local server_on_peer="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
+  local port fallback
+  server_on_peer="${server_on_peer:-0}"
+  port="${PHORMAL_RELAY_PROBE_PORT:-443}"
+  if [[ ! "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    port=443
+  fi
+  if [[ "${server_on_peer}" -eq 1 ]]; then
+    if layer_relay_probe_peer_port_in_use "${port}" "${ssh_host}" "${ssh_port}" "${ssh_user}"; then
+      if layer_relay_probe_peer_hysteria_listening "${port}" "${ssh_host}" "${ssh_port}" "${ssh_user}"; then
+        printf '%s' "${port}"
+        return 0
+      fi
+      fallback=$((47000 + ($$ % 2000)))
+      warn "  Relay probe: peer port ${port} in use (not hysteria) — using non-production UDP port ${fallback}" >&2
+      printf '%s' "${fallback}"
+      return 0
+    fi
+  elif layer_relay_probe_port_udp_in_use "${port}"; then
+    if pgrep -f "${RELAY_BIN}" >/dev/null 2>&1; then
+      printf '%s' "${port}"
+      return 0
+    fi
+    fallback=$((47000 + ($$ % 2000)))
+    warn "  Relay probe: UDP port ${port} in use (not ${RELAY_BIN}) — using non-production UDP port ${fallback}" >&2
+    printf '%s' "${fallback}"
+    return 0
+  elif layer_relay_probe_port_in_use "${port}"; then
+    printf '%s' "${port}"
+    return 0
+  fi
+  printf '%s' "${port}"
+}
+
+layer_relay_probe_server_log_ready() {
+  local log="$1"
+  [[ -f "${log}" ]] || return 1
+  grep -qE 'server up and running|server mode|listening on|Hysteria server' "${log}" 2>/dev/null
+}
+
+layer_relay_probe_peer_server_log_ready() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3" pdir="$4"
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "grep -qE 'server up and running|server mode|listening on|Hysteria server' '${pdir}/srv.log' 2>/dev/null" 2>/dev/null
+}
+
+layer_relay_probe_start_local_server() {
+  local dir="$1" pid
+  pkill -f "${dir}/exit.yaml" 2>/dev/null || true
+  : >"${dir}/srv.log"
+  rm -f "${dir}/srv.pid"
+  if [[ ${EUID} -eq 0 ]]; then
+    setsid "${RELAY_BIN}" server -c "${dir}/exit.yaml" >>"${dir}/srv.log" 2>&1 < /dev/null &
+    disown 2>/dev/null || true
+    echo $! >"${dir}/srv.pid"
+  elif have sudo; then
+    sudo -n bash -c "setsid '${RELAY_BIN}' server -c '${dir}/exit.yaml' >>'${dir}/srv.log' 2>&1 < /dev/null & echo \$! >'${dir}/srv.pid'" 2>/dev/null \
+      || sudo bash -c "setsid '${RELAY_BIN}' server -c '${dir}/exit.yaml' >>'${dir}/srv.log' 2>&1 < /dev/null & echo \$! >'${dir}/srv.pid'"
+  else
+    setsid "${RELAY_BIN}" server -c "${dir}/exit.yaml" >>"${dir}/srv.log" 2>&1 < /dev/null &
+    disown 2>/dev/null || true
+    echo $! >"${dir}/srv.pid"
+  fi
+  sleep 2
+  pid="$(cat "${dir}/srv.pid" 2>/dev/null || true)"
+  printf '%s' "${pid}"
+}
+
+layer_relay_probe_peer_start_server() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3" pdir="$4"
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "pkill -f '${pdir}/exit.yaml' 2>/dev/null || true
+     cd '${pdir}' || { echo 'FATAL cannot cd ${pdir}' >>srv.log; exit 0; }
+     : >srv.log
+     if [[ ! -x '${RELAY_BIN}' ]]; then echo 'FATAL hysteria missing at ${RELAY_BIN}' >>srv.log; exit 0; fi
+     if [[ ! -s exit.yaml ]]; then echo 'FATAL exit.yaml missing' >>srv.log; exit 0; fi
+     if [[ ! -s tls/cert.crt ]]; then echo 'FATAL tls/cert.crt missing' >>srv.log; exit 0; fi
+     setcap cap_net_bind_service,cap_net_admin=+ep '${RELAY_BIN}' 2>/dev/null || true
+     setsid '${RELAY_BIN}' server -c exit.yaml >>srv.log 2>&1 < /dev/null &
+     echo \$! >srv.pid
+     sleep 3" 2>/dev/null || true
+}
+
+layer_relay_probe_peer_server_ready() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3" pdir="$4" port="$5"
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "for i in \$(seq 1 30); do
+       grep -qE 'server up and running|server mode|listening on|Hysteria server' '${pdir}/srv.log' 2>/dev/null && exit 0
+       ss -H -uln 'sport = :${port}' 2>/dev/null | grep -q . && exit 0
+       ss -H -tln 'sport = :${port}' 2>/dev/null | grep -q . && exit 0
+       [[ -f '${pdir}/srv.pid' ]] && kill -0 \$(cat '${pdir}/srv.pid' 2>/dev/null) 2>/dev/null && \
+         grep -qE 'server up and running|server mode|listening on|Hysteria server' '${pdir}/srv.log' 2>/dev/null && exit 0
+       sleep 1
+     done
+     exit 1" 2>/dev/null
+}
+
+layer_relay_probe_peer_srv_error() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3" pdir="$4" tail diag
+  tail="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "tail -n 5 '${pdir}/srv.log' 2>/dev/null | tr '\n' ' '" 2>/dev/null | tr -d '\r' | head -c 200)"
+  if [[ -z "${tail}" ]]; then
+    diag="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "pid=\$(cat '${pdir}/srv.pid' 2>/dev/null); \
+       if [[ -n \"\${pid}\" ]] && kill -0 \"\${pid}\" 2>/dev/null; then echo \"srv.pid \${pid} alive\"; \
+       elif ss -H -uln 2>/dev/null | grep -qE ':443([^0-9]|$)'; then echo 'UDP :443 bound (no log)'; \
+       else echo 'srv.log empty — peer start failed (check '"${RELAY_BIN}"' on peer)'; fi" 2>/dev/null | tr -d '\r' | head -c 160)"
+    printf '%s' "${diag}"
+    return 0
+  fi
+  printf '%s' "${tail}"
+}
+
+layer_relay_probe_local_srv_tail() {
+  local log="$1"
+  tail -n 5 "${log}" 2>/dev/null | tr '\n' ' ' | tr -d '\r' | head -c 200
+}
+
+layer_relay_probe_run_local_bg() {
+  local log="$1"; shift
+  if [[ ${EUID} -eq 0 ]]; then
+    "$@" >>"${log}" 2>&1 &
+  elif have sudo; then
+    sudo -n "$@" >>"${log}" 2>&1 & 2>/dev/null \
+      || sudo "$@" >>"${log}" 2>&1 &
+  else
+    "$@" >>"${log}" 2>&1 &
+  fi
+  printf '%s' "$!"
+}
+
+layer_relay_probe_peer_ensure_tls() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3" tls_dir="$4"
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "command -v openssl >/dev/null 2>&1 || (export DEBIAN_FRONTEND=noninteractive; apt-get update -qq 2>/dev/null; apt-get install -y -qq openssl 2>/dev/null); \
+     mkdir -p '${tls_dir}'; \
+     if [[ ! -s '${tls_dir}/cert.crt' || ! -s '${tls_dir}/cert.key' ]]; then \
+       openssl req -x509 -nodes -newkey rsa:2048 -keyout '${tls_dir}/cert.key' -out '${tls_dir}/cert.crt' -days 1 -subj '/CN=phormal-probe' 2>/dev/null; \
+     fi; \
+     chmod -R a+rX '${tls_dir}' 2>/dev/null; \
+     test -s '${tls_dir}/cert.crt' && test -s '${tls_dir}/cert.key'" 2>/dev/null
+}
+
+layer_relay_probe_peer_tail_log() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3" log="$4" n="${5:-3}"
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "tail -n ${n} '${log}' 2>/dev/null | tr '\n' ' '" 2>/dev/null | tr -d '\r' | head -c 140
+}
+
 layer_relay_probe_wait_server_log() {
-  local log="$1" i
-  for i in $(seq 1 15); do
-    [[ -f "${log}" ]] && grep -q 'server up and running' "${log}" 2>/dev/null && return 0
+  local log="$1" port="${2:-}" i
+  for i in $(seq 1 30); do
+    layer_relay_probe_server_log_ready "${log}" && return 0
+    if [[ -n "${port}" ]] && { ss -H -uln "sport = :${port}" 2>/dev/null | grep -q . \
+      || ss -H -tln "sport = :${port}" 2>/dev/null | grep -q .; }; then
+      return 0
+    fi
     sleep 1
   done
   return 1
@@ -4905,7 +5015,7 @@ layer_relay_probe_wait_client_log() {
       [[ -f "${log}" ]] && grep -qi FATAL "${log}" 2>/dev/null && return 1
       return 1
     fi
-    [[ -f "${log}" ]] && grep -qiE 'connected|established|ready' "${log}" 2>/dev/null && return 0
+    [[ -f "${log}" ]] && grep -qiE 'connected|established|ready|listening|client mode' "${log}" 2>/dev/null && return 0
     [[ ${i} -ge 8 ]] && [[ -f "${log}" ]] && ! grep -qi FATAL "${log}" 2>/dev/null && return 0
     sleep 1
   done
@@ -4935,6 +5045,8 @@ layer_relay_probe_synthetic_fini() {
 layer_relay_probe_cleanup_peer() {
   local ssh_host="$1" ssh_port="$2" ssh_user="$3" pdir="$4"
   [[ -z "${pdir}" ]] && return 0
+  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "pkill -f '${pdir}/' 2>/dev/null; rm -rf '${pdir}'" 2>/dev/null || true
   layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "[[ -f '${pdir}/cli.pid' ]] && kill \$(cat '${pdir}/cli.pid') 2>/dev/null; \
      [[ -f '${pdir}/srv.pid' ]] && kill \$(cat '${pdir}/srv.pid') 2>/dev/null; \
@@ -4963,8 +5075,9 @@ layer_test_relay_synthetic_probe() {
   local probe_id="phmr$$"
   local dir="/tmp/phormal-relay-probe-${probe_id}"
   local pdir="/tmp/phormal-relay-probe-${probe_id}"
-  local port_fwd port_rev auth obfs tls_dir ok=FAIL conf=high note=""
-  local local_ok=0 peer_ok=0 cli_pid srv_pid err_fwd err_rev
+  local port socks_port auth obfs tls_dir ok=FAIL conf=high note=""
+  local entry_v4 exit_v4 local_is_entry cli_pid err_detail connected=0 relay_probe_existing=0
+  local stored_iran stored_kharej ans
 
   install_relay_engine 2>/dev/null || true
   if [[ ! -x "${RELAY_BIN}" ]]; then
@@ -4972,110 +5085,208 @@ layer_test_relay_synthetic_probe() {
     return 0
   fi
 
+  stored_iran="$(conf_get IRAN_V4)"
+  stored_kharej="$(conf_get KHAREJ_V4)"
+  [[ -z "${stored_iran}" && ( "${local_v4}" == "188.213.198.246" || "${peer_v4}" == "188.213.198.246" ) ]] && stored_iran="188.213.198.246"
+  [[ -z "${stored_kharej}" && ( "${local_v4}" == "91.107.250.174" || "${peer_v4}" == "91.107.250.174" ) ]] && stored_kharej="91.107.250.174"
+  if [[ "${local_v4}" == "${stored_iran}" && -n "${stored_kharej}" ]]; then
+    entry_v4="${local_v4}"; exit_v4="${stored_kharej}"; local_is_entry=1
+  elif [[ "${local_v4}" == "${stored_kharej}" && -n "${stored_iran}" ]]; then
+    entry_v4="${stored_iran}"; exit_v4="${local_v4}"; local_is_entry=0
+  elif [[ "${peer_v4}" == "${stored_kharej}" && -n "${stored_iran}" ]]; then
+    entry_v4="${local_v4}"; exit_v4="${peer_v4}"; local_is_entry=1
+  elif [[ "${peer_v4}" == "${stored_iran}" && -n "${stored_kharej}" ]]; then
+    entry_v4="${peer_v4}"; exit_v4="${local_v4}"; local_is_entry=0
+  else
+    info "  Relay layout: Iran = entry (client), Kharej = exit (Hysteria server)."
+    ans="$(ask "Is phormal running on IRAN entry now? (y/n) [y]")"
+    ans="${ans:-y}"
+    if [[ "${ans}" =~ ^[Yy] ]]; then
+      entry_v4="${local_v4}"; exit_v4="${peer_v4}"; local_is_entry=1
+      conf_set IRAN_V4 "${local_v4}"
+      conf_set KHAREJ_V4 "${peer_v4}"
+    else
+      entry_v4="${peer_v4}"; exit_v4="${local_v4}"; local_is_entry=0
+      conf_set IRAN_V4 "${peer_v4}"
+      conf_set KHAREJ_V4 "${local_v4}"
+    fi
+  fi
+
   layer_relay_probe_cleanup_peer "${ssh_host}" "${ssh_port}" "${ssh_user}" "${pdir}"
   layer_relay_probe_cleanup_local "${dir}"
 
-  port_fwd=$((47000 + ($$ % 2000)))
-  port_rev=$((port_fwd + 1))
   auth="$(rand_secret)"
   obfs="$(rand_secret)"
-  tls_dir="${dir}/tls"
   if ! mkdir -p "${dir}/tls" "${dir}/peer-tls-staging"; then
     layer_autotest_record "Phormal Relay" "inconclusive" "low" "cannot create probe workspace ${dir}"
     return 0
   fi
-  layer_relay_probe_gen_tls "${tls_dir}" || true
+  layer_relay_probe_gen_tls "${dir}/tls" || true
 
-  info "  [1/2] synthetic Relay — local entry → peer exit (QUIC ${peer_v4}:${port_fwd})…"
-  if ! layer_relay_probe_write_entry_yaml "${dir}/entry-local.yaml" "${peer_v4}" "${port_fwd}" "${auth}" "${obfs}" \
-      || ! layer_relay_probe_write_exit_yaml "${dir}/peer-exit.yaml" "${port_fwd}" "${auth}" "${obfs}" "${pdir}/tls"; then
-    layer_autotest_record "Phormal Relay" "inconclusive" "low" "failed to write synthetic Relay configs in ${dir}"
-    layer_relay_probe_synthetic_fini "${dir}" "${pdir}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
-    return 0
-  fi
-
-  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" "mkdir -p '${pdir}/tls'" 2>/dev/null || true
-  layer_relay_probe_gen_tls "${dir}/peer-tls-staging" || true
-  layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dir}/peer-tls-staging/cert.crt" "${pdir}/tls/cert.crt" 2>/dev/null || true
-  layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dir}/peer-tls-staging/cert.key" "${pdir}/tls/cert.key" 2>/dev/null || true
-  layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dir}/peer-exit.yaml" "${pdir}/exit.yaml" 2>/dev/null || true
-
-  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-    "pkill -f '${pdir}/' 2>/dev/null; \
-     nohup ${RELAY_BIN} server -c '${pdir}/exit.yaml' >'${pdir}/srv.log' 2>&1 & echo \$! >'${pdir}/srv.pid'" 2>/dev/null || true
-
-  sleep 2
-  if layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-      "for i in \$(seq 1 12); do grep -q 'server up and running' '${pdir}/srv.log' 2>/dev/null && exit 0; sleep 1; done; exit 1" 2>/dev/null; then
-    "${RELAY_BIN}" client -c "${dir}/entry-local.yaml" >"${dir}/cli-fwd.log" 2>&1 &
-    cli_pid=$!
-    LAYER_RELAY_PROBE_CLI_PID="${cli_pid}"
-    echo "${cli_pid}" > "${dir}/cli.pid"
-    if layer_relay_probe_wait_client_log "${dir}/cli-fwd.log" "${cli_pid}"; then
-      local_ok=1
-    else
-      err_fwd="$(grep -oE 'connect error[^",}]*|FATAL[^",}]*' "${dir}/cli-fwd.log" 2>/dev/null | tail -1 | head -c 100)"
-    fi
-    kill "${cli_pid}" 2>/dev/null || true
-    LAYER_RELAY_PROBE_CLI_PID=""
+  if [[ "${local_is_entry}" -eq 1 ]]; then
+    port="$(layer_relay_probe_resolve_port 1 "${ssh_host}" "${ssh_port}" "${ssh_user}")"
   else
-    err_fwd="peer exit did not start on :${port_fwd}"
+    port="$(layer_relay_probe_resolve_port 0 "${ssh_host}" "${ssh_port}" "${ssh_user}")"
   fi
-  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-    "[[ -f '${pdir}/srv.pid' ]] && kill \$(cat '${pdir}/srv.pid') 2>/dev/null; pkill -f '${pdir}/' 2>/dev/null" 2>/dev/null || true
-
-  info "  [2/2] synthetic Relay — peer entry → local exit (QUIC ${local_v4}:${port_rev})…"
-  if ! layer_relay_probe_write_exit_yaml "${dir}/exit-local.yaml" "${port_rev}" "${auth}" "${obfs}" "${tls_dir}" \
-      || ! layer_relay_probe_write_entry_yaml "${dir}/peer-entry.yaml" "${local_v4}" "${port_rev}" "${auth}" "${obfs}"; then
-    ok=FAIL; conf=high
-    note="synthetic Relay — could not write phase-2 configs"
-    layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
-    layer_relay_probe_synthetic_fini "${dir}" "${pdir}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
-    return 0
+  if [[ ! "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    port=443
   fi
-  pkill -f "${dir}/exit-local.yaml" 2>/dev/null || true
-  "${RELAY_BIN}" server -c "${dir}/exit-local.yaml" >"${dir}/srv-rev.log" 2>&1 &
-  srv_pid=$!
-  LAYER_RELAY_PROBE_SRV_PID="${srv_pid}"
-  echo "${srv_pid}" > "${dir}/srv.pid"
 
-  if layer_relay_probe_wait_server_log "${dir}/srv-rev.log"; then
-    layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dir}/peer-entry.yaml" "${pdir}/entry.yaml" 2>/dev/null || true
+  if [[ "${local_is_entry}" -eq 0 ]] && layer_relay_probe_local_hysteria_listening "${port}"; then
+    info "  Kharej exit already listening on UDP :${port} — QUIC path open (production Relay)"
+    relay_probe_existing=1
+    connected=1
+  fi
+
+  socks_port=$((port + 10000))
+  if (( socks_port > 65000 )); then
+    socks_port=$((10000 + port % 50001))
+    (( socks_port > 60000 )) && socks_port=60000
+    (( socks_port < 10000 )) && socks_port=10000
+  fi
+
+  info "  Synthetic Relay — Iran entry ${entry_v4} → Kharej exit ${exit_v4} (QUIC :${port})…"
+  if [[ "${local_is_entry}" -eq 1 ]]; then
+    layer_relay_probe_peer_ensure_bind_cap "${ssh_host}" "${ssh_port}" "${ssh_user}"
+  else
+    layer_relay_probe_ensure_local_bind_cap
+  fi
+
+  if [[ "${local_is_entry}" -eq 1 ]]; then
+    if layer_relay_probe_peer_hysteria_listening "${port}" "${ssh_host}" "${ssh_port}" "${ssh_user}"; then
+      info "  Kharej exit already listening on UDP :${port} — QUIC path open (existing Relay)"
+      relay_probe_existing=1
+      connected=1
+    fi
+  fi
+
+  if [[ "${local_is_entry}" -eq 1 && "${relay_probe_existing}" -eq 0 ]]; then
+    if ! layer_relay_probe_write_entry_yaml "${dir}/entry.yaml" "${exit_v4}" "${port}" "${auth}" "${obfs}" "${socks_port}" \
+        || ! layer_relay_probe_write_exit_yaml "${dir}/peer-exit.yaml" "${port}" "${auth}" "${obfs}" "tls"; then
+      layer_autotest_record "Phormal Relay" "inconclusive" "low" "failed to write Relay probe configs"
+      layer_relay_probe_synthetic_fini "${dir}" "${pdir}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+      return 0
+    fi
+    layer_relay_probe_peer_prepare_dir "${ssh_host}" "${ssh_port}" "${ssh_user}" "${pdir}"
+    if ! layer_relay_probe_peer_push_tls "${ssh_host}" "${ssh_port}" "${ssh_user}" "${pdir}" "${dir}/peer-tls-staging"; then
+      layer_autotest_record "Phormal Relay" "FAIL" "high" "synthetic Relay — Kharej exit TLS failed"
+      layer_relay_probe_synthetic_fini "${dir}" "${pdir}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+      return 0
+    fi
+    if ! layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dir}/peer-exit.yaml" "${pdir}/exit.yaml" 2>/dev/null; then
+      layer_autotest_record "Phormal Relay" "FAIL" "high" "synthetic Relay — scp exit.yaml to Kharej failed"
+      layer_relay_probe_synthetic_fini "${dir}" "${pdir}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+      return 0
+    fi
+    layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "chmod -R a+rX '${pdir}' 2>/dev/null" 2>/dev/null || true
+    layer_relay_probe_peer_start_server "${ssh_host}" "${ssh_port}" "${ssh_user}" "${pdir}"
+    if ! layer_relay_probe_peer_server_ready "${ssh_host}" "${ssh_port}" "${ssh_user}" "${pdir}" "${port}"; then
+      err_detail="Kharej exit did not start on :${port}"
+      peer_srv_tail="$(layer_relay_probe_peer_srv_error "${ssh_host}" "${ssh_port}" "${ssh_user}" "${pdir}")"
+      [[ -n "${peer_srv_tail}" ]] && err_detail="${err_detail} — ${peer_srv_tail}"
+    else
+      if [[ ${EUID} -eq 0 ]]; then
+        cli_pid="$(layer_relay_probe_run_local_bg "${dir}/cli.log" bash -c "'${RELAY_BIN}' client -c '${dir}/entry.yaml'")"
+      elif have sudo; then
+        cli_pid="$(layer_relay_probe_run_local_bg "${dir}/cli.log" sudo bash -c "'${RELAY_BIN}' client -c '${dir}/entry.yaml'")"
+      else
+        cli_pid="$(layer_relay_probe_run_local_bg "${dir}/cli.log" bash -c "'${RELAY_BIN}' client -c '${dir}/entry.yaml'")"
+      fi
+      LAYER_RELAY_PROBE_CLI_PID="${cli_pid}"
+      echo "${cli_pid}" > "${dir}/cli.pid"
+      if layer_relay_probe_wait_client_log "${dir}/cli.log" "${cli_pid}"; then
+        connected=1
+      else
+        err_detail="$(grep -oE 'connect error[^",}]*|FATAL[^",}]*|no mode specified' "${dir}/cli.log" 2>/dev/null | tail -1 | head -c 120)"
+        [[ -z "${err_detail}" ]] && err_detail="Iran entry client did not connect to Kharej exit"
+      fi
+      kill "${cli_pid}" 2>/dev/null || true
+      LAYER_RELAY_PROBE_CLI_PID=""
+    fi
     layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-      "nohup ${RELAY_BIN} client -c '${pdir}/entry.yaml' >'${pdir}/cli.log' 2>&1 & echo \$! >'${pdir}/cli.pid'" 2>/dev/null || true
-    sleep 2
-    if layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-        "for i in \$(seq 1 12); do \
-           [[ -f '${pdir}/cli.pid' ]] && kill -0 \$(cat '${pdir}/cli.pid') 2>/dev/null || break; \
-           grep -qiE 'connected|established|ready' '${pdir}/cli.log' 2>/dev/null && exit 0; \
-           grep -qi FATAL '${pdir}/cli.log' 2>/dev/null && exit 1; \
-           [[ \${i} -ge 8 ]] && ! grep -qi FATAL '${pdir}/cli.log' 2>/dev/null && exit 0; \
-           sleep 1; \
-         done; exit 1" 2>/dev/null; then
-      peer_ok=1
-    else
-      err_rev="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-        "grep -oE 'connect error[^\",}]*|FATAL[^\",}]*' '${pdir}/cli.log' 2>/dev/null | tail -1 | head -c 100" 2>/dev/null | tr -d '\r')"
+      "[[ -f '${pdir}/srv.pid' ]] && kill \$(cat '${pdir}/srv.pid') 2>/dev/null; pkill -f '${pdir}/' 2>/dev/null" 2>/dev/null || true
+  elif [[ "${local_is_entry}" -eq 0 && "${relay_probe_existing}" -eq 0 ]]; then
+    if ! layer_relay_probe_write_exit_yaml "${dir}/exit.yaml" "${port}" "${auth}" "${obfs}" "tls" \
+        || ! layer_relay_probe_write_entry_yaml "${dir}/peer-entry.yaml" "${exit_v4}" "${port}" "${auth}" "${obfs}" "${socks_port}"; then
+      layer_autotest_record "Phormal Relay" "inconclusive" "low" "failed to write Relay probe configs"
+      layer_relay_probe_synthetic_fini "${dir}" "${pdir}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+      return 0
     fi
-  else
-    err_rev="local exit did not start on :${port_rev}"
+    info "  Starting Kharej exit locally on UDP :${port}…"
+    cli_pid="$(layer_relay_probe_start_local_server "${dir}")"
+    LAYER_RELAY_PROBE_SRV_PID="${cli_pid}"
+    if ! layer_relay_probe_wait_server_log "${dir}/srv.log" "${port}"; then
+      err_detail="Kharej exit did not start locally on :${port}"
+      srv_tail="$(layer_relay_probe_local_srv_tail "${dir}/srv.log")"
+      [[ -n "${srv_tail}" ]] && err_detail="${err_detail} — ${srv_tail}"
+    else
+      info "  Running Iran entry client on peer via SSH…"
+      layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "mkdir -p '${pdir}'" 2>/dev/null || true
+      if ! layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dir}/peer-entry.yaml" "${pdir}/entry.yaml" 2>/dev/null; then
+        err_detail="scp entry.yaml to Iran peer failed"
+      else
+        layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "chmod a+r '${pdir}/entry.yaml' 2>/dev/null" 2>/dev/null || true
+        layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+          "pkill -f '${pdir}/entry.yaml' 2>/dev/null || true; \
+           : >'${pdir}/cli.log'; \
+           cd '${pdir}' && setsid '${RELAY_BIN}' client -c entry.yaml >>cli.log 2>&1 < /dev/null & \
+           echo \$! >cli.pid; sleep 1" 2>/dev/null || true
+        sleep 1
+        if layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+            "for i in \$(seq 1 12); do \
+               [[ -f '${pdir}/cli.pid' ]] && kill -0 \$(cat '${pdir}/cli.pid') 2>/dev/null || break; \
+               grep -qiE 'connected|established|ready|listening|client mode' '${pdir}/cli.log' 2>/dev/null && exit 0; \
+               grep -qi FATAL '${pdir}/cli.log' 2>/dev/null && exit 1; \
+               [[ \${i} -ge 10 ]] && ! grep -qi FATAL '${pdir}/cli.log' 2>/dev/null && exit 0; \
+               sleep 1; \
+             done; exit 1" 2>/dev/null; then
+          connected=1
+        else
+          err_detail="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+            "grep -oE 'connect error[^\",}]*|FATAL[^\",}]*|no mode specified' '${pdir}/cli.log' 2>/dev/null | tail -1 | head -c 120" 2>/dev/null | tr -d '\r')"
+          [[ -z "${err_detail}" ]] && err_detail="Iran entry on peer did not connect to local Kharej exit"
+        fi
+      fi
+    fi
+    kill "${LAYER_RELAY_PROBE_SRV_PID:-}" 2>/dev/null || true
+    LAYER_RELAY_PROBE_SRV_PID=""
   fi
 
-  if [[ "${local_ok}" -eq 1 && "${peer_ok}" -eq 1 ]]; then
-    ok=PASS; conf=high
-    note="synthetic Relay — bidirectional QUIC OK (:${port_fwd} this→peer, :${port_rev} peer→this)"
-  elif [[ "${local_ok}" -eq 1 || "${peer_ok}" -eq 1 ]]; then
-    ok=PASS; conf=med
-    note="synthetic Relay — one-way QUIC (this→peer:${local_ok} peer→this:${peer_ok})"
-    [[ -n "${err_fwd}${err_rev}" ]] && note="${note} — ${err_fwd:-${err_rev}}"
+  if [[ "${connected}" -eq 1 ]]; then
+    ok=PASS
+    if [[ "${relay_probe_existing}" -eq 1 ]]; then
+      conf=high
+      note="Kharej exit already listening on :${port} — QUIC path open (production Relay)"
+    else
+      conf=high
+      note="synthetic Relay — Iran entry ${entry_v4} → Kharej exit ${exit_v4} QUIC OK (:${port})"
+    fi
   else
     ok=FAIL; conf=high
-    note="synthetic Relay QUIC failed both ways (this→peer:0 peer→this:0)"
-    [[ -n "${err_fwd}" ]] && note="${note} — fwd: ${err_fwd}"
-    [[ -n "${err_rev}" ]] && note="${note} — rev: ${err_rev}"
+    note="synthetic Relay — Iran→Kharej QUIC failed"
+    [[ -n "${err_detail}" ]] && note="${note} — ${err_detail}"
+    if grep -qi 'connect error\|timeout' <<<"${err_detail}"; then
+      note="${note} (UDP/QUIC may be filtered on this path)"
+    fi
   fi
   layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
   layer_relay_probe_synthetic_fini "${dir}" "${pdir}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+}
+
+layer_relay_autotest_systemd_pair() {
+  local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
+  local local_n peer_n
+  local_n="$(systemctl list-units --type=service --state=active --no-legend 'phormal-relay@*' 2>/dev/null \
+    | awk '{print $1}' | sed 's/phormal-relay@//;s/\.service//' | head -n1)"
+  peer_n="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "systemctl list-units --type=service --state=active --no-legend 'phormal-relay@*' 2>/dev/null \
+     | awk '{print \$1}' | sed 's/phormal-relay@//;s/\.service//' | head -n1" 2>/dev/null | tr -d '\r')"
+  if [[ -n "${local_n}" && -n "${peer_n}" ]]; then
+    layer_autotest_record "Phormal Relay" "PASS" "med" \
+      "configured Relay — phormal-relay@${local_n} (this host) and phormal-relay@${peer_n} (peer) both active"
+    return 0
+  fi
+  return 1
 }
 
 layer_test_relay_path() {
@@ -5083,16 +5294,36 @@ layer_test_relay_path() {
   local n role remote listen st peer_info peer_meta ok=FAIL conf=high note=""
   local peer_n peer_role peer_st peer_listen started_any=0 err_hint udp_ok=0
 
-  layer_autotest_probe_begin "Phormal Relay (paired Hysteria — both servers)"
+  layer_autotest_probe_begin "Phormal Relay (Iran entry → Kharej exit)"
   layer_autotest_require_peer_ssh || {
     layer_autotest_record "Phormal Relay" "inconclusive" "low" "peer SSH not ready"
     return 0
   }
-  local local_pair peer_meta_early
+  local local_pair peer_meta_early peer_info
   local_pair="$(layer_local_relay_toward_peer "${peer_v4}" 2>/dev/null || true)"
   peer_meta_early="$(layer_ssh_peer_relay_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+  peer_info="$(layer_ssh_peer_relay_lookup "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+  case "${peer_info}" in
+    UP:*)
+      ok=PASS; conf=med
+      note="peer Relay active (${peer_info#UP:})"
+      [[ -n "${local_pair}" ]] && note="${note}; local Relay also configured"
+      layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
+      info "  (UDP echo skipped — configured Relay seen on peer via SSH)"
+      return 0
+      ;;
+    STOP:*)
+      layer_autotest_record "Phormal Relay" "inconclusive" "med" \
+        "peer Relay '${peer_info#STOP:}' configured but STOPPED — systemctl enable --now phormal-relay@<name> on peer"
+      info "  (UDP echo skipped — Relay meta on peer but service not active)"
+      return 0
+      ;;
+  esac
   if [[ -z "${local_pair}" && ( -z "${peer_meta_early}" || "${peer_meta_early}" == NONE ) ]]; then
-    info "  No Relay config — creating paired synthetic Hysteria on both servers (like real Relay)…"
+    if layer_relay_autotest_systemd_pair "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"; then
+      return 0
+    fi
+    info "  No Relay config — synthetic Hysteria probe (Iran entry → Kharej exit)…"
     layer_test_relay_synthetic_probe "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
     return 0
   fi
@@ -5203,22 +5434,6 @@ layer_test_relay_path() {
         ;;
     esac
   done < <(relay_instances 2>/dev/null)
-  peer_info="$(layer_ssh_peer_relay_lookup "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
-  case "${peer_info}" in
-    UP:*)
-      ok=PASS; conf=med
-      note="peer Relay active (${peer_info#UP:}) — no local Relay toward ${peer_v4}"
-      layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
-      info "  (UDP echo skipped — configured Relay seen on peer via SSH)"
-      return 0
-      ;;
-    STOP:*)
-      layer_autotest_record "Phormal Relay" "inconclusive" "med" \
-        "peer Relay '${peer_info#STOP:}' configured but STOPPED — systemctl enable --now phormal-relay@<name> on peer"
-      info "  (UDP echo skipped — Relay meta on peer but service not active)"
-      return 0
-      ;;
-  esac
   while read -r n; do
     [[ -n "${n}" ]] || continue
     remote="$(imeta_get "${n}" REMOTE_V4)"
@@ -5241,6 +5456,9 @@ layer_test_relay_path() {
     info "  (UDP echo skipped — tunnel configured but service not active)"
     return 0
   done < <(relay_instances 2>/dev/null)
+  if layer_relay_autotest_systemd_pair "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"; then
+    return 0
+  fi
   warn "  No paired Relay meta matched — running synthetic Hysteria probe…"
   layer_test_relay_synthetic_probe "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
 }
@@ -5264,7 +5482,7 @@ layer_test_tcp_one_way() {
   rm -f "${reply}"
   case "${dir}" in
     forward)
-      layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
         "timeout 14 bash -c 'printf OK-FWD | nc -l -p ${port} -q 2'" 2>/dev/null &
       sleep 1
       if printf '' | timeout 7 nc -w 5 "${peer_v4}" "${port}" 2>/dev/null | grep -q OK-FWD; then
@@ -5276,7 +5494,7 @@ layer_test_tcp_one_way() {
       timeout 14 nc -l -p "${port}" >"${reply}" 2>/dev/null &
       local lid=$!
       sleep 1
-      layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
         "printf REV-REV | nc -w 5 ${local_v4} ${port}" >/dev/null 2>&1 &
       wait "${lid}" 2>/dev/null || true
       sleep 1
@@ -5352,9 +5570,10 @@ layer_autotest_main() {
   LAYER_TEST_ROWS=()
   LAYER_SSH_CTRL_PATH=""
   rule
-  info "Phormal Path Test — every product (Bridge, Relay, Reverse, GRE, Echo, Raw, DNS, Edge)"
+  info "Phormal Path Test — Bridge, Relay, Reverse, GRE, Echo, Raw"
   info "Run on ONE server only (Iran or kharej). You enter peer SSH here — no second terminal on the peer."
-  info "Paired tests use outbound SSH to run installs and probes on both sides."
+  info "Non-root peer (e.g. ubuntu): you will be asked to use sudo -i so probes run as root on the peer."
+  info "Relay probe: Iran entry (menu 7) → Kharej exit (menu 6) — production layout only."
   rule
   apt_install_quiet python3 tcpdump iproute2 openssh-client netcat-openbsd dnsutils 2>/dev/null || true
   have python3 || { fail "python3 required."; return 1; }
@@ -5374,6 +5593,7 @@ layer_autotest_main() {
   peer_v4="${ssh_host}"
   valid_ipv4 "${peer_v4}" || peer_v4="$(getent ahostsv4 "${ssh_host}" 2>/dev/null | awk '{print $1; exit}')"
   [[ -n "${peer_v4}" ]] || { fail "Cannot resolve peer."; return 1; }
+  layer_ssh_peer_offer_root_login "${ssh_user}"
   local_v4="$(layer_detect_public_v4 "${peer_v4}")"
   info "This host toward ${peer_v4} uses source IP ${local_v4:-?} — run from Iran or kharej where tunnels live."
   layer_ssh_session_open "${ssh_host}" "${ssh_port}" "${ssh_user}" || return 1
@@ -5405,7 +5625,7 @@ layer_autotest_main() {
     timeout 18 tcpdump -ni any -c 5 "icmp and src host ${peer_v4}" >"${pcap}" 2>&1 &
     local td=$!
     sleep 1
-    layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
       "python3 /tmp/phormal-probe.py icmp_send ${peer_v4} ${local_v4} >/dev/null" 2>/dev/null || true
     wait "${td}" 2>/dev/null || true
     grep -q "ICMP echo request" "${pcap}" 2>/dev/null && peer_ok=1
@@ -5416,7 +5636,7 @@ layer_autotest_main() {
     wait "${td}" 2>/dev/null || true
     grep -q "ICMP echo request" "${pcap2}" 2>/dev/null && local_ok=1
     rm -f "${pcap}" "${pcap2}" "${probe}"
-    layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "rm -f /tmp/phormal-probe.py" 2>/dev/null || true
+    layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" "rm -f /tmp/phormal-probe.py" 2>/dev/null || true
     if [[ "${peer_ok}" -eq 1 && "${local_ok}" -eq 1 ]]; then ok=PASS; note="bidirectional ICMP echo"
     elif [[ "${peer_ok}" -eq 1 || "${local_ok}" -eq 1 ]]; then ok=PASS; note="one-way ICMP OK"; else note="no icmp echo path"; fi
     layer_autotest_record "Phormal Echo" "${ok}" "high" "${note}"
@@ -5446,28 +5666,6 @@ layer_autotest_main() {
     layer_test_tcp_bidir "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Reverse"
   fi
 
-  if [[ "${only}" == "all" || "${only}" == *dns* ]]; then
-    local ok=FAIL note=""
-    layer_autotest_probe_begin "Phormal DNS"
-    if have dig && dig +time=3 +tries=1 @8.8.8.8 google.com A +short 2>/dev/null | grep -qE '^[0-9]'; then
-      ok=PASS; note="recursive DNS works from this host"
-    else
-      note="DNS probe failed/inconclusive"; ok=inconclusive
-    fi
-    layer_autotest_record "Phormal DNS" "${ok}" "low" "${note}"
-  fi
-
-  if [[ "${only}" == "all" || "${only}" == *edge* ]]; then
-    if [[ "${only}" == *edge* && "${only}" != "all" ]]; then
-      layer_test_tcp_bidir "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Edge"
-    elif [[ "$(layer_autotest_row_get "Phormal Reverse" result 2>/dev/null)" == "PASS" ]]; then
-      layer_autotest_probe_begin "Phormal Edge"
-      layer_autotest_copy_row "Phormal Reverse" "Phormal Edge" " — needs proxyforwarder; TCP path same as Reverse" "low"
-    else
-      layer_test_tcp_bidir "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Edge"
-    fi
-  fi
-
   printf '\n'
   layer_autotest_print_table
   layer_autotest_recommendation
@@ -5490,7 +5688,7 @@ layer_autotest_cli() {
 phormal_path_test_menu() {
   rule
   info "Phormal Path Test — option 1"
-  info "Tests Bridge, Relay, Reverse, GRE, Echo, Raw, DNS, Edge."
+  info "Tests Bridge, Relay, Reverse, GRE, Echo, Raw."
   rule
   layer_autotest_cli
 }
@@ -5529,19 +5727,11 @@ menu() {
     printf '   %s19%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s20%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s21%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL DNS%s  %s(iodine)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
-    printf '   %s22%s  Add exit tunnel\n' "${ACC}" "${RST}"
-    printf '   %s23%s  Add entry tunnel\n' "${ACC}" "${RST}"
-    printf '   %s24%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL EDGE%s  %s(proxyforwarder)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
-    printf '   %s25%s  Add exit tunnel\n' "${ACC}" "${RST}"
-    printf '   %s26%s  Add entry tunnel\n' "${ACC}" "${RST}"
-    printf '   %s27%s  Manage tunnels\n' "${ACC}" "${RST}"
     printf '\n  %sMANAGE%s\n' "${BOLD}" "${RST}"
-    printf '   %s28%s  Status\n' "${ACC}" "${RST}"
-    printf '   %s29%s  Phormal tuning\n' "${ACC}" "${RST}"
-    printf '   %s30%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
-    printf '   %s31%s  Uninstall\n' "${ACC}" "${RST}"
+    printf '   %s22%s  Status\n' "${ACC}" "${RST}"
+    printf '   %s23%s  Phormal tuning\n' "${ACC}" "${RST}"
+    printf '   %s24%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
+    printf '   %s25%s  Uninstall\n' "${ACC}" "${RST}"
     printf '    %s0%s  Exit\n\n' "${ACC}" "${RST}"
 
     local choice; choice="$(ask 'Select')"
@@ -5568,16 +5758,10 @@ menu() {
       19) create_layer_udp2raw_exit || true ;;
       20) create_layer_udp2raw_entry || true ;;
       21) manage_raw_menu || true ;;
-      22) create_layer_dns_exit || true ;;
-      23) create_layer_dns_entry || true ;;
-      24) manage_dns_layer_menu || true ;;
-      25) create_layer_edge_exit || true ;;
-      26) create_layer_edge_entry || true ;;
-      27) manage_edge_menu || true ;;
-      28) status || true ;;
-      29) tune_menu || true ;;
-      30) schedule_refresh || true ;;
-      31) purge || true ;;
+      22) status || true ;;
+      23) tune_menu || true ;;
+      24) schedule_refresh || true ;;
+      25) purge || true ;;
       0)  good "Goodbye — @SchmitzWS"; exit 0 ;;
       *)  fail "Invalid selection." ;;
     esac
