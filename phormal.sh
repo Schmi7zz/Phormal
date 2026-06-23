@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.2.0"
+readonly PHORMAL_VERSION="5.3.0"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -40,6 +40,8 @@ readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 # Files expected on the mirror host (served at MIRROR_BASE):
 #   gost-linux-{amd64,arm64}  hysteria-linux-{amd64,arm64}
 #   rathole-linux-{amd64,arm64}  phormal-spoof-linux-{amd64,arm64}
+#   backhaul-linux-{amd64,arm64}  icmp_tun-linux-{amd64,arm64}  udp2raw-linux-{amd64,arm64}
+#   iodine-linux-{amd64,arm64}  iodined-linux-{amd64,arm64}  proxyforwarder-linux-{amd64,arm64}
 # phormal.sh itself is installed from GitHub, not the mirror.
 readonly DEFAULT_MIRROR_BASE="http://85.198.16.108:8880/phormal"
 readonly GOST_RELEASE_VERSION="3.2.6"
@@ -252,7 +254,7 @@ mirror_fwd_url() {
   local arch="$1" base
   base="$(mirror_base)"
   [[ -z "${base}" ]] && return 1
-  printf '%s/phormal-bridge-linux-%s' "${base%/}" "${arch}"
+  printf '%s/gost-linux-%s' "${base%/}" "${arch}"
 }
 
 mirror_relay_url() {
@@ -266,7 +268,7 @@ mirror_reverse_url() {
   local arch="$1" base
   base="$(mirror_base)"
   [[ -z "${base}" ]] && return 1
-  printf '%s/phormal-linux-%s' "${base%/}" "${arch}"
+  printf '%s/rathole-linux-%s' "${base%/}" "${arch}"
 }
 
 mirror_spoof_url() {
@@ -334,7 +336,7 @@ reset_binary_source() { BINARY_SOURCE=""; }
 choose_binary_source() {
   [[ -n "${BINARY_SOURCE}" ]] && return 0
   rule
-  info "Binary download source"
+  info "Binary download source (gost + hysteria)"
   rule
   printf '  %s1%s  Iran mirror download [default]\n' "${ACC}" "${RST}"
   printf '  %s2%s  GitHub — official pinned releases\n' "${ACC}" "${RST}"
@@ -354,7 +356,7 @@ install_manual_fwd() {
   arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
   src="${MANUAL_DIR}/gost-linux-${arch}"
   if [[ ! -f "${src}" ]]; then
-    fail "Place the Phormal Bridge binary at ${src}"
+    fail "Place the gost binary at ${src}"
     info "Download it from: $(gost_release_url "${arch}")"
     return 1
   fi
@@ -373,7 +375,7 @@ install_manual_relay() {
   arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
   src="${MANUAL_DIR}/hysteria-linux-${arch}"
   if [[ ! -f "${src}" ]]; then
-    fail "Place the phormal relay binary at ${src}"
+    fail "Place the hysteria binary at ${src}"
     info "Download it from: $(hysteria_upstream_url "${arch}")"
     return 1
   fi
@@ -741,7 +743,7 @@ tune_menu() {
 #  Services per link (systemd templates):
 #    phormal-core@<name>   SIT bring-up/down       (oneshot)
 #    phormal-guard@<name>  keepalive ping          (entry + exit)
-#    phormal-bfwd@<name>   port publisher          (entry only)
+#    phormal-bfwd@<name>   port publisher (gost)   (entry only)
 # ==============================================================================
 readonly BRIDGE_DIR="${PHORMAL_HOME}/bridge"
 readonly BRIDGE_RUN="/usr/local/bin/phormal-bridge-run"
@@ -774,24 +776,24 @@ install_engine() {
         urls+=("${mirror}")
       fi
       if fetch_binary "${FWD_BIN}" verify_fwd_tmp \
-          "Phormal publisher engine" "${urls[@]}"; then
+          "Phormal publisher engine (gost)" "${urls[@]}"; then
         return 0
       fi
     fi
-    info "Mirror unavailable — trying upstream phormal bridge release v${GOST_RELEASE_VERSION}…"
+    info "Mirror unavailable — trying upstream gost release v${GOST_RELEASE_VERSION}…"
     if install_gost_from_release; then
       good "Phormal publisher engine installed."
       return 0
     fi
   elif [[ "${BINARY_SOURCE}" == "github" ]]; then
-    info "Fetching phormal bridge release v${GOST_RELEASE_VERSION} from GitHub…"
+    info "Fetching gost release v${GOST_RELEASE_VERSION} from GitHub…"
     if install_gost_from_release; then
       good "Phormal publisher engine installed."
       return 0
     fi
   fi
 
-  info "Trying phormal bridge install script…"
+  info "Trying gost install script…"
   if bash <(curl -fsSL --connect-timeout 20 --max-time 180 \
       https://github.com/go-gost/gost/raw/master/install.sh) --install >/dev/null 2>&1 \
      && have gost; then
@@ -1091,7 +1093,7 @@ case "\${cmd}" in
     while :; do ping6 -c1 -W2 "\${PEER_CORE}" >/dev/null 2>&1 || true; sleep 15; done
     ;;
   fwd)
-    [[ -z "\${PEER_CORE}" ]] && { echo "PEER_CORE empty in meta.conf — refusing to start (would crash bridge)" >&2; exit 1; }
+    [[ -z "\${PEER_CORE}" ]] && { echo "PEER_CORE empty in meta.conf — refusing to start (would crash gost)" >&2; exit 1; }
     args=()
     IFS=',' read -ra parr <<< "\${PORTS}"
     for p in "\${parr[@]}"; do
@@ -1577,14 +1579,14 @@ install_relay_engine() {
     fi
     urls+=( "$(hysteria_upstream_url "${arch}")" )
     if fetch_binary "${RELAY_BIN}" verify_relay_tmp \
-        "Phormal Relay engine" "${urls[@]}"; then
+        "Phormal Relay engine (hysteria)" "${urls[@]}"; then
       setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
       return 0
     fi
   elif [[ "${BINARY_SOURCE}" == "github" ]]; then
     urls+=( "$(hysteria_upstream_url "${arch}")" )
     if fetch_binary "${RELAY_BIN}" verify_relay_tmp \
-        "Phormal Relay engine" "${urls[@]}"; then
+        "Phormal Relay engine (hysteria)" "${urls[@]}"; then
       setcap cap_net_bind_service,cap_net_admin=+ep "${RELAY_BIN}" 2>/dev/null || true
       return 0
     fi
@@ -1900,15 +1902,7 @@ write_instance_entry_config() {
     echo ""
     relay_engine_block
     echo ""
-    # Connection mode. Default = eager + fastOpen (best for most servers / CDN).
-    # COMPAT_LAZY=1 switches to lazy dial (fresh QUIC per use) for the minority of
-    # links where a warm long-lived session gets killed by DPI/NAT ("connects with
-    # high ping, then drops"). Both keep the keepAlive from relay_engine_block.
-    if [[ "$(imeta_get "${name}" COMPAT_LAZY)" == "1" ]]; then
-      echo "lazy: true"
-    else
-      echo "fastOpen: true"
-    fi
+    echo "fastOpen: true"
     if [[ "${listen}" == *-* ]]; then
       echo ""
       echo "transport:"
@@ -2076,14 +2070,6 @@ create_entry_tunnel() {
   local ports; ports="$(gather_ports)"
   [[ -z "${ports}" ]] && { fail "No valid ports provided."; rm -rf "$(relay_idir "${name}")"; return 1; }
   imeta_set "${name}" PORTS "${ports}"
-
-  # Connection mode. Default (eager + fastOpen) is best for most servers and CDN.
-  # Enable compatibility mode only if THIS server shows "connects, high ping, then
-  # drops" — it switches to lazy dial (fresh QUIC per use).
-  local compat
-  compat="$(ask 'Connection compatibility mode? Use only if the link connects then drops (y/n) [n]')"
-  compat="${compat:-n}"
-  [[ "${compat}" =~ ^[Yy] ]] && imeta_set "${name}" COMPAT_LAZY 1 || imeta_set "${name}" COMPAT_LAZY 0
 
   local cdn_ans cdn_domain cdn_path cdn_listen cdn_port fp
   cdn_ans="$(ask 'Put this entry behind a CDN (ArvanCloud) over port 80 + WebSocket? (y/n) [n]')"
@@ -2297,7 +2283,7 @@ instance_edit_raw() {
   local name="$1" dir; dir="$(relay_idir "${name}")"
   info "  ${dir}/meta.conf"
   info "  ${dir}/config.yaml"
-  local c; c="$(ask 'Edit raw phormal relay config now? (y/n)')"
+  local c; c="$(ask 'Edit raw hysteria config now? (y/n)')"
   [[ "${c}" == "y" ]] && ${EDITOR:-nano} "${dir}/config.yaml"
   local r; r="$(ask 'Restart tunnel to apply? (y/n)')"
   [[ "${r}" == "y" ]] && relay_start_instance "${name}"
@@ -2317,24 +2303,6 @@ instance_delete() {
   good "Tunnel '${name}' deleted."
 }
 
-instance_toggle_compat() {
-  local name="$1" cur
-  [[ "$(imeta_get "${name}" ROLE)" == "entry" ]] || { warn "Compatibility mode applies to ENTRY tunnels only."; return 0; }
-  cur="$(imeta_get "${name}" COMPAT_LAZY)"; cur="${cur:-0}"
-  if [[ "${cur}" == "1" ]]; then
-    info "Compatibility mode is currently ON (lazy dial)."
-    local a; a="$(ask 'Turn it OFF (back to default fastOpen)? (y/n)')"
-    [[ "${a}" =~ ^[Yy] ]] && imeta_set "${name}" COMPAT_LAZY 0 || return 0
-  else
-    info "Compatibility mode is currently OFF (default fastOpen)."
-    local a; a="$(ask 'Turn it ON (lazy dial — for links that connect then drop)? (y/n)')"
-    [[ "${a}" =~ ^[Yy] ]] && imeta_set "${name}" COMPAT_LAZY 1 || return 0
-  fi
-  write_instance_entry_config "${name}"
-  relay_start_instance "${name}" || true
-  good "Compatibility mode updated and tunnel restarted."
-}
-
 manage_instance_menu() {
   local name="$1"
   while :; do
@@ -2352,7 +2320,6 @@ manage_instance_menu() {
     printf '  %s9%s  Edit auth/obfs/bandwidth\n' "${ACC}" "${RST}"
     printf ' %s10%s  Edit raw config\n'         "${ACC}" "${RST}"
     printf ' %s11%s  Delete tunnel\n'           "${ACC}" "${RST}"
-    printf ' %s12%s  Compatibility mode (entry only)\n' "${ACC}" "${RST}"
     printf '  %s0%s  Back\n\n'                  "${ACC}" "${RST}"
     local c; c="$(ask 'Select')"; echo
     case "${c}" in
@@ -2367,7 +2334,6 @@ manage_instance_menu() {
       9) instance_edit_creds "${name}" || true ;;
       10) instance_edit_raw "${name}" || true ;;
       11) instance_delete "${name}"; break ;;
-      12) instance_toggle_compat "${name}" || true ;;
       0) break ;;
       *) fail "Invalid selection." ;;
     esac
@@ -2863,7 +2829,6 @@ manage_reverse_instance_menu() {
     printf '  %s9%s  Change token\n'            "${ACC}" "${RST}"
     printf ' %s10%s  Edit raw config\n'         "${ACC}" "${RST}"
     printf ' %s11%s  Delete tunnel\n'           "${ACC}" "${RST}"
-    printf ' %s12%s  Compatibility mode (entry only)\n' "${ACC}" "${RST}"
     printf '  %s0%s  Back\n\n'                  "${ACC}" "${RST}"
     local c; c="$(ask 'Select')"; echo
     case "${c}" in
@@ -2964,10 +2929,12 @@ spoof_enable_raw() {
 net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
 net.ipv4.ip_forward = 1
+net.ipv4.icmp_echo_ignore_all = 0
 EOF
   sysctl --system >/dev/null 2>&1 || true
   local iface; iface="$(primary_iface)"
   [[ -n "${iface}" ]] && sysctl -w "net.ipv4.conf.${iface}.rp_filter=0" >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 || true
   enable_relay_buffers
   good "Phormal Spoof kernel tuning applied."
 }
@@ -3063,8 +3030,8 @@ spoof_print_egress_report() {
       warn "Strict reverse-path filtering (rp_filter) may be dropping spoofed egress."
       warn "Run Spoof kernel prep (rp_filter=0) before retrying."
     else
-      warn "Host/kernel or local firewall may block forged-source egress."
-      warn "Your provider may also block spoofing upstream (use Layer 2 peer test)."
+      warn "tcpdump may miss same-host spoofed egress — not proof spoof is blocked."
+      warn "Use menu 6 (listener on peer) + 7 (sender here) for a reliable path test."
     fi
   elif [[ "${verdict}" == "PASS" ]]; then
     warn "PASS proves host/kernel egress only — ISP uRPF/BCP38 is still unknown."
@@ -3072,11 +3039,22 @@ spoof_print_egress_report() {
   rule
 }
 
+spoof_count_captured_probes() {
+  local pcap="$1" src_ip="$2" dst_ip="$3" n
+  n="$(tcpdump -r "${pcap}" -nn 2>/dev/null \
+    | grep -cE "${src_ip//./\\.} > ${dst_ip//./\\.}.*ICMP echo request" || true)"
+  [[ "${n}" -gt 0 ]] && { printf '%s' "${n}"; return 0; }
+  n="$(tcpdump -r "${pcap}" -nn \
+    "src host ${src_ip} and dst host ${dst_ip} and icmp" 2>/dev/null \
+    | wc -l | tr -d ' ')"
+  printf '%s' "${n:-0}"
+}
+
 # Layer 1 — mandatory isolated egress test. Optional args: spoof_src, dest, offer_peer (1/0).
 spoof_test_egress() {
   local default_src="${1:-}" default_dst="${2:-}" offer_peer="${3:-1}"
-  local iface real_ip src_ip dst_ip sent=5 captured=0
-  local rp_all rp_def rp_if fw_note pcap tdp
+  local iface real_ip src_ip dst_ip sent=8 captured=0
+  local rp_all rp_def rp_if fw_note pcap pcap2 tdp tdp2 cap_iface n
 
   apt_install_quiet tcpdump python3
 
@@ -3088,6 +3066,10 @@ spoof_test_egress() {
   iface="$(primary_iface)"
   [[ -n "${iface}" ]] || { fail "Could not detect egress interface."; return 1; }
   real_ip="$(spoof_iface_ipv4 "${iface}")"
+  sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+  sysctl -w "net.ipv4.conf.${iface}.rp_filter=0" >/dev/null 2>&1 || true
 
   rule
   info "Spoof preflight — testing local egress on ${iface}"
@@ -3130,23 +3112,31 @@ spoof_test_egress() {
   fi
 
   pcap="$(mktemp)"
-  timeout 8 tcpdump -ni "${iface}" -c 5 -w "${pcap}" \
-    "icmp and src host ${src_ip} and dst host ${dst_ip}" >/dev/null 2>&1 &
+  pcap2="$(mktemp)"
+  timeout 15 tcpdump -ni any -s 160 -w "${pcap}" \
+    "icmp and dst host ${dst_ip}" >/dev/null 2>&1 &
   tdp=$!
+  timeout 15 tcpdump -ni "${iface}" -s 160 -w "${pcap2}" \
+    "icmp and dst host ${dst_ip}" >/dev/null 2>&1 &
+  tdp2=$!
   sleep 1
 
   if ! spoof_send_probe "${src_ip}" "${dst_ip}" "${sent}"; then
-    kill "${tdp}" 2>/dev/null || true
-    wait "${tdp}" 2>/dev/null || true
-    rm -f "${pcap}"
+    kill "${tdp}" "${tdp2}" 2>/dev/null || true
+    wait "${tdp}" "${tdp2}" 2>/dev/null || true
+    rm -f "${pcap}" "${pcap2}"
     return 1
   fi
 
-  wait "${tdp}" 2>/dev/null || true
-  if [[ -f "${pcap}" ]]; then
-    captured="$(tcpdump -r "${pcap}" -nn 2>/dev/null | wc -l | tr -d ' ')"
-  fi
-  rm -f "${pcap}"
+  sleep 3
+  kill "${tdp}" "${tdp2}" 2>/dev/null || true
+  wait "${tdp}" "${tdp2}" 2>/dev/null || true
+  for cap_iface in "${pcap}" "${pcap2}"; do
+    [[ -f "${cap_iface}" && -s "${cap_iface}" ]] || continue
+    n="$(spoof_count_captured_probes "${cap_iface}" "${src_ip}" "${dst_ip}")"
+    [[ "${n}" -gt "${captured}" ]] && captured="${n}"
+  done
+  rm -f "${pcap}" "${pcap2}"
   captured="${captured:-0}"
 
   local verdict="FAIL"
@@ -3317,7 +3307,7 @@ EOF
 }
 
 spoof_write_ipx_block() {
-  # $1 = src spoof IP, $2 = dst spoof (white) IP. dst defaults to src when empty.
+  # $1 = spoof SOURCE ip, $2 = spoof DESTINATION (white) ip. dst defaults to src when empty.
   local src_ip="$1" dst_ip="${2:-$1}"
   echo '[ipx]'
   echo 'profile = "icmp"'
@@ -3350,15 +3340,17 @@ spoof_write_ports_block() {
   echo ']'
 }
 
+# [ipx] is a separate table alongside transport = "tcp". On deploy, confirm via:
+# journalctl -u 'phormal-spoof@*' -f  →  "spoofing enabled, srcIP: … dstIP: …"
 write_spoof_entry_config() {
-  local name="$1" dir token link_port ports spoof_ip
+  local name="$1" dir token link_port ports spoof_ip spoof_dst
   dir="$(sp_idir "${name}")"
   mkdir -p "${dir}"
   token="$(smeta_get "${name}" TOKEN)"
   link_port="$(smeta_get "${name}" LINK_PORT)"; link_port="${link_port:-${SPOOF_DEFAULT_LINK_PORT}}"
   ports="$(smeta_get "${name}" PORTS)"
   spoof_ip="$(smeta_get "${name}" SPOOF_IP)"
-  local spoof_dst; spoof_dst="$(smeta_get "${name}" SPOOF_DST_IP)"; spoof_dst="${spoof_dst:-${spoof_ip}}"
+  spoof_dst="$(smeta_get "${name}" SPOOF_DST_IP)"; spoof_dst="${spoof_dst:-${spoof_ip}}"
 
   {
     echo '[server]'
@@ -3375,14 +3367,14 @@ write_spoof_entry_config() {
 }
 
 write_spoof_exit_config() {
-  local name="$1" dir token link_port remote spoof_ip
+  local name="$1" dir token link_port remote spoof_ip spoof_dst
   dir="$(sp_idir "${name}")"
   mkdir -p "${dir}"
   token="$(smeta_get "${name}" TOKEN)"
   link_port="$(smeta_get "${name}" LINK_PORT)"; link_port="${link_port:-${SPOOF_DEFAULT_LINK_PORT}}"
   remote="$(smeta_get "${name}" REMOTE_V4)"
   spoof_ip="$(smeta_get "${name}" SPOOF_IP)"
-  local spoof_dst; spoof_dst="$(smeta_get "${name}" SPOOF_DST_IP)"; spoof_dst="${spoof_dst:-${spoof_ip}}"
+  spoof_dst="$(smeta_get "${name}" SPOOF_DST_IP)"; spoof_dst="${spoof_dst:-${spoof_ip}}"
 
   {
     echo '[client]'
@@ -3497,7 +3489,7 @@ create_spoof_entry() {
   good "Entry tunnel '${name}' live — link :${link_port}"
   good "Token (for kharej exit): ${token}"
   info "  Ports : ${ports}"
-  info "  IPX   : icmp + custom_packet + spoof_src/dst = $(smeta_get "${name}" SPOOF_IP)"
+  info "  Spoof : profile=icmp src=$(smeta_get "${name}" SPOOF_IP) dst=$(smeta_get "${name}" SPOOF_DST_IP)"
   good "Point users at THIS server's IP and the published port(s)."
   warn "Create the matching Phormal Spoof EXIT on kharej with the SAME token, link port, and white IP."
 }
@@ -3542,7 +3534,7 @@ create_spoof_exit() {
   echo
   good "Exit tunnel '${name}' live."
   info "  Remote : ${remote}:${link_port}"
-  info "  IPX    : icmp + custom_packet + spoof_src/dst = $(smeta_get "${name}" SPOOF_IP)"
+  info "  Spoof  : profile=icmp src=$(smeta_get "${name}" SPOOF_IP) dst=$(smeta_get "${name}" SPOOF_DST_IP)"
   warn "Run your local service (e.g. VLESS on 127.0.0.1:8081) — port map is defined on the entry."
 }
 
@@ -3605,7 +3597,25 @@ diagnose_spoof_instance() {
     fail "config.toml missing — restart to rebuild from meta.conf"
   fi
   info "Token    : $(smeta_get "${name}" TOKEN)"
-  info "White IP : $(smeta_get "${name}" SPOOF_IP) (ipx icmp + custom_packet)"
+  info "Spoof src: $(smeta_get "${name}" SPOOF_IP)"
+  info "Spoof dst: $(smeta_get "${name}" SPOOF_DST_IP)"
+  if [[ -f "${dir}/config.toml" ]]; then
+    if grep -q 'transport = "tcp"' "${dir}/config.toml" 2>/dev/null; then
+      good 'config transport = "tcp"'
+    else
+      warn 'config transport is not "tcp" — restart tunnel to rebuild'
+    fi
+    if grep -q 'profile = "icmp"' "${dir}/config.toml" 2>/dev/null; then
+      good '[ipx] profile = "icmp" present'
+    else
+      warn '[ipx] block missing or old — restart tunnel to rebuild'
+    fi
+  fi
+  if journalctl -u "${svc}" --since '5 min ago' 2>/dev/null | grep -qi 'spoofing enabled'; then
+    good "engine reports spoofing enabled (see log below)"
+  else
+    warn "no 'spoofing enabled' in recent log — tunnel may not be spoofing yet"
+  fi
   if [[ "${role}" == "entry" ]]; then
     if port_open_tcp "${link}"; then good "TCP link :${link} listening"; else warn "TCP link :${link} not confirmed"; fi
     ports="$(smeta_get "${name}" PORTS)"
@@ -3867,6 +3877,17 @@ status() {
     printf '    %-16s %-6s %-28s %s\n' "${sn}" "${role}" "${tgt}" "$(sp_svc_state "${sn}")"
   done < <(spoof_instances)
   [[ ${sany} -eq 0 ]] && warn "no spoof tunnels configured"
+  echo
+  info "LAYER TUNNELS"
+  local lany=0 lk ln
+  for lk in gre icmp udp2raw btcp bwss dns fwd; do
+    while read -r ln; do
+      [[ -n "${ln}" ]] || continue
+      lany=1
+      printf '    %-10s %-16s %s\n' "${lk}" "${ln}" "$(layer_svc_state "$(layer_svc "${lk}" "${ln}")")"
+    done < <(layer_instances "${lk}" 2>/dev/null || true)
+  done
+  [[ ${lany} -eq 0 ]] && warn "no layer tunnels configured"
   rule
 }
 
@@ -3933,6 +3954,18 @@ purge() {
   rm -f "${SPOOF_TMPL}" "${SPOOF_RUN}" "${SPOOF_BIN}" "${SPOOF_SYSCTL}"
   rm -f /usr/bin/phormal-refresh.sh
   crontab -l 2>/dev/null | grep -v 'phormal-refresh' | crontab - 2>/dev/null || true
+  local lk ln
+  for lk in gre icmp udp2raw btcp bwss dns fwd; do
+    while read -r ln; do
+      [[ -n "${ln}" ]] || continue
+      systemctl stop "phormal-${lk}@${ln}" 2>/dev/null || true
+      systemctl disable "phormal-${lk}@${ln}" 2>/dev/null || true
+      [[ "${lk}" == gre ]] && ip link del "$(layer_meta_get gre "${ln}" IFACE 2>/dev/null || true)" 2>/dev/null || true
+    done < <(layer_instances "${lk}" 2>/dev/null || true)
+    rm -f "/etc/systemd/system/phormal-${lk}@.service"
+  done
+  rm -f "${LAYER_RUN}" "${LAYER_GRE_RUN}" "${LAYER_BACKHAUL_BIN}" "${LAYER_ICMP_BIN}" \
+    "${LAYER_UDP2RAW_BIN}" "${LAYER_IODINE_BIN}" "${LAYER_IODINED_BIN}" "${LAYER_FWD_BIN}"
   rm -rf "${PHORMAL_HOME}"
   systemctl daemon-reload
   good "Phormal removed. (CLI shortcut left at ${CLI_LINK}; delete manually if desired.)"
@@ -3945,6 +3978,979 @@ install_cli() {
   if [[ "${src}" != "${CLI_LINK}" ]]; then
     cp -f "${src}" "${CLI_LINK}" 2>/dev/null && chmod +x "${CLI_LINK}" 2>/dev/null || true
   fi
+}
+
+
+# ------------------------------------------------------------------------------
+#  Multi-Layer Tunnels & Auto-Test
+# ------------------------------------------------------------------------------
+# ---- Multi-layer constants ----
+readonly LAYER_HOME="${PHORMAL_HOME}"
+readonly LAYER_PROBE_TAG="phormal-probe"
+readonly LAYER_PROBE_PORT_BASE=59000
+readonly ICMP_TUN_RELEASE_REPO="Azumi67/icmp_tun"
+readonly UDP2RAW_RELEASE_TAG="20230206.0"
+readonly UDP2RAW_RELEASE_REPO="wangyu-/udp2raw"
+readonly IODINE_SRC_REPO="yarrick/iodine"
+readonly PROXYFWD_REPO="Azumi67/proxyforwarder"
+readonly LAYER_BACKHAUL_BIN="/usr/local/bin/phormal-backhaul"
+readonly LAYER_ICMP_BIN="/usr/local/bin/phormal-icmp-tun"
+readonly LAYER_UDP2RAW_BIN="/usr/local/bin/phormal-udp2raw"
+readonly LAYER_IODINE_BIN="/usr/local/bin/phormal-iodine"
+readonly LAYER_IODINED_BIN="/usr/local/bin/phormal-iodined"
+readonly LAYER_FWD_BIN="/usr/local/bin/phormal-layer-fwd"
+readonly LAYER_RUN="/usr/local/bin/phormal-layer-run"
+readonly LAYER_GRE_RUN="/usr/local/bin/phormal-gre-run"
+readonly LAYER_KEYS=(gre icmp udp2raw btcp bwss dns fwd)
+
+layer_idir() { printf '%s/%s/%s' "${LAYER_HOME}" "$1" "$2"; }
+layer_svc()  { printf 'phormal-%s@%s.service' "$1" "$2"; }
+
+layer_meta_file() { printf '%s/meta.conf' "$(layer_idir "$1" "$2")"; }
+
+layer_meta_get() {
+  local key="$1" name="$2" k="$3" f
+  f="$(layer_meta_file "${key}" "${name}")"
+  [[ -f "${f}" ]] || return 1
+  grep -m1 "^${k}=" "${f}" 2>/dev/null | cut -d= -f2- | tr -d '\r'
+}
+
+layer_meta_set() {
+  local key="$1" name="$2" k="$3" v="$4" f dir
+  dir="$(layer_idir "${key}" "${name}")"
+  mkdir -p "${dir}"
+  f="$(layer_meta_file "${key}" "${name}")"
+  touch "${f}"
+  if grep -q "^${k}=" "${f}" 2>/dev/null; then
+    sed -i "s|^${k}=.*|${k}=${v}|" "${f}"
+  else
+    printf '%s=%s\n' "${k}" "${v}" >>"${f}"
+  fi
+}
+
+layer_instances() {
+  local key="$1" d
+  d="${LAYER_HOME}/${key}"
+  [[ -d "${d}" ]] || return 0
+  find "${d}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
+    | sort -u
+}
+
+layer_pick_name() {
+  local key="$1" raw name
+  raw="$(ask "Tunnel name for ${key} (e.g. ir1, khr-de)")"
+  name="$(relay_sanitize_name "${raw}")"
+  if [[ -f "$(layer_meta_file "${key}" "${name}")" ]]; then
+    warn "Tunnel '${name}' already exists for ${key}." >&2
+    printf '%s' ""
+    return 1
+  fi
+  printf '%s' "${name}"
+}
+
+layer_svc_state() {
+  local svc="$1"
+  systemctl is-active "${svc}" 2>/dev/null || printf 'inactive'
+}
+
+# ---- Mirror URL helpers ----
+mirror_layer_url() {
+  local file="$1" base
+  base="$(mirror_base)"
+  [[ -n "${base}" ]] || return 1
+  printf '%s/%s' "${base%/}" "${file}"
+}
+
+mirror_backhaul_url() {
+  local arch="$1"
+  mirror_layer_url "backhaul-linux-${arch}"
+}
+
+mirror_icmp_tun_url() {
+  local arch="$1"
+  mirror_layer_url "icmp_tun-linux-${arch}"
+}
+
+mirror_udp2raw_url() {
+  local arch="$1"
+  mirror_layer_url "udp2raw-linux-${arch}"
+}
+
+mirror_iodine_url() {
+  local arch="$1"
+  mirror_layer_url "iodine-linux-${arch}"
+}
+
+mirror_iodined_url() {
+  local arch="$1"
+  mirror_layer_url "iodined-linux-${arch}"
+}
+
+mirror_proxyfwd_url() {
+  local arch="$1"
+  mirror_layer_url "proxyforwarder-linux-${arch}"
+}
+
+backhaul_layer_tgz_url() {
+  local arch="$1"
+  printf 'https://github.com/%s/releases/download/%s/backhaul_linux_%s.tar.gz' \
+    "${BACKHAUL_RELEASE_REPO}" "${BACKHAUL_RELEASE_TAG}" "${arch}"
+}
+
+udp2raw_upstream_tgz_url() {
+  printf 'https://github.com/%s/releases/download/%s/udp2raw_binaries.tar.gz' \
+    "${UDP2RAW_RELEASE_REPO}" "${UDP2RAW_RELEASE_TAG}"
+}
+
+verify_backhaul_layer_tmp() { verify_spoof_tmp "$1"; }
+verify_icmp_tun_tmp() {
+  local b="$1" out
+  [[ -x "${b}" ]] || return 1
+  out="$("${b}" --help 2>&1 || true)"
+  [[ "${out}" == *"icmp_tun"* || "${out}" == *"--mode"* || "${out}" == *"TUN"* ]]
+}
+verify_udp2raw_tmp() {
+  local b="$1" out
+  [[ -x "${b}" ]] || return 1
+  out="$("${b}" --help 2>&1 || "${b}" -h 2>&1 || true)"
+  [[ "${out}" == *"raw-mode"* || "${out}" == *"faketcp"* ]]
+}
+verify_iodine_tmp() {
+  [[ -x "$1" ]] && "$1" -v >/dev/null 2>&1
+}
+verify_proxyfwd_tmp() {
+  [[ -x "$1" ]] && "$1" --help >/dev/null 2>&1
+}
+
+install_layer_backhaul() {
+  local arch urls=() dest="${LAYER_BACKHAUL_BIN}" mirror manual
+  arch="$(machine_arch)" || return 1
+  [[ -x "${dest}" ]] && verify_backhaul_layer_tmp "${dest}" && return 0
+  choose_binary_source || true
+  if [[ "${BINARY_SOURCE}" == "manual" ]]; then
+    manual="${MANUAL_DIR}/backhaul-linux-${arch}"
+    [[ -f "${manual}" ]] || manual="${MANUAL_DIR}/phormal-spoof-linux-${arch}"
+    [[ -f "${manual}" ]] || { fail "Place backhaul at ${MANUAL_DIR}/backhaul-linux-${arch}"; return 1; }
+    cp -f "${manual}" "${dest}" && chmod +x "${dest}"
+    verify_backhaul_layer_tmp "${dest}" && { good "Backhaul engine installed (manual)."; return 0; }
+    return 1
+  fi
+  if [[ "${BINARY_SOURCE}" == "mirror" ]]; then
+    mirror="$(mirror_backhaul_url "${arch}" 2>/dev/null || true)"
+    [[ -n "${mirror}" ]] && urls+=("${mirror}")
+    mirror="$(mirror_spoof_url "${arch}" 2>/dev/null || true)"
+    [[ -n "${mirror}" ]] && urls+=("${mirror}")
+  fi
+  urls+=("$(backhaul_layer_tgz_url "${arch}")")
+  local tmp tgz td
+  for mirror in "${urls[@]}"; do
+    [[ -z "${mirror}" ]] && continue
+    if [[ "${mirror}" == *".tar.gz" ]]; then
+      tgz="$(mktemp)"; td="$(mktemp -d)"
+      if fetch_url "${mirror}" "${tgz}"; then
+        tar xzf "${tgz}" -C "${td}" 2>/dev/null || true
+        if [[ -f "${td}/backhaul" ]]; then
+          cp -f "${td}/backhaul" "${dest}"
+        else
+          local found
+          found="$(find "${td}" -maxdepth 2 -name backhaul -type f 2>/dev/null | head -n1)"
+          [[ -n "${found}" ]] && cp -f "${found}" "${dest}"
+        fi
+        rm -rf "${td}" "${tgz}"
+        chmod +x "${dest}" 2>/dev/null || true
+        if verify_backhaul_layer_tmp "${dest}"; then
+          good "Backhaul engine installed."
+          return 0
+        fi
+      fi
+      rm -rf "${td}" "${tgz}" 2>/dev/null || true
+    else
+      fetch_binary "${dest}" verify_backhaul_layer_tmp "Backhaul" "${mirror}" && return 0
+    fi
+  done
+  install_local_binary "${dest}" || return 1
+  verify_backhaul_layer_tmp "${dest}"
+}
+
+install_layer_icmp_tun() {
+  local arch dest="${LAYER_ICMP_BIN}" mirror manual
+  arch="$(machine_arch)" || return 1
+  [[ -x "${dest}" ]] && verify_icmp_tun_tmp "${dest}" && return 0
+  choose_binary_source || true
+  if [[ "${BINARY_SOURCE}" == "manual" ]]; then
+    manual="${MANUAL_DIR}/icmp_tun-linux-${arch}"
+    [[ -f "${manual}" ]] || { fail "Place binary at ${manual}"; return 1; }
+    cp -f "${manual}" "${dest}" && chmod +x "${dest}"
+    verify_icmp_tun_tmp "${dest}" && { good "icmp_tun installed (manual)."; return 0; }
+    return 1
+  fi
+  local urls=()
+  [[ "${BINARY_SOURCE}" == "mirror" ]] && urls+=("$(mirror_icmp_tun_url "${arch}" 2>/dev/null || true)")
+  fetch_binary "${dest}" verify_icmp_tun_tmp "icmp_tun" "${urls[@]}" \
+    || install_local_binary "${dest}" || return 1
+  verify_icmp_tun_tmp "${dest}"
+}
+
+install_layer_udp2raw() {
+  local arch dest="${LAYER_UDP2RAW_BIN}" mirror manual tgz td found
+  arch="$(machine_arch)" || return 1
+  [[ -x "${dest}" ]] && verify_udp2raw_tmp "${dest}" && return 0
+  choose_binary_source || true
+  if [[ "${BINARY_SOURCE}" == "manual" ]]; then
+    manual="${MANUAL_DIR}/udp2raw-linux-${arch}"
+    [[ -f "${manual}" ]] || { fail "Place binary at ${manual}"; return 1; }
+    cp -f "${manual}" "${dest}" && chmod +x "${dest}"
+    verify_udp2raw_tmp "${dest}" && { good "udp2raw installed (manual)."; return 0; }
+    return 1
+  fi
+  local urls=()
+  [[ "${BINARY_SOURCE}" == "mirror" ]] && urls+=("$(mirror_udp2raw_url "${arch}" 2>/dev/null || true)")
+  for mirror in "${urls[@]}"; do
+    [[ -n "${mirror}" ]] && fetch_binary "${dest}" verify_udp2raw_tmp "udp2raw" "${mirror}" && return 0
+  done
+  tgz="$(mktemp)"; td="$(mktemp -d)"
+  if fetch_url "$(udp2raw_upstream_tgz_url)" "${tgz}"; then
+    tar xzf "${tgz}" -C "${td}" 2>/dev/null || true
+    for found in "${td}/udp2raw_${arch}" "${td}/udp2raw_${arch//amd64/amd64}" \
+      "${td}/udp2raw_amd64" "${td}/udp2raw_arm" "${td}/udp2raw_aarch64"; do
+      [[ -f "${found}" ]] && cp -f "${found}" "${dest}" && break
+    done
+    [[ ! -f "${dest}" ]] && found="$(find "${td}" -name 'udp2raw*' -type f 2>/dev/null | head -n1)" \
+      && [[ -n "${found}" ]] && cp -f "${found}" "${dest}"
+    rm -rf "${td}" "${tgz}"
+    chmod +x "${dest}" 2>/dev/null || true
+    verify_udp2raw_tmp "${dest}" && { good "udp2raw installed."; return 0; }
+  fi
+  install_local_binary "${dest}" || return 1
+  verify_udp2raw_tmp "${dest}"
+}
+
+install_layer_iodine_pair() {
+  local arch destc="${LAYER_IODINE_BIN}" dests="${LAYER_IODINED_BIN}" mirror
+  arch="$(machine_arch)" || return 1
+  if [[ -x "${destc}" && -x "${dests}" ]] && verify_iodine_tmp "${destc}" && verify_iodine_tmp "${dests}"; then
+    return 0
+  fi
+  choose_binary_source || true
+  local urls_c=() urls_s=()
+  if [[ "${BINARY_SOURCE}" == "mirror" ]]; then
+    urls_c+=("$(mirror_iodine_url "${arch}" 2>/dev/null || true)")
+    urls_s+=("$(mirror_iodined_url "${arch}" 2>/dev/null || true)")
+  fi
+  fetch_binary "${destc}" verify_iodine_tmp "iodine" "${urls_c[@]}" || install_local_binary "${destc}" || return 1
+  fetch_binary "${dests}" verify_iodine_tmp "iodined" "${urls_s[@]}" || install_local_binary "${dests}" || return 1
+  good "iodine + iodined installed."
+}
+
+install_layer_proxyfwd() {
+  local arch dest="${LAYER_FWD_BIN}" mirror
+  arch="$(machine_arch)" || return 1
+  [[ -x "${dest}" ]] && verify_proxyfwd_tmp "${dest}" && return 0
+  choose_binary_source || true
+  local urls=()
+  [[ "${BINARY_SOURCE}" == "mirror" ]] && urls+=("$(mirror_proxyfwd_url "${arch}" 2>/dev/null || true)")
+  fetch_binary "${dest}" verify_proxyfwd_tmp "proxyforwarder" "${urls[@]}" \
+    || install_local_binary "${dest}" || return 1
+  verify_proxyfwd_tmp "${dest}"
+}
+
+layer_install_runtime() {
+  cat > "${LAYER_RUN}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+key="$1"; name="$2"
+dir="/etc/phormal/${key}/${name}"
+meta="${dir}/meta.conf"
+[[ -f "${meta}" ]] || { echo "missing ${meta}" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "${meta}"
+case "${key}" in
+  btcp|bwss)
+    exec /usr/local/bin/phormal-backhaul -c "${dir}/config.toml"
+    ;;
+  icmp)
+    # shellcheck disable=SC2086
+    exec /usr/local/bin/phormal-icmp-tun ${ICMP_ARGS:-}
+    ;;
+  udp2raw)
+    # shellcheck disable=SC2086
+    exec /usr/local/bin/phormal-udp2raw ${UDP2RAW_ARGS:-}
+    ;;
+  dns)
+    if [[ "${ROLE}" == "entry" ]]; then
+      # shellcheck disable=SC2086
+      exec /usr/local/bin/phormal-iodined -f ${IODINED_ARGS:-}
+    else
+      # shellcheck disable=SC2086
+      exec /usr/local/bin/phormal-iodine -f ${IODINE_ARGS:-}
+    fi
+    ;;
+  fwd)
+    # shellcheck disable=SC2086
+    exec /usr/local/bin/phormal-layer-fwd ${FWD_ARGS:-}
+    ;;
+  *)
+    echo "unknown layer ${key}" >&2; exit 1
+    ;;
+esac
+EOF
+  chmod +x "${LAYER_RUN}"
+
+  cat > "${LAYER_GRE_RUN}" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+name="$1"
+dir="/etc/phormal/gre/${name}"
+meta="${dir}/meta.conf"
+[[ -f "${meta}" ]] || { echo "missing meta" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "${meta}"
+IFACE="${IFACE:-phgre${name}}"
+ip link del "${IFACE}" 2>/dev/null || true
+case "${TUN_MODE}" in
+  gre) ip tunnel add "${IFACE}" mode gre remote "${REMOTE_V4}" local "${LOCAL_V4}" ttl 255 ;;
+  ipip) ip tunnel add "${IFACE}" mode ipip remote "${REMOTE_V4}" local "${LOCAL_V4}" ttl 255 ;;
+  *) echo "bad TUN_MODE" >&2; exit 1 ;;
+esac
+ip link set "${IFACE}" up
+ip addr add "${LOCAL_PRIV}/30" dev "${IFACE}"
+ip route add "${REMOTE_PRIV}/32" dev "${IFACE}" 2>/dev/null || true
+exec sleep infinity
+EOF
+  chmod +x "${LAYER_GRE_RUN}"
+
+  cat > /etc/systemd/system/phormal-gre@.service <<EOF
+[Unit]
+Description=Phormal GRE/IPIP layer (%i)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStart=${LAYER_GRE_RUN} %i
+Restart=always
+RestartSec=3
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+[Install]
+WantedBy=multi-user.target
+EOF
+  local key
+  for key in icmp udp2raw btcp bwss dns fwd; do
+    cat > "/etc/systemd/system/phormal-${key}@.service" <<EOF
+[Unit]
+Description=Phormal layer ${key} (%i)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 2
+ExecStart=${LAYER_RUN} ${key} %i
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+[Install]
+WantedBy=multi-user.target
+EOF
+  done
+  systemctl daemon-reload
+}
+
+layer_write_backhaul_entry() {
+  local key="$1" name="$2" transport dir token link_port ports
+  dir="$(layer_idir "${key}" "${name}")"
+  token="$(layer_meta_get "${key}" "${name}" TOKEN)"
+  link_port="$(layer_meta_get "${key}" "${name}" LINK_PORT)"
+  ports="$(layer_meta_get "${key}" "${name}" PORTS)"
+  {
+    echo '[server]'
+    echo "bind_addr = \"0.0.0.0:${link_port}\""
+    echo "transport = \"${transport}\""
+    echo "token = \"${token}\""
+    echo 'heartbeat = 40'
+    echo 'channel_size = 2048'
+    echo 'accept_udp = true'
+    if [[ -n "${ports}" ]]; then
+      spoof_write_ports_block "${ports}"
+    fi
+  } > "${dir}/config.toml"
+}
+
+layer_write_backhaul_exit() {
+  local key="$1" name="$2" transport dir token link_port remote
+  dir="$(layer_idir "${key}" "${name}")"
+  token="$(layer_meta_get "${key}" "${name}" TOKEN)"
+  link_port="$(layer_meta_get "${key}" "${name}" LINK_PORT)"
+  remote="$(layer_meta_get "${key}" "${name}" REMOTE_V4)"
+  {
+    echo '[client]'
+    echo "remote_addr = \"${remote}:${link_port}\""
+    echo "transport = \"${transport}\""
+    echo "token = \"${token}\""
+    echo 'heartbeat = 40'
+    echo 'connection_pool = 8'
+  } > "${dir}/config.toml"
+}
+
+layer_start_instance() {
+  local key="$1" name="$2" svc
+  svc="$(layer_svc "${key}" "${name}")"
+  systemctl daemon-reload
+  systemctl enable "${svc}" >/dev/null 2>&1
+  systemctl restart "${svc}"
+  sleep 2
+  if systemctl is-active "${svc}" >/dev/null 2>&1; then
+    good "Layer tunnel '${key}/${name}' is active."
+    return 0
+  fi
+  fail "Layer tunnel '${key}/${name}' failed to start."
+  journalctl -u "${svc}" -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+  return 1
+}
+
+layer_print_connect_line() {
+  local key="$1" name="$2" role ports link self_ip
+  role="$(layer_meta_get "${key}" "${name}" ROLE)"
+  ports="$(layer_meta_get "${key}" "${name}" PORTS)"
+  link="$(layer_meta_get "${key}" "${name}" LINK_PORT)"
+  self_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  if [[ "${role}" == "entry" && -n "${ports}" ]]; then
+    good "Point users at ${self_ip:-THIS_SERVER} on port(s): ${ports}"
+  elif [[ "${role}" == "entry" && -n "${link}" ]]; then
+    good "Entry listening on :${link} — publish panel ports on this Iran node."
+  fi
+}
+
+create_layer_gre_entry() {
+  local name local_v4 remote_v4 mode local_priv remote_priv iface
+  name="$(layer_pick_name gre)" || return 1
+  mkdir -p "$(layer_idir gre "${name}")"
+  layer_meta_set gre "${name}" ROLE entry
+  mode="$(ask 'Tunnel mode [gre/ipip]')"; mode="${mode:-gre}"
+  layer_meta_set gre "${name}" TUN_MODE "${mode}"
+  local_v4="$(ask 'This server public IPv4')"
+  remote_v4="$(ask 'Peer public IPv4')"
+  valid_ipv4 "${local_v4}" && valid_ipv4 "${remote_v4}" || return 1
+  layer_meta_set gre "${name}" LOCAL_V4 "${local_v4}"
+  layer_meta_set gre "${name}" REMOTE_V4 "${remote_v4}"
+  local_priv="$(ask 'Local private /30 IP [10.77.0.1]')"; local_priv="${local_priv:-10.77.0.1}"
+  remote_priv="$(ask 'Remote private /30 IP [10.77.0.2]')"; remote_priv="${remote_priv:-10.77.0.2}"
+  layer_meta_set gre "${name}" LOCAL_PRIV "${local_priv}"
+  layer_meta_set gre "${name}" REMOTE_PRIV "${remote_priv}"
+  iface="phgre${name}"
+  layer_meta_set gre "${name}" IFACE "${iface}"
+  layer_install_runtime
+  layer_start_instance gre "${name}"
+}
+
+create_layer_gre_exit() {
+  create_layer_gre_entry
+}
+
+create_layer_backhaul_entry() {
+  local key="$1" transport name token link_port ports sug
+  name="$(layer_pick_name "${key}")" || return 1
+  install_layer_backhaul || return 1
+  layer_install_runtime
+  mkdir -p "$(layer_idir "${key}" "${name}")"
+  layer_meta_set "${key}" "${name}" ROLE entry
+  link_port="$(ask 'Link port [3080]')"; link_port="${link_port:-3080}"
+  layer_meta_set "${key}" "${name}" LINK_PORT "${link_port}"
+  sug="$(rand_secret)"
+  token="$(ask "Token [${sug}]")"; token="${token:-${sug}}"
+  layer_meta_set "${key}" "${name}" TOKEN "${token}"
+  ports="$(gather_ports)" || return 1
+  layer_meta_set "${key}" "${name}" PORTS "${ports}"
+  layer_write_backhaul_entry "${key}" "${name}" "${transport}"
+  layer_start_instance "${key}" "${name}"
+  layer_print_connect_line "${key}" "${name}"
+}
+
+create_layer_backhaul_exit() {
+  local key="$1" transport name remote token link_port ports local_host
+  name="$(layer_pick_name "${key}")" || return 1
+  install_layer_backhaul || return 1
+  layer_install_runtime
+  mkdir -p "$(layer_idir "${key}" "${name}")"
+  layer_meta_set "${key}" "${name}" ROLE exit
+  remote="$(ask 'Iran entry public IPv4')"; valid_ipv4 "${remote}" || return 1
+  layer_meta_set "${key}" "${name}" REMOTE_V4 "${remote}"
+  link_port="$(ask 'Link port (match entry) [3080]')"; link_port="${link_port:-3080}"
+  layer_meta_set "${key}" "${name}" LINK_PORT "${link_port}"
+  token="$(ask 'Token (match entry)')"; [[ -n "${token}" ]] || return 1
+  layer_meta_set "${key}" "${name}" TOKEN "${token}"
+  ports="$(gather_ports)" || return 1
+  layer_meta_set "${key}" "${name}" PORTS "${ports}"
+  local_host="$(ask 'Local upstream host [127.0.0.1]')"; local_host="${local_host:-127.0.0.1}"
+  layer_meta_set "${key}" "${name}" LOCAL_HOST "${local_host}"
+  layer_write_backhaul_exit "${key}" "${name}" "${transport}"
+  layer_start_instance "${key}" "${name}"
+  good "Exit ${key}/${name} dials ${remote}:${link_port}"
+}
+
+create_layer_icmp_entry() {
+  local name local_v4 remote_v4 local_priv remote_priv tid args
+  install_layer_icmp_tun || return 1
+  layer_install_runtime
+  name="$(layer_pick_name icmp)" || return 1
+  mkdir -p "$(layer_idir icmp "${name}")"
+  layer_meta_set icmp "${name}" ROLE entry
+  local_v4="$(ask 'This server public IPv4')"
+  remote_v4="$(ask 'Peer public IPv4')"
+  valid_ipv4 "${local_v4}" && valid_ipv4 "${remote_v4}" || return 1
+  local_priv="$(ask 'Local TUN IP [10.88.0.1]')"; local_priv="${local_priv:-10.88.0.1}"
+  remote_priv="$(ask 'Remote TUN IP [10.88.0.2]')"; remote_priv="${remote_priv:-10.88.0.2}"
+  tid="$(ask 'Tunnel ICMP id hex [0x7048]')"; tid="${tid:-0x7048}"
+  args="--mode server --id ${tid} --burst 4 --pack 1 tun${name} ${local_v4} ${remote_v4} ${local_priv} ${remote_priv}"
+  layer_meta_set icmp "${name}" ICMP_ARGS "${args}"
+  layer_start_instance icmp "${name}"
+}
+
+create_layer_icmp_exit() {
+  local name local_v4 remote_v4 local_priv remote_priv tid args
+  install_layer_icmp_tun || return 1
+  layer_install_runtime
+  name="$(layer_pick_name icmp)" || return 1
+  mkdir -p "$(layer_idir icmp "${name}")"
+  layer_meta_set icmp "${name}" ROLE exit
+  local_v4="$(ask 'This server public IPv4')"
+  remote_v4="$(ask 'Iran entry public IPv4')"
+  valid_ipv4 "${local_v4}" && valid_ipv4 "${remote_v4}" || return 1
+  local_priv="$(ask 'Local TUN IP [10.88.0.2]')"; local_priv="${local_priv:-10.88.0.2}"
+  remote_priv="$(ask 'Remote TUN IP [10.88.0.1]')"; remote_priv="${remote_priv:-10.88.0.1}"
+  tid="$(ask 'Tunnel ICMP id hex (match entry) [0x7048]')"; tid="${tid:-0x7048}"
+  args="--mode client --id ${tid} --poll-ms 8 --pack 1 tun${name} ${local_v4} ${remote_v4} ${local_priv} ${remote_priv}"
+  layer_meta_set icmp "${name}" ICMP_ARGS "${args}"
+  layer_start_instance icmp "${name}"
+}
+
+create_layer_udp2raw_exit() {
+  local name remote listen relay key mode args
+  install_layer_udp2raw || return 1
+  layer_install_runtime
+  name="$(layer_pick_name udp2raw)" || return 1
+  mkdir -p "$(layer_idir udp2raw "${name}")"
+  layer_meta_set udp2raw "${name}" ROLE exit
+  remote="$(ask 'Iran server IPv4')"; valid_ipv4 "${remote}" || return 1
+  listen="$(ask 'udp2raw listen port on Iran [4096]')"; listen="${listen:-4096}"
+  relay="$(ask 'Local UDP service port to tunnel [51820]')"; relay="${relay:-51820}"
+  key="$(ask 'udp2raw key [phormal]')"; key="${key:-phormal}"
+  mode="$(ask 'raw-mode [faketcp/icmp/udp]')"; mode="${mode:-faketcp}"
+  args="-c -l0.0.0.0:${relay} -r${remote}:${listen} -k ${key} --raw-mode ${mode} -a"
+  layer_meta_set udp2raw "${name}" UDP2RAW_ARGS "${args}"
+  layer_start_instance udp2raw "${name}"
+}
+
+create_layer_udp2raw_entry() {
+  local name listen relay key mode args
+  install_layer_udp2raw || return 1
+  layer_install_runtime
+  name="$(layer_pick_name udp2raw)" || return 1
+  mkdir -p "$(layer_idir udp2raw "${name}")"
+  layer_meta_set udp2raw "${name}" ROLE entry
+  listen="$(ask 'udp2raw listen port [4096]')"; listen="${listen:-4096}"
+  relay="$(ask 'Forward to local UDP port [51820]')"; relay="${relay:-51820}"
+  key="$(ask 'udp2raw key [phormal]')"; key="${key:-phormal}"
+  mode="$(ask 'raw-mode [faketcp/icmp/udp]')"; mode="${mode:-faketcp}"
+  args="-s -l0.0.0.0:${listen} -r127.0.0.1:${relay} -k ${key} --raw-mode ${mode} -a"
+  layer_meta_set udp2raw "${name}" UDP2RAW_ARGS "${args}"
+  layer_start_instance udp2raw "${name}"
+}
+
+layer_delete_instance() {
+  local key="$1" name="$2" svc iface
+  svc="$(layer_svc "${key}" "${name}")"
+  systemctl stop "${svc}" 2>/dev/null || true
+  systemctl disable "${svc}" 2>/dev/null || true
+  if [[ "${key}" == gre ]]; then
+    iface="$(layer_meta_get gre "${name}" IFACE 2>/dev/null || true)"
+    [[ -n "${iface}" ]] && ip link del "${iface}" 2>/dev/null || true
+  fi
+  rm -rf "$(layer_idir "${key}" "${name}")"
+  good "Deleted ${key}/${name}."
+}
+
+manage_layer_instance_menu() {
+  local key="$1" name="$2" c svc
+  svc="$(layer_svc "${key}" "${name}")"
+  while :; do
+    banner
+    rule
+    info "Layer ${key} / ${name}  [$(layer_svc_state "${svc}")]"
+    rule
+    printf '    %s1%s  Start/restart\n' "${ACC}" "${RST}"
+    printf '    %s2%s  Stop\n' "${ACC}" "${RST}"
+    printf '    %s3%s  Logs\n' "${ACC}" "${RST}"
+    printf '    %s4%s  Delete\n' "${ACC}" "${RST}"
+    printf '    %s0%s  Back\n\n' "${ACC}" "${RST}"
+    c="$(ask 'Select')"; echo
+    case "${c}" in
+      1) layer_start_instance "${key}" "${name}" || true ;;
+      2) systemctl stop "${svc}" && good "Stopped." ;;
+      3) journalctl -u "${svc}" -n 40 --no-pager ;;
+      4) layer_delete_instance "${key}" "${name}"; break ;;
+      0) break ;;
+    esac
+    echo; read -n1 -s -r -p "  ${MUT}Press any key…${RST}"; echo
+  done
+}
+
+manage_layer_menu() {
+  local c key name n
+  while :; do
+    banner
+    rule
+    info "Multi-layer tunnels"
+    rule
+    for key in "${LAYER_KEYS[@]}"; do
+      while read -r n; do
+        [[ -n "${n}" ]] || continue
+        printf '    %-10s %-16s %s\n' "${key}" "${n}" "$(layer_svc_state "$(layer_svc "${key}" "${n}")")"
+      done < <(layer_instances "${key}")
+    done
+    printf '\n    %s1%s  Pick instance to manage\n' "${ACC}" "${RST}"
+    printf '    %s0%s  Back\n\n' "${ACC}" "${RST}"
+    c="$(ask 'Select')"; echo
+    [[ "${c}" == "0" ]] && break
+    [[ "${c}" != "1" ]] && continue
+    key="$(ask 'Layer key (gre|icmp|udp2raw|btcp|bwss|dns|fwd)')"
+    name="$(ask 'Instance name')"
+    [[ -f "$(layer_meta_file "${key}" "${name}")" ]] || { fail "Not found."; continue; }
+    manage_layer_instance_menu "${key}" "${name}"
+  done
+}
+
+layer_add_menu() {
+  local c
+  banner
+  rule
+  info "Add layer tunnel (pick engine)"
+  rule
+  printf '    %s1%s  GRE/IPIP (kernel)\n' "${ACC}" "${RST}"
+  printf '    %s2%s  ICMP (icmp_tun)\n' "${ACC}" "${RST}"
+  printf '    %s3%s  UDP raw (udp2raw)\n' "${ACC}" "${RST}"
+  printf '    %s4%s  TCP (Backhaul btcp)\n' "${ACC}" "${RST}"
+  printf '    %s5%s  TLS/WS (Backhaul bwss)\n' "${ACC}" "${RST}"
+  printf '    %s6%s  DNS (iodine)\n' "${ACC}" "${RST}"
+  printf '    %s0%s  Cancel\n\n' "${ACC}" "${RST}"
+  c="$(ask 'Select')"; echo
+  local role; role="$(ask 'Role [entry/exit]')"; role="${role:-entry}"
+  case "${c}" in
+    1) [[ "${role}" == entry ]] && create_layer_gre_entry || create_layer_gre_exit ;;
+    2) [[ "${role}" == entry ]] && create_layer_icmp_entry || create_layer_icmp_exit ;;
+    3) [[ "${role}" == entry ]] && create_layer_udp2raw_entry || create_layer_udp2raw_exit ;;
+    4) [[ "${role}" == entry ]] && create_layer_backhaul_entry btcp tcp || create_layer_backhaul_exit btcp tcp ;;
+    5) [[ "${role}" == entry ]] && create_layer_backhaul_entry bwss wss || create_layer_backhaul_exit bwss wss ;;
+    6) warn "DNS layer wizard: install iodine pair on both nodes, delegate NS subdomain." ;;
+    0) return 0 ;;
+    *) fail "Invalid." ;;
+  esac
+}
+
+# ---- Auto-test helpers ----
+layer_probe_port_free() {
+  local p="$1"
+  if ss -lun "sport = :${p}" 2>/dev/null | grep -q ":${p}"; then return 1; fi
+  if ss -lnt "sport = :${p}" 2>/dev/null | grep -q ":${p}"; then return 1; fi
+  return 0
+}
+
+layer_pick_probe_port() {
+  local p=$((LAYER_PROBE_PORT_BASE + RANDOM % 2000))
+  local i=0
+  while ! layer_probe_port_free "${p}"; do
+    p=$((p + 1)); i=$((i + 1))
+    [[ ${i} -lt 50 ]] || return 1
+  done
+  printf '%s' "${p}"
+}
+
+layer_ssh_cmd() {
+  local host="$1" port="$2" user="$3" cmd="$4"
+  ssh -o BatchMode=yes -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new \
+    -p "${port}" "${user}@${host}" "${cmd}"
+}
+
+layer_probe_py() {
+  cat <<'PY'
+import socket, struct, sys, time, os, subprocess, json
+
+def csum(d):
+    if len(d) % 2: d += b'\x00'
+    s = sum(struct.unpack('!%dH' % (len(d) // 2), d))
+    while s >> 16: s = (s & 0xffff) + (s >> 16)
+    return ~s & 0xffff
+
+def udp_probe(bind_port, peer_ip, peer_port, size, count=8, timeout=8):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(('0.0.0.0', bind_port))
+    s.settimeout(0.4)
+    sent = recv = 0
+    tag = os.urandom(4)
+    for i in range(count):
+        payload = tag + struct.pack('!HH', size, i) + b'P' * max(0, size - 8)
+        try:
+            s.sendto(payload[:size], (peer_ip, peer_port))
+            sent += 1
+        except OSError:
+            pass
+        t0 = time.time()
+        while time.time() - t0 < timeout / count:
+            try:
+                data, _ = s.recvfrom(2048)
+                if data.startswith(tag):
+                    recv += 1
+                    break
+            except socket.timeout:
+                break
+    s.close()
+    return sent, recv
+
+def icmp_probe(src, dst, count=6):
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    sent = 0
+    for seq in range(count):
+        icmp = struct.pack('!BBHHH', 8, 0, 0, seq, 0x7048)
+        c = csum(icmp); icmp = struct.pack('!BBHHH', 8, 0, c, seq, 0x7048)
+        ip = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(icmp), 0x4242, 0, 64, 1, 0,
+                         socket.inet_aton(src), socket.inet_aton(dst))
+        c = csum(ip); ip = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(icmp), 0x4242, 0, 64, 1, c,
+                                       socket.inet_aton(src), socket.inet_aton(dst))
+        try:
+            s.sendto(ip + icmp, (dst, 0)); sent += 1
+        except OSError:
+            pass
+        time.sleep(0.15)
+    s.close()
+    return sent
+
+if __name__ == '__main__':
+    cmd = sys.argv[1]
+    if cmd == 'udp':
+        print(json.dumps(dict(zip(('sent','recv'), udp_probe(int(sys.argv[2]), sys.argv[3], int(sys.argv[4]), int(sys.argv[5]))))))
+    elif cmd == 'icmp_send':
+        print(icmp_probe(sys.argv[2], sys.argv[3]))
+    elif cmd == 'tcp_echo':
+        # server or client handled externally
+        pass
+PY
+}
+
+layer_autotest_record() {
+  LAYER_TEST_ROWS+=("$1|$2|$3|$4")
+}
+
+layer_autotest_print_table() {
+  local row
+  rule
+  printf '  %-28s %-10s %-10s %s\n' "LAYER / TUNNEL" "RESULT" "CONFIDENCE" "NOTE"
+  rule
+  for row in "${LAYER_TEST_ROWS[@]}"; do
+    IFS='|' read -r a b c d <<<"${row}"
+    printf '  %-28s %-10s %-10s %s\n' "${a}" "${b}" "${c}" "${d}"
+  done
+  rule
+}
+
+layer_test_kernel_pair() {
+  local mode="$1" label="$2" local_v4="$3" remote_v4="$4" ssh_host ssh_port ssh_user
+  local iface="phprb$$" lip rip lpriv rpriv ok=FAIL conf=high note=""
+  ssh_host="$5"; ssh_port="$6"; ssh_user="$7"
+  lip="${local_v4}"; rip="${remote_v4}"
+  lpriv="10.99.1.1"; rpriv="10.99.1.2"
+  ip link del "${iface}" 2>/dev/null || true
+  case "${mode}" in
+    sit) ip tunnel add "${iface}" mode sit remote "${rip}" local "${lip}" ttl 64 2>/dev/null || note="local sit add failed" ;;
+    gre) ip tunnel add "${iface}" mode gre remote "${rip}" local "${lip}" ttl 64 2>/dev/null || note="local gre add failed" ;;
+    ipip) ip tunnel add "${iface}" mode ipip remote "${rip}" local "${lip}" ttl 64 2>/dev/null || note="local ipip add failed" ;;
+  esac
+  if [[ -z "${note}" ]]; then
+    ip link set "${iface}" up 2>/dev/null || true
+    ip addr add "${lpriv}/30" dev "${iface}" 2>/dev/null || true
+    layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "ip link del ${iface} 2>/dev/null; ip tunnel add ${iface} mode ${mode} remote ${lip} local ${rip} ttl 64 && ip link set ${iface} up && ip addr add ${rpriv}/30 dev ${iface}" \
+      2>/dev/null || note="remote tunnel failed"
+  fi
+  if [[ -z "${note}" ]]; then
+    if ping -c 3 -W 2 -I "${iface}" "${rpriv}" >/dev/null 2>&1 \
+      && layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+        "ping -c 3 -W 2 -I ${iface} ${lpriv}" >/dev/null 2>&1; then
+      ok=PASS
+      note="bidirectional ping on ${mode}"
+    else
+      note="no bidirectional ping"
+    fi
+  fi
+  ip link del "${iface}" 2>/dev/null || true
+  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "ip link del ${iface} 2>/dev/null" || true
+  layer_autotest_record "${label}" "${ok}" "${conf}" "${note}"
+}
+
+layer_write_probe_py() {
+  local dest="$1"
+  layer_probe_py >"${dest}"
+  chmod 755 "${dest}"
+}
+
+layer_test_udp_sizes() {
+  local peer="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4" size="$5" label="$6"
+  local port listen res ok=FAIL conf=high note="" probe="/tmp/phormal-probe-$$.py" rjson="/tmp/phormal-probe-remote-$$.json"
+  apt_install_quiet python3 2>/dev/null || true
+  port="$(layer_pick_probe_port)" || { layer_autotest_record "${label}" "inconclusive" "low" "no free port"; return; }
+  listen=$((port + 1))
+  layer_write_probe_py "${probe}"
+  scp -q -P "${ssh_port}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+    "${probe}" "${ssh_user}@${ssh_host}:/tmp/phormal-probe.py" 2>/dev/null || {
+    rm -f "${probe}"; layer_autotest_record "${label}" "inconclusive" "low" "scp failed"; return; }
+  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "timeout 20 python3 /tmp/phormal-probe.py udp ${listen} ${peer} ${port} ${size} >${rjson}" 2>/dev/null &
+  local rid=$!
+  sleep 1
+  res="$(python3 "${probe}" udp "${port}" "${peer}" "${listen}" "${size}" 2>/dev/null || echo '{}')"
+  wait "${rid}" 2>/dev/null || true
+  local sent recv rsent rrecv
+  sent="$(printf '%s' "${res}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sent',0))" 2>/dev/null || echo 0)"
+  recv="$(printf '%s' "${res}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('recv',0))" 2>/dev/null || echo 0)"
+  rsent="$(layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "python3 -c \"import json; print(json.load(open('${rjson}')).get('sent',0))\" 2>/dev/null || echo 0")"
+  rrecv="$(layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "python3 -c \"import json; print(json.load(open('${rjson}')).get('recv',0))\" 2>/dev/null || echo 0")"
+  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "rm -f /tmp/phormal-probe.py ${rjson}" 2>/dev/null || true
+  rm -f "${probe}"
+  if [[ "${sent}" -ge 3 && "${recv}" -ge 1 && "${rsent}" -ge 3 && "${rrecv}" -ge 1 ]]; then
+    ok=PASS; note="A->B ${recv}/${sent} B->A ${rrecv}/${rsent} size=${size}"
+  else
+    note="A->B ${recv}/${sent} B->A ${rrecv}/${rsent} size=${size}"
+    conf=med
+  fi
+  layer_autotest_record "${label}" "${ok}" "${conf}" "${note}"
+}
+
+layer_test_tcp_bidir() {
+  local peer="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4" label="$5"
+  local port ok=FAIL conf=high note="" self_ip
+  self_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  port="$(layer_pick_probe_port)" || { layer_autotest_record "${label}" "inconclusive" "low" "no port"; return; }
+  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "timeout 15 bash -c 'echo OK-PROBE | nc -l -p ${port} -q 1'" 2>/dev/null &
+  sleep 1
+  if echo "PHORMAL-PROBE" | timeout 5 nc -w 3 "${peer}" "${port}" 2>/dev/null | grep -q OK-PROBE; then
+    local port2=$((port + 10))
+    if layer_probe_port_free "${port2}"; then
+      timeout 15 nc -l -p "${port2}" -q 1 >/tmp/phormal-tcp-reply 2>/dev/null &
+      sleep 1
+      if layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+        "echo REV-PROBE | nc -w 3 ${self_ip} ${port2}" 2>/dev/null | grep -q REV-PROBE \
+        || grep -q REV-PROBE /tmp/phormal-tcp-reply 2>/dev/null; then
+        ok=PASS; note="bidirectional nc on :${port}"
+      else
+        note="reverse TCP failed"
+      fi
+      rm -f /tmp/phormal-tcp-reply
+    fi
+  else
+    note="forward TCP failed"
+  fi
+  layer_autotest_record "${label}" "${ok}" "${conf}" "${note}"
+}
+
+layer_autotest_main() {
+  local only="${1:-all}" ssh_host ssh_port ssh_user local_v4 peer_v4
+  LAYER_TEST_ROWS=()
+  rule
+  info "Phormal Multi-Layer Auto-Test"
+  info "Probes real traffic bidirectionally via SSH coordination."
+  rule
+  apt_install_quiet python3 tcpdump iproute2 openssh-client netcat-openbsd 2>/dev/null || true
+  have python3 || { fail "python3 required."; return 1; }
+  local_v4="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  ssh_host="$(ask 'Peer SSH host (IP or hostname)')"
+  ssh_port="$(ask 'Peer SSH port [22]')"; ssh_port="${ssh_port:-22}"
+  ssh_user="$(ask 'Peer SSH user [root]')"; ssh_user="${ssh_user:-root}"
+  peer_v4="${ssh_host}"
+  valid_ipv4 "${peer_v4}" || peer_v4="$(getent ahostsv4 "${ssh_host}" 2>/dev/null | awk '{print $1; exit}')"
+  [[ -n "${peer_v4}" ]] || { fail "Cannot resolve peer."; return 1; }
+  if ! layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "echo PHORMAL-SSH-OK" 2>/dev/null | grep -q OK; then
+    fail "SSH to ${ssh_user}@${ssh_host}:${ssh_port} failed (key auth required)."
+    return 1
+  fi
+  good "SSH link OK."
+  sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
+  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0" >/dev/null 2>&1 || true
+
+  [[ "${only}" == "all" || "${only}" == *sit* ]] && \
+    layer_test_kernel_pair sit "L3 SIT (Bridge)" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+  [[ "${only}" == "all" || "${only}" == *gre* ]] && \
+    layer_test_kernel_pair gre "L3 GRE" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+  [[ "${only}" == "all" || "${only}" == *ipip* ]] && \
+    layer_test_kernel_pair ipip "L3 IPIP" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+
+  if [[ "${only}" == "all" || "${only}" == *icmp* ]]; then
+    local pcap ok=FAIL note="" probe="/tmp/phormal-probe-$$.py"
+    pcap="$(mktemp)"
+    layer_write_probe_py "${probe}"
+    scp -q -P "${ssh_port}" -o BatchMode=yes "${probe}" "${ssh_user}@${ssh_host}:/tmp/phormal-probe.py" 2>/dev/null || true
+    timeout 18 tcpdump -ni any -c 5 "icmp and src host ${peer_v4}" >"${pcap}" 2>&1 &
+    local td=$!
+    sleep 1
+    layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "python3 /tmp/phormal-probe.py icmp_send ${local_v4} ${peer_v4}" 2>/dev/null || true
+    wait "${td}" 2>/dev/null || true
+    if grep -q "ICMP echo request" "${pcap}" 2>/dev/null; then ok=PASS; note="peer->local icmp seen"; else note="no icmp arrival"; fi
+    rm -f "${pcap}" "${probe}"
+    layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "rm -f /tmp/phormal-probe.py" 2>/dev/null || true
+    layer_autotest_record "L3 ICMP echo" "${ok}" "high" "${note}"
+  fi
+
+  [[ "${only}" == "all" || "${only}" == *udp* ]] && layer_test_udp_sizes "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" 64 "L4 UDP small"
+  [[ "${only}" == "all" || "${only}" == *udp* ]] && layer_test_udp_sizes "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" 1400 "L4 UDP large/MTU"
+
+  [[ "${only}" == "all" || "${only}" == *tcp* ]] && \
+    layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "L4 TCP connect+data"
+
+  if [[ "${only}" == "all" || "${only}" == *tls* || "${only}" == *wss* ]]; then
+    local ok=FAIL note="not probed"
+    if have openssl; then
+      if echo | timeout 8 openssl s_client -connect "${peer_v4}:443" -servername github.com 2>/dev/null | grep -qi "BEGIN CERTIFICATE"; then
+        ok=PASS; note="TLS handshake :443 ok"
+      else
+        note="no TLS on peer :443"
+      fi
+    else
+      note="openssl missing"; ok=inconclusive
+    fi
+    layer_autotest_record "L7 TLS :443" "${ok}" "med" "${note}"
+  fi
+
+  if [[ "${only}" == "all" || "${only}" == *dns* ]]; then
+    local ok=FAIL note=""
+    if have dig && dig +time=3 +tries=1 @8.8.8.8 google.com A +short 2>/dev/null | grep -qE '^[0-9]'; then
+      ok=PASS; note="recursive DNS works from this host"
+    else
+      note="DNS probe failed/inconclusive"; ok=inconclusive
+    fi
+    layer_autotest_record "L7 DNS" "${ok}" "low" "${note}"
+  fi
+
+  layer_autotest_print_table
+  info "Recommendation: pick the fastest layer marked PASS above."
+  warn "Existing Phormal Relay (UDP/QUIC) and Bridge (SIT) are probed — do not rebuild if FAIL."
+}
+
+layer_autotest_cli() {
+  local only="all"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --only) only="${2:-all}"; shift 2 ;;
+      --all) only="all"; shift ;;
+      *) shift ;;
+    esac
+  done
+  layer_autotest_main "${only}"
 }
 
 # ------------------------------------------------------------------------------
@@ -3971,11 +4977,15 @@ menu() {
     printf '   %s12%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s13%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s14%s  Manage tunnels\n' "${ACC}" "${RST}"
+    printf '\n  %sMULTI-LAYER%s  %s(auto-test + per-layer tunnels)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '   %s15%s  Auto-test path (SSH to peer)\n' "${ACC}" "${RST}"
+    printf '   %s16%s  Add a layer tunnel\n' "${ACC}" "${RST}"
+    printf '   %s17%s  Manage layer tunnels\n' "${ACC}" "${RST}"
     printf '\n  %sMANAGE%s\n' "${BOLD}" "${RST}"
-    printf '   %s15%s  Status\n' "${ACC}" "${RST}"
-    printf '   %s16%s  Phormal tuning\n' "${ACC}" "${RST}"
-    printf '   %s17%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
-    printf '   %s18%s  Uninstall\n' "${ACC}" "${RST}"
+    printf '   %s18%s  Status\n' "${ACC}" "${RST}"
+    printf '   %s19%s  Phormal tuning\n' "${ACC}" "${RST}"
+    printf '   %s20%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
+    printf '   %s21%s  Uninstall\n' "${ACC}" "${RST}"
     printf '    %s0%s  Exit\n\n' "${ACC}" "${RST}"
 
     local choice; choice="$(ask 'Select')"
@@ -3995,10 +5005,13 @@ menu() {
       12) create_spoof_exit || true ;;
       13) create_spoof_entry || true ;;
       14) manage_spoof_menu || true ;;
-      15) status || true ;;
-      16) tune_menu || true ;;
-      17) schedule_refresh || true ;;
-      18) purge || true ;;
+      15) layer_autotest_cli || true ;;
+      16) layer_add_menu || true ;;
+      17) manage_layer_menu || true ;;
+      18) status || true ;;
+      19) tune_menu || true ;;
+      20) schedule_refresh || true ;;
+      21) purge || true ;;
       0) good "Goodbye — @SchmitzWS"; exit 0 ;;
       *) fail "Invalid selection." ;;
     esac
