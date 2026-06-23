@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.4.11"
+readonly PHORMAL_VERSION="5.4.12"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -317,7 +317,7 @@ verify_reverse_tmp() {
 reset_binary_source() { BINARY_SOURCE=""; }
 
 choose_binary_source() {
-  [[ -n "${BINARY_SOURCE}" ]] && return 0
+  [[ -n "${BINARY_SOURCE}" && -z "${PATH_TEST_FORCE_PICK:-}" ]] && return 0
   rule
   info "Binary download source (gost, hysteria, rathole — local host and peer via SSH)"
   rule
@@ -3794,12 +3794,12 @@ layer_ssh_session_show_link() {
   peer_name="$(layer_ssh_cmd "${host}" "${port}" "${user}" "hostname -s 2>/dev/null || hostname" 2>/dev/null | tr -d '\r' | head -n1)"
   peer_seen="$(layer_ssh_cmd "${host}" "${port}" "${user}" "echo PHORMAL-LINK-OK" 2>/dev/null | tr -d '\r')"
   rule
-  info "SSH link for paired tests (one connection — you do NOT need a second terminal on the peer):"
-  info "  This server : ${local_name}  (${local_v4:-?})  ← you ran phormal.sh here"
-  info "  Peer server : ${user}@${host}:${port}  (${peer_v4})  ← script SSHs here for you"
-  [[ -n "${peer_name}" ]] && info "  Peer hostname: ${peer_name} (confirmed over SSH)"
+  info "SSH for path test — ONE direction only (this host → peer):"
+  info "  This server : ${local_name}  (${local_v4:-?})  ← phormal.sh runs HERE"
+  info "  Peer server : ${user}@${host}:${port}  (${peer_v4})  ← outbound SSH target"
+  [[ -n "${peer_name}" ]] && info "  Peer hostname: ${peer_name} (read via SSH; peer did NOT SSH back to you)"
   [[ "${peer_seen}" == *LINK-OK* ]] || warn "  Could not re-check peer over SSH control socket."
-  info "  Entering the peer password above opened this link; installs and paired probes use it."
+  info "  Tunnel tests run commands ON the peer through this link — not a second SSH session."
   rule
 }
 
@@ -4003,8 +4003,10 @@ layer_autotest_prepare_hosts() {
   local arch peer_arch urls=() u
 
   layer_autotest_require_peer_ssh || return 1
+  PATH_TEST_FORCE_PICK=1
   BINARY_SOURCE=""
   choose_binary_source
+  unset PATH_TEST_FORCE_PICK
 
   rule
   info "Preparing this host and peer (download missing engines before tests)…"
@@ -4419,7 +4421,7 @@ layer_autotest_verify_peer_pairing() {
   peer_bridge="$(layer_ssh_peer_bridge_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
   [[ -z "${peer_bridge}" ]] && peer_err=1
   peer_relay="$(layer_ssh_peer_relay_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
-  info "Peer pairing check (this host ${local_v4} ↔ peer ${peer_v4}) — after peer SSH is ready:"
+  info "Peer pairing check (meta on this host + on peer via ONE-WAY SSH) — ${local_v4} ↔ ${peer_v4}:"
   if layer_local_bridge_meta_to_peer "${peer_v4}" >/dev/null 2>&1; then
     info "  Bridge: this host has meta toward ${peer_v4}"
   else
@@ -4642,6 +4644,70 @@ layer_autotest_verdict() {
   info "Run option 1 when you add a new peer — then pick the BEST CHOICE from the menu."
 }
 
+layer_tunnel_modprobe() {
+  local mode="$1"
+  case "${mode}" in
+    sit)  modprobe sit 2>/dev/null || true ;;
+    gre)  modprobe gre 2>/dev/null || true ;;
+    ipip) modprobe ipip 2>/dev/null || true; modprobe ip_gre 2>/dev/null || true ;;
+  esac
+}
+
+layer_local_root_run() {
+  if [[ ${EUID} -eq 0 ]]; then
+    bash -c "$1"
+  else
+    sudo bash -c "$1"
+  fi
+}
+
+layer_test_bridge_sit_ipv6_probe() {
+  local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
+  local iface="phmpb$$" prefix self6 peer6 ok=FAIL conf=high note="" local_ok=0 peer_ok=0
+
+  layer_tunnel_modprobe sit
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" "modprobe sit 2>/dev/null || true" 2>/dev/null || true
+
+  prefix="$(random_core_prefix)"
+  self6="${prefix}::2"
+  peer6="${prefix}::1"
+
+  ip link del "${iface}" 2>/dev/null || true
+  if ! layer_local_root_run "ip tunnel add ${iface} mode sit remote ${peer_v4} local ${local_v4} ttl 64 \
+      && ip link set ${iface} up && ip -6 addr add ${self6}/64 dev ${iface}" 2>/dev/null; then
+    layer_autotest_record "Phormal Bridge" "FAIL" "high" "local SIT+IPv6 setup failed (${self6})"
+    return 0
+  fi
+
+  if ! layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "ip link del ${iface} 2>/dev/null; ip tunnel add ${iface} mode sit remote ${local_v4} local ${peer_v4} ttl 64 \
+       && ip link set ${iface} up && ip -6 addr add ${peer6}/64 dev ${iface}" 2>/dev/null; then
+    ip link del "${iface}" 2>/dev/null || true
+    layer_autotest_record "Phormal Bridge" "FAIL" "high" "peer SIT+IPv6 setup failed (${peer6})"
+    return 0
+  fi
+
+  sleep 2
+  info "  Bidirectional ping6 on synthetic Bridge IPv6 ${self6} ↔ ${peer6}…"
+  ping6 -c 3 -W 3 "${peer6}" >/dev/null 2>&1 && local_ok=1
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "ping6 -c 3 -W 3 ${self6}" >/dev/null 2>&1 && peer_ok=1
+
+  ip link del "${iface}" 2>/dev/null || true
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" "ip link del ${iface} 2>/dev/null" 2>/dev/null || true
+
+  if [[ "${local_ok}" -eq 1 && "${peer_ok}" -eq 1 ]]; then
+    ok=PASS; conf=high
+    note="synthetic Bridge SIT — bidirectional ping6 ${self6}↔${peer6}"
+  elif [[ "${local_ok}" -eq 1 || "${peer_ok}" -eq 1 ]]; then
+    ok=PASS; conf=med
+    note="synthetic Bridge SIT — one-way ping6 (local→peer:${local_ok} peer→local:${peer_ok})"
+  else
+    note="synthetic Bridge SIT up but ping6 failed (path may block SIT or IPv6)"
+  fi
+  layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
+}
+
 layer_test_kernel_pair() {
   local mode="$1" label="$2" local_v4="$3" remote_v4="$4" ssh_host ssh_port ssh_user
   local iface="pht${mode}$$" lip rip lpriv rpriv ok=FAIL conf=high note="" rerr=""
@@ -4654,60 +4720,62 @@ layer_test_kernel_pair() {
   layer_autotest_probe_begin "${label} (kernel ${mode} probe)"
   lip="${local_v4}"; rip="${remote_v4}"
   lpriv="10.99.1.1"; rpriv="10.99.1.2"
+  layer_tunnel_modprobe "${mode}"
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "modprobe ${mode} 2>/dev/null; modprobe sit 2>/dev/null; modprobe gre 2>/dev/null" 2>/dev/null || true
   ip link del "${iface}" 2>/dev/null || true
   case "${mode}" in
     sit)
-      ip tunnel add "${iface}" mode sit remote "${rip}" local "${lip}" ttl 64 2>/dev/null \
-        || note="local sit add failed (run path test as root)"
+      layer_local_root_run "ip tunnel add ${iface} mode sit remote ${rip} local ${lip} ttl 64" 2>/dev/null \
+        || note="local sit add failed (need root/sudo or kernel sit module)"
       ;;
     gre)
-      ip tunnel add "${iface}" mode gre remote "${rip}" local "${lip}" ttl 64 key "$(($$ % 65535))" 2>/dev/null \
-        || note="local gre add failed (run path test as root)"
+      layer_local_root_run "ip tunnel add ${iface} mode gre remote ${rip} local ${lip} ttl 64 key $(($$ % 65535))" 2>/dev/null \
+        || note="local gre add failed (need root/sudo or kernel gre module)"
       ;;
     ipip)
-      ip tunnel add "${iface}" mode ipip remote "${rip}" local "${lip}" ttl 64 2>/dev/null \
-        || note="local ipip add failed (run path test as root)"
+      layer_local_root_run "ip tunnel add ${iface} mode ipip remote ${rip} local ${lip} ttl 64" 2>/dev/null \
+        || note="local ipip add failed (need root/sudo or modprobe ipip)"
       ;;
   esac
   if [[ -z "${note}" ]]; then
-    ip link set "${iface}" up 2>/dev/null || true
-    ip addr add "${lpriv}/30" dev "${iface}" 2>/dev/null || true
+    layer_local_root_run "ip link set ${iface} up && ip addr add ${lpriv}/30 dev ${iface}" 2>/dev/null \
+      || note="local ${mode} iface up failed"
+  fi
+  if [[ -z "${note}" ]]; then
     local gkey; gkey="$(($$ % 65535))"
     if [[ "${mode}" == gre ]]; then
       rerr="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
         "ip link del ${iface} 2>/dev/null; ip tunnel add ${iface} mode gre remote ${lip} local ${rip} ttl 64 key ${gkey} && ip link set ${iface} up && ip addr add ${rpriv}/30 dev ${iface}" 2>&1)" \
-        || note="remote gre probe failed (peer needs root/sudo; gre0 may be in use)"
+        || note="remote gre probe failed (peer needs root/sudo)"
     else
       rerr="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
         "ip link del ${iface} 2>/dev/null; ip tunnel add ${iface} mode ${mode} remote ${lip} local ${rip} ttl 64 && ip link set ${iface} up && ip addr add ${rpriv}/30 dev ${iface}" 2>&1)" \
-        || note="remote tunnel failed (peer needs root or passwordless sudo)"
+        || note="remote ${mode} probe failed (peer needs root/sudo)"
     fi
     [[ -n "${note}" && -n "${rerr}" ]] && note="${note}: ${rerr##*$'\n'}"
   fi
   if [[ -z "${note}" ]]; then
-    sleep 1
+    sleep 2
     layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
       "ip link show ${iface} 2>/dev/null | grep -qE 'UP|LOWER_UP'" >/dev/null 2>&1 \
       || note="remote ${mode} iface not UP after setup"
   fi
   if [[ -z "${note}" ]]; then
-    info "  Bidirectional ping on ${mode} (both sides up concurrently)…"
-    ping -c 3 -W 2 -I "${iface}" "${rpriv}" >/dev/null 2>&1 &
-    local pa=$!
-    layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-      "ping -c 3 -W 2 -I ${iface} ${lpriv}" >/dev/null 2>&1 &
-    local pb=$!
     local local_ok=0 peer_ok=0
-    wait "${pa}" 2>/dev/null && local_ok=1
-    wait "${pb}" 2>/dev/null && peer_ok=1
+    info "  [1/2] this→peer ping on ${mode} (${lpriv}→${rpriv})…"
+    ping -c 3 -W 3 -I "${iface}" "${rpriv}" >/dev/null 2>&1 && local_ok=1
+    info "  [2/2] peer→this ping on ${mode} (${rpriv}→${lpriv})…"
+    layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "ping -c 3 -W 3 -I ${iface} ${lpriv}" >/dev/null 2>&1 && peer_ok=1
     if [[ "${local_ok}" -eq 1 && "${peer_ok}" -eq 1 ]]; then
       ok=PASS
-      note="bidirectional ping on ${mode} (synthetic paired probe)"
+      note="bidirectional ping on ${mode} (this→peer:${local_ok} peer→this:${peer_ok})"
     elif [[ "${local_ok}" -eq 1 || "${peer_ok}" -eq 1 ]]; then
       ok=PASS; conf=med
-      note="one-way ping on ${mode} probe (local:${local_ok} peer:${peer_ok})"
+      note="one-way ping on ${mode} (this→peer:${local_ok} peer→this:${peer_ok})"
     else
-      note="no bidirectional ping on synthetic ${mode} tunnel"
+      note="no ping on synthetic ${mode} tunnel (this→peer:${local_ok} peer→this:${peer_ok})"
     fi
   fi
   ip link del "${iface}" 2>/dev/null || true
@@ -4736,8 +4804,8 @@ layer_test_bridge_configured() {
         "kernel SIT UP toward ${peer_v4} (no phormal meta on either side)"
       return 0
     fi
-    info "  No Bridge on either host — paired kernel SIT probe (both servers, peer SSH required)…"
-    layer_test_kernel_pair sit "Phormal Bridge" "${local_v4}" "${peer_v4}" \
+    info "  No Bridge config — creating paired SIT + internal IPv6 on both servers (like real Bridge)…"
+    layer_test_bridge_sit_ipv6_probe "${local_v4}" "${peer_v4}" \
       "${ssh_host}" "${ssh_port}" "${ssh_user}"
     return 0
   fi
@@ -5097,7 +5165,7 @@ layer_autotest_main() {
   info "This host toward ${peer_v4} uses source IP ${local_v4:-?} — run from Iran or kharej where tunnels live."
   layer_ssh_session_open "${ssh_host}" "${ssh_port}" "${ssh_user}" || return 1
   layer_ssh_session_show_link "${ssh_host}" "${ssh_port}" "${ssh_user}" "${local_v4}" "${peer_v4}"
-  good "Both sides reachable for paired tests (local + peer via SSH above)."
+  info "Outbound SSH only (this → peer). Peer is controlled remotely — no SSH from peer to this host."
   conf_set PATH_TEST_SSH_HOST "${ssh_host}"
   conf_set PATH_TEST_SSH_PORT "${ssh_port}"
   conf_set PATH_TEST_SSH_USER "${ssh_user}"
