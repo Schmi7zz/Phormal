@@ -93,7 +93,7 @@ Peer SSH host / port / user are remembered in `/etc/phormal/phormal.conf`.
 
 ---
 
-## 🧭 Menu reference (v5.6.5)
+## 🧭 Menu reference (v6.2.2)
 
 ### Path test
 
