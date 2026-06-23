@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.4.0"
+readonly PHORMAL_VERSION="5.4.1"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -3800,6 +3800,17 @@ layer_ssh_session_close() {
   LAYER_SSH_CTRL_PATH=""
 }
 
+# Run a command on the peer; use sudo when SSH user is not root (kernel probes need it).
+layer_ssh_remote() {
+  local host="$1" port="$2" user="$3" cmd="$4"
+  if [[ "${user}" == "root" ]]; then
+    layer_ssh_cmd "${host}" "${port}" "${user}" "${cmd}"
+  else
+    layer_ssh_cmd "${host}" "${port}" "${user}" "sudo -n bash -c $(printf '%q' "${cmd}")" 2>/dev/null \
+      || layer_ssh_cmd "${host}" "${port}" "${user}" "sudo bash -c $(printf '%q' "${cmd}")"
+  fi
+}
+
 layer_probe_py() {
   cat <<'PY'
 import socket, struct, sys, time, os, subprocess, json
@@ -3867,8 +3878,80 @@ if __name__ == '__main__':
 PY
 }
 
+layer_autotest_probe_begin() {
+  printf '\n'
+  info "▶ Testing %s…" "$1"
+}
+
 layer_autotest_record() {
-  LAYER_TEST_ROWS+=("$1|$2|$3|$4")
+  local label="$1" result="$2" conf="$3" note="$4"
+  LAYER_TEST_ROWS+=("${label}|${result}|${conf}|${note}")
+  case "${result}" in
+    PASS)
+      good "  ${label}: PASS [${conf}] — ${note}"
+      ;;
+    inconclusive)
+      warn "  ${label}: inconclusive [${conf}] — ${note}"
+      ;;
+    *)
+      fail "  ${label}: FAIL [${conf}] — ${note}"
+      ;;
+  esac
+}
+
+layer_autotest_pop_row() {
+  local want="$1" i row a
+  for i in "${!LAYER_TEST_ROWS[@]}"; do
+    row="${LAYER_TEST_ROWS[i]}"
+    a="${row%%|*}"
+    [[ "${a}" == "${want}" ]] || continue
+    unset 'LAYER_TEST_ROWS[i]'
+    LAYER_TEST_ROWS=("${LAYER_TEST_ROWS[@]}")
+    return 0
+  done
+  return 1
+}
+
+layer_relay_link_listening() {
+  local listen="$1"
+  if [[ "${listen}" == *-* ]]; then
+    systemctl list-units 'phormal-relay@*' --state=active --no-legend 2>/dev/null | grep -q . \
+      && pgrep -f "${RELAY_BIN}" >/dev/null 2>&1
+    return $?
+  fi
+  ss -uln 2>/dev/null | grep -qE ":${listen}( |$)" \
+    || ss -uln "sport = :${listen}" 2>/dev/null | grep -q "${listen}"
+}
+
+layer_peer_relay_active() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3"
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "systemctl list-units 'phormal-relay@*' --state=active --no-legend 2>/dev/null | grep -q . && echo yes || echo no" \
+    2>/dev/null | tr -d '\r' | grep -q yes
+}
+
+layer_autotest_row_get() {
+  local want="$1" field="$2" row a b c d
+  for row in "${LAYER_TEST_ROWS[@]}"; do
+    IFS='|' read -r a b c d <<<"${row}"
+    [[ "${a}" == "${want}" ]] || continue
+    case "${field}" in
+      result) printf '%s' "${b}" ;;
+      conf)   printf '%s' "${c}" ;;
+      note)   printf '%s' "${d}" ;;
+    esac
+    return 0
+  done
+  return 1
+}
+
+layer_autotest_copy_row() {
+  local from="$1" to="$2" note_suffix="$3"
+  local res conf note
+  res="$(layer_autotest_row_get "${from}" result)" || return 1
+  conf="$(layer_autotest_row_get "${from}" conf)"
+  note="$(layer_autotest_row_get "${from}" note)"
+  layer_autotest_record "${to}" "${res}" "${conf}" "${note}${note_suffix}"
 }
 
 layer_autotest_print_table() {
@@ -3901,13 +3984,14 @@ layer_autotest_mirror_row() {
   res="$(layer_autotest_last_result result)"
   conf="$(layer_autotest_last_result conf)"
   note="$(layer_autotest_last_result note)"
-  layer_autotest_record "${label}" "${res}" "${conf}" "${note}${note_suffix}"
+  LAYER_TEST_ROWS+=("${label}|${res}|${conf}|${note}${note_suffix}")
+  info "  ${label}: ${res} [${conf}] — ${note}${note_suffix}"
 }
 
 layer_autotest_recommendation() {
   local row product result menu_hint any=0
   rule
-  info "Which menu option to use (PASS products only)"
+  info "Menu mapping (PASS products only)"
   rule
   for row in "${LAYER_TEST_ROWS[@]}"; do
     IFS='|' read -r product result _ _ <<<"${row}"
@@ -3929,64 +4013,197 @@ layer_autotest_recommendation() {
     esac
     printf '  %-28s → %s\n' "${product}" "${menu_hint}"
   done
-  [[ ${any} -eq 0 ]] && warn "No product passed — review FAIL rows or try another peer path."
+  [[ ${any} -eq 0 ]] && warn "No product passed — review FAIL rows above."
   rule
+}
+
+layer_autotest_conf_score() {
+  case "$1" in
+    high) printf '3' ;;
+    med)  printf '2' ;;
+    *)    printf '1' ;;
+  esac
+}
+
+layer_autotest_product_rank() {
+  case "$1" in
+    "Phormal Bridge")       printf '90' ;;
+    "Phormal Relay")        printf '85' ;;
+    "Phormal GRE")          printf '80' ;;
+    "Phormal GRE (IPIP)")  printf '79' ;;
+    "Phormal Reverse")      printf '75' ;;
+    "Phormal Stream")       printf '74' ;;
+    "Phormal Echo")         printf '70' ;;
+    "Phormal Raw")          printf '65' ;;
+    "Phormal Cloak")        printf '60' ;;
+    "Phormal Edge")         printf '20' ;;
+    "Phormal DNS")          printf '10' ;;
+    *)                      printf '50' ;;
+  esac
+}
+
+layer_autotest_verdict() {
+  local row product result conf note best="" best_score=0 score rank menu_hint
+  local -a pass_rows=()
+  rule
+  info "Verdict — which Phormal product to use"
+  rule
+  for row in "${LAYER_TEST_ROWS[@]}"; do
+    IFS='|' read -r product result conf note <<<"${row}"
+    case "${result}" in
+      PASS)
+        pass_rows+=("${row}")
+        score="$(layer_autotest_conf_score "${conf}")"
+        rank="$(layer_autotest_product_rank "${product}")"
+        score=$(( score * 100 + rank ))
+        if [[ "${score}" -gt "${best_score}" ]]; then
+          best_score="${score}"
+          best="${product}|${conf}|${note}"
+        fi
+        ;;
+      inconclusive)
+        warn "  ${product}: inconclusive — ${note}"
+        ;;
+      *)
+        fail "  ${product}: not recommended — ${note}"
+        ;;
+    esac
+  done
+  if [[ ${#pass_rows[@]} -gt 0 ]]; then
+    info "Products that passed (best first for real tunnel traffic):"
+    printf '%s\n' "${pass_rows[@]}" | while IFS='|' read -r product result conf note; do
+      printf '    %-28s [%s] %s\n' "${product}" "${conf}" "${note}"
+    done
+  fi
+  if [[ -n "${best}" ]]; then
+    IFS='|' read -r product conf note <<<"${best}"
+    case "${product}" in
+      "Phormal Bridge")       menu_hint="2–5 (Bridge)" ;;
+      "Phormal Relay")        menu_hint="6–9 (Relay)" ;;
+      "Phormal Reverse")      menu_hint="10–12 (Reverse)" ;;
+      "Phormal GRE"|"Phormal GRE (IPIP)") menu_hint="13–15 (GRE)" ;;
+      "Phormal Echo")         menu_hint="16–18 (Echo)" ;;
+      "Phormal Raw")          menu_hint="19–21 (Raw)" ;;
+      "Phormal Stream")       menu_hint="22–24 (Stream)" ;;
+      "Phormal Cloak")        menu_hint="25–27 (Cloak)" ;;
+      "Phormal DNS")          menu_hint="28–30 (DNS)" ;;
+      "Phormal Edge")         menu_hint="31–33 (Edge)" ;;
+      *) menu_hint="see menu" ;;
+    esac
+    printf '\n'
+    good "BEST CHOICE: ${product}"
+    info "  Confidence : ${conf}"
+    info "  Why        : ${note}"
+    info "  Use menu   : ${menu_hint}"
+    info "  DNS/Edge PASS only means generic internet works — prefer Bridge/Relay/GRE/Reverse when they PASS."
+  else
+    fail "No product passed on this path — try GRE/Echo if kernel probes failed (peer may need root/sudo for SIT test)."
+  fi
+  rule
+  info "Run option 1 when you add a new peer — then pick the BEST CHOICE from the menu."
 }
 
 layer_test_kernel_pair() {
   local mode="$1" label="$2" local_v4="$3" remote_v4="$4" ssh_host ssh_port ssh_user
-  local iface="phprb$$" lip rip lpriv rpriv ok=FAIL conf=high note=""
+  local iface="phprb$$" lip rip lpriv rpriv ok=FAIL conf=high note="" rerr=""
   ssh_host="$5"; ssh_port="$6"; ssh_user="$7"
+  layer_autotest_probe_begin "${label} (kernel ${mode} probe)"
   lip="${local_v4}"; rip="${remote_v4}"
   lpriv="10.99.1.1"; rpriv="10.99.1.2"
   ip link del "${iface}" 2>/dev/null || true
   case "${mode}" in
-    sit) ip tunnel add "${iface}" mode sit remote "${rip}" local "${lip}" ttl 64 2>/dev/null || note="local sit add failed" ;;
+    sit) ip tunnel add "${iface}" mode sit remote "${rip}" local "${lip}" ttl 64 2>/dev/null || note="local sit add failed (need CAP_NET_ADMIN)" ;;
     gre) ip tunnel add "${iface}" mode gre remote "${rip}" local "${lip}" ttl 64 2>/dev/null || note="local gre add failed" ;;
     ipip) ip tunnel add "${iface}" mode ipip remote "${rip}" local "${lip}" ttl 64 2>/dev/null || note="local ipip add failed" ;;
   esac
   if [[ -z "${note}" ]]; then
     ip link set "${iface}" up 2>/dev/null || true
     ip addr add "${lpriv}/30" dev "${iface}" 2>/dev/null || true
-    layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-      "ip link del ${iface} 2>/dev/null; ip tunnel add ${iface} mode ${mode} remote ${lip} local ${rip} ttl 64 && ip link set ${iface} up && ip addr add ${rpriv}/30 dev ${iface}" \
-      2>/dev/null || note="remote tunnel failed"
+    rerr="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "ip link del ${iface} 2>/dev/null; ip tunnel add ${iface} mode ${mode} remote ${lip} local ${rip} ttl 64 && ip link set ${iface} up && ip addr add ${rpriv}/30 dev ${iface}" 2>&1)" \
+      || note="remote tunnel failed (peer needs root or passwordless sudo)"
+    [[ -n "${note}" && -n "${rerr}" ]] && note="${note}: ${rerr##*$'\n'}"
   fi
   if [[ -z "${note}" ]]; then
     if ping -c 3 -W 2 -I "${iface}" "${rpriv}" >/dev/null 2>&1 \
-      && layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      && layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
         "ping -c 3 -W 2 -I ${iface} ${lpriv}" >/dev/null 2>&1; then
       ok=PASS
-      note="bidirectional ping on ${mode}"
+      note="bidirectional ping on ${mode} (synthetic probe)"
     else
-      note="no bidirectional ping"
+      note="no bidirectional ping on synthetic ${mode} tunnel"
     fi
   fi
   ip link del "${iface}" 2>/dev/null || true
-  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "ip link del ${iface} 2>/dev/null" || true
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" "ip link del ${iface} 2>/dev/null" 2>/dev/null || true
   layer_autotest_record "${label}" "${ok}" "${conf}" "${note}"
 }
 
-layer_write_probe_py() {
-  local dest="$1"
-  layer_probe_py >"${dest}"
-  chmod 755 "${dest}"
+layer_test_bridge_configured() {
+  local peer_v4="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
+  local n remote peer_core self_core iface st ok=FAIL conf=high note="no active Bridge link to ${peer_v4}"
+  layer_autotest_probe_begin "Phormal Bridge (your configured links)"
+  while read -r n; do
+    [[ -n "${n}" ]] || continue
+    remote="$(bmeta_get "${n}" REMOTE_V4)"
+    [[ "${remote}" == "${peer_v4}" ]] || continue
+    peer_core="$(bmeta_get "${n}" PEER_CORE)"
+    self_core="$(bmeta_get "${n}" SELF_CORE)"
+    iface="$(bmeta_get "${n}" IFACE)"
+    [[ -n "${peer_core}" ]] || continue
+    st="$(bcore_state "${n}")"
+    if [[ "${st}" != "active" && "${st}" != "running" ]]; then
+      note="link '${n}' exists but core is ${st} (not running)"
+      continue
+    fi
+    if [[ -n "${iface}" ]] && ip link show "${iface}" 2>/dev/null | grep -q 'state UP'; then
+      if ping6 -c 3 -W 2 "${peer_core}" >/dev/null 2>&1 \
+        && layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+          "ping6 -c 3 -W 2 ${self_core}" >/dev/null 2>&1; then
+        ok=PASS
+        note="link '${n}' up — bidirectional ping6 ${self_core} ↔ ${peer_core}"
+        layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
+        return 0
+      fi
+      if ping6 -c 3 -W 2 "${peer_core}" >/dev/null 2>&1; then
+        ok=PASS; conf=med
+        note="link '${n}' up — one-way ping6 to peer ${peer_core}"
+        layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
+        return 0
+      fi
+      ok=PASS; conf=med
+      note="link '${n}' SIT iface ${iface} UP, core ${st} — tunnel looks operational (ping6 blocked?)"
+      layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
+      return 0
+    fi
+    note="link '${n}' core ${st} but iface ${iface:-?} not UP"
+  done < <(bridge_instances)
+  layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
 }
 
-layer_test_udp_sizes() {
-  local peer="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4" size="$5" label="$6"
-  local port listen res ok=FAIL conf=high note="" probe="/tmp/phormal-probe-$$.py" rjson="/tmp/phormal-probe-remote-$$.json"
-  apt_install_quiet python3 2>/dev/null || true
-  port="$(layer_pick_probe_port)" || { layer_autotest_record "${label}" "inconclusive" "low" "no free port"; return; }
-  listen=$((port + 1))
+layer_test_bridge_path() {
+  local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
+  layer_test_bridge_configured "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+  if [[ "$(layer_autotest_row_get "Phormal Bridge" result 2>/dev/null)" == "PASS" ]]; then
+    return 0
+  fi
+  info "  Configured Bridge not detected — trying short-lived SIT probe…"
+  layer_autotest_pop_row "Phormal Bridge"
+  layer_test_kernel_pair sit "Phormal Bridge" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+}
+
+layer_test_udp_echo() {
+  local peer="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4" bind_port="$5" peer_port="$6" size="$7" label="$8"
+  local listen res ok=FAIL conf=high note="" probe="/tmp/phormal-probe-$$.py" rjson="/tmp/phormal-probe-remote-$$.json"
+  listen=$((peer_port + 1))
   layer_write_probe_py "${probe}"
   layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${probe}" "/tmp/phormal-probe.py" 2>/dev/null || {
-    rm -f "${probe}"; layer_autotest_record "${label}" "inconclusive" "low" "scp failed"; return; }
+    rm -f "${probe}"; layer_autotest_record "${label}" "inconclusive" "low" "scp probe to peer failed"; return; }
   layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-    "timeout 20 python3 /tmp/phormal-probe.py udp ${listen} ${peer} ${port} ${size} >${rjson}" 2>/dev/null &
+    "timeout 20 python3 /tmp/phormal-probe.py udp ${listen} ${peer} ${peer_port} ${size} >${rjson}" 2>/dev/null &
   local rid=$!
   sleep 1
-  res="$(python3 "${probe}" udp "${port}" "${peer}" "${listen}" "${size}" 2>/dev/null || echo '{}')"
+  res="$(python3 "${probe}" udp "${bind_port}" "${peer}" "${listen}" "${size}" 2>/dev/null || echo '{}')"
   wait "${rid}" 2>/dev/null || true
   local sent recv rsent rrecv
   sent="$(printf '%s' "${res}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('sent',0))" 2>/dev/null || echo 0)"
@@ -3998,17 +4215,102 @@ layer_test_udp_sizes() {
   layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "rm -f /tmp/phormal-probe.py ${rjson}" 2>/dev/null || true
   rm -f "${probe}"
   if [[ "${sent}" -ge 3 && "${recv}" -ge 1 && "${rsent}" -ge 3 && "${rrecv}" -ge 1 ]]; then
-    ok=PASS; note="A->B ${recv}/${sent} B->A ${rrecv}/${rsent} size=${size}"
+    ok=PASS; note="UDP echo ${peer}:${peer_port} A->B ${recv}/${sent} B->A ${rrecv}/${rsent} size=${size}"
   else
-    note="A->B ${recv}/${sent} B->A ${rrecv}/${rsent} size=${size}"
+    note="UDP echo ${peer}:${peer_port} A->B ${recv}/${sent} B->A ${rrecv}/${rsent} size=${size}"
     conf=med
   fi
   layer_autotest_record "${label}" "${ok}" "${conf}" "${note}"
 }
 
+layer_test_relay_path() {
+  local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
+  local n role remote listen st local_ok peer_ok ok=FAIL conf=high note=""
+  layer_autotest_probe_begin "Phormal Relay (your configured Hysteria tunnel)"
+  while read -r n; do
+    [[ -n "${n}" ]] || continue
+    role="$(imeta_get "${n}" ROLE)"
+    remote="$(imeta_get "${n}" REMOTE_V4)"
+    listen="$(imeta_get "${n}" LISTEN)"; listen="${listen:-443}"
+    st="$(relay_svc_state "${n}")"
+    case "${role}" in
+      entry)
+        [[ "${remote}" == "${peer_v4}" ]] || continue
+        local_ok="down"
+        [[ "${st}" == "active" ]] && local_ok="up"
+        peer_ok="down"
+        if layer_peer_relay_active "${ssh_host}" "${ssh_port}" "${ssh_user}"; then
+          peer_ok="up"
+        else
+          peer_ok="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+            "ss -uln 2>/dev/null | grep -qE ':${listen}( |\$)' && echo up || echo down" 2>/dev/null | tr -d '\r')"
+        fi
+        peer_ok="${peer_ok:-down}"
+        if [[ "${local_ok}" == "up" && "${peer_ok}" == "up" ]]; then
+          ok=PASS
+          note="entry '${n}' active — Hysteria toward ${peer_v4}:${listen} (peer relay up)"
+          layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
+          info "  (UDP echo skipped — QUIC tunnel does not echo arbitrary UDP)"
+          return 0
+        fi
+        note="entry '${n}' local=${local_ok} peer link :${listen}=${peer_ok}"
+        ;;
+      exit)
+        local_ok="down"
+        [[ "${st}" == "active" ]] && local_ok="up"
+        peer_ok="down"
+        if layer_peer_relay_active "${ssh_host}" "${ssh_port}" "${ssh_user}"; then
+          peer_ok="up"
+        fi
+        if [[ "${local_ok}" == "up" && "${peer_ok}" == "up" ]] \
+          && layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+            "grep -l '^REMOTE_V4=${local_v4}\$' ${RELAY_DIR}/*/meta.conf 2>/dev/null | head -1" 2>/dev/null | grep -q meta.conf; then
+          ok=PASS
+          note="exit '${n}' active — peer entry targets this host (${local_v4})"
+          layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
+          info "  (UDP echo skipped — configured Relay tunnel is up)"
+          return 0
+        fi
+        if [[ "${local_ok}" == "up" ]] && layer_relay_link_listening "${listen}"; then
+          ok=PASS; conf=med
+          note="exit '${n}' listening UDP :${listen} (peer entry not verified via SSH)"
+          layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
+          return 0
+        fi
+        ;;
+    esac
+  done < <(relay_instances)
+  if [[ "${ok}" == "PASS" ]]; then
+    return 0
+  fi
+  warn "  No active Relay tunnel to ${peer_v4} — running generic UDP echo probes"
+  local port
+  port="$(layer_pick_probe_port)" || { layer_autotest_record "Phormal Relay" "inconclusive" "low" "no free port"; return; }
+  layer_test_udp_echo "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "${port}" $((port + 1)) 64 "Phormal Relay"
+  if [[ "$(layer_autotest_row_get "Phormal Relay" result 2>/dev/null)" != "PASS" ]]; then
+    layer_autotest_pop_row "Phormal Relay"
+    port="$(layer_pick_probe_port)" || return 0
+    layer_test_udp_echo "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "${port}" $((port + 1)) 1400 "Phormal Relay"
+  fi
+}
+
+layer_write_probe_py() {
+  local dest="$1"
+  layer_probe_py >"${dest}"
+  chmod 755 "${dest}"
+}
+
+layer_test_udp_sizes() {
+  local peer="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4" size="$5" label="$6" port
+  apt_install_quiet python3 2>/dev/null || true
+  port="$(layer_pick_probe_port)" || { layer_autotest_record "${label}" "inconclusive" "low" "no free port"; return; }
+  layer_test_udp_echo "${peer}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "${port}" $((port + 1)) "${size}" "${label}"
+}
+
 layer_test_tcp_bidir() {
   local peer="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4" label="$5"
   local port ok=FAIL conf=high note="" self_ip
+  layer_autotest_probe_begin "${label}"
   self_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
   port="$(layer_pick_probe_port)" || { layer_autotest_record "${label}" "inconclusive" "low" "no port"; return; }
   layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
@@ -4022,7 +4324,7 @@ layer_test_tcp_bidir() {
       if layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
         "echo REV-PROBE | nc -w 3 ${self_ip} ${port2}" 2>/dev/null | grep -q REV-PROBE \
         || grep -q REV-PROBE /tmp/phormal-tcp-reply 2>/dev/null; then
-        ok=PASS; note="bidirectional nc on :${port}"
+        ok=PASS; note="bidirectional TCP nc on :${port}"
       else
         note="reverse TCP failed"
       fi
@@ -4036,12 +4338,12 @@ layer_test_tcp_bidir() {
 
 layer_autotest_main() {
   local only="${1:-all}" ssh_host ssh_port ssh_user local_v4 peer_v4
-  local def_host def_port def_user saved_host saved_port saved_user
+  local def_host def_port def_user
   LAYER_TEST_ROWS=()
   LAYER_SSH_CTRL_PATH=""
   rule
   info "Phormal Path Test — every product (Bridge, Relay, Reverse, GRE, Echo, Raw, Stream, Cloak, DNS, Edge)"
-  info "Probes real bidirectional traffic via SSH coordination with the peer."
+  info "Each test prints its result live below, then a summary table and verdict."
   rule
   apt_install_quiet python3 tcpdump iproute2 openssh-client netcat-openbsd dnsutils 2>/dev/null || true
   have python3 || { fail "python3 required."; return 1; }
@@ -4059,8 +4361,6 @@ layer_autotest_main() {
     ssh_port="$(ask 'Peer SSH port [22]')"; ssh_port="${ssh_port:-22}"
     ssh_user="$(ask 'Peer SSH user [root]')"; ssh_user="${ssh_user:-root}"
   fi
-  saved_host="${ssh_host}"; saved_port="${ssh_port}"; saved_user="${ssh_user}"
-  trap 'layer_ssh_session_close "${saved_host}" "${saved_port}" "${saved_user}"' RETURN
   peer_v4="${ssh_host}"
   valid_ipv4 "${peer_v4}" || peer_v4="$(getent ahostsv4 "${ssh_host}" 2>/dev/null | awk '{print $1; exit}')"
   [[ -n "${peer_v4}" ]] || { fail "Cannot resolve peer."; return 1; }
@@ -4069,11 +4369,11 @@ layer_autotest_main() {
   conf_set PATH_TEST_SSH_PORT "${ssh_port}"
   conf_set PATH_TEST_SSH_USER "${ssh_user}"
   sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
-  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0" >/dev/null 2>&1 || true
 
   [[ "${only}" == "all" || "${only}" == *bridge* || "${only}" == *sit* ]] && \
-    layer_test_kernel_pair sit "Phormal Bridge" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+    layer_test_bridge_path "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
   [[ "${only}" == "all" || "${only}" == *gre* ]] && \
     layer_test_kernel_pair gre "Phormal GRE" "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
   [[ "${only}" == "all" || "${only}" == *ipip* ]] && \
@@ -4081,6 +4381,7 @@ layer_autotest_main() {
 
   if [[ "${only}" == "all" || "${only}" == *echo* || "${only}" == *icmp* ]]; then
     local pcap pcap2 ok=FAIL note="" probe="/tmp/phormal-probe-$$.py" peer_ok=0 local_ok=0
+    layer_autotest_probe_begin "Phormal Echo"
     pcap="$(mktemp)"; pcap2="$(mktemp)"
     layer_write_probe_py "${probe}"
     layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${probe}" "/tmp/phormal-probe.py" 2>/dev/null || true
@@ -4088,7 +4389,7 @@ layer_autotest_main() {
     local td=$!
     sleep 1
     layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-      "python3 /tmp/phormal-probe.py icmp_send ${peer_v4} ${local_v4}" 2>/dev/null || true
+      "python3 /tmp/phormal-probe.py icmp_send ${peer_v4} ${local_v4} >/dev/null" 2>/dev/null || true
     wait "${td}" 2>/dev/null || true
     grep -q "ICMP echo request" "${pcap}" 2>/dev/null && peer_ok=1
     timeout 18 tcpdump -ni any -c 5 "icmp and src host ${local_v4}" >"${pcap2}" 2>&1 &
@@ -4105,13 +4406,18 @@ layer_autotest_main() {
   fi
 
   [[ "${only}" == "all" || "${only}" == *relay* || "${only}" == *udp* ]] && \
-    layer_test_udp_sizes "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" 64 "Phormal Relay (UDP small)"
-  [[ "${only}" == "all" || "${only}" == *relay* || "${only}" == *udp* ]] && \
-    layer_test_udp_sizes "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" 1400 "Phormal Relay (UDP large)"
+    layer_test_relay_path "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+
   if [[ "${only}" == *raw* && "${only}" != "all" ]]; then
+    layer_autotest_probe_begin "Phormal Raw"
     layer_test_udp_sizes "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" 1400 "Phormal Raw"
   elif [[ "${only}" == "all" || "${only}" == *raw* ]]; then
-    layer_autotest_mirror_row "Phormal Raw" " — faketcp needs TCP-looking UDP path"
+    if [[ "$(layer_autotest_row_get "Phormal Relay" result 2>/dev/null)" == "PASS" ]]; then
+      layer_autotest_copy_row "Phormal Relay" "Phormal Raw" " — Raw uses faketcp over UDP-like path"
+    else
+      layer_autotest_probe_begin "Phormal Raw"
+      layer_test_udp_sizes "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" 1400 "Phormal Raw"
+    fi
   fi
 
   if [[ "${only}" == "all" || "${only}" == *reverse* || "${only}" == *tcp* ]]; then
@@ -4125,11 +4431,12 @@ layer_autotest_main() {
 
   if [[ "${only}" == "all" || "${only}" == *cloak* || "${only}" == *tls* || "${only}" == *wss* ]]; then
     local ok=FAIL note="not probed"
+    layer_autotest_probe_begin "Phormal Cloak"
     if have openssl; then
       if echo | timeout 8 openssl s_client -connect "${peer_v4}:443" -servername github.com 2>/dev/null | grep -qi "BEGIN CERTIFICATE"; then
         ok=PASS; note="TLS handshake :443 ok"
       else
-        note="no TLS on peer :443"
+        note="no TLS listener on peer :443"
       fi
     else
       note="openssl missing"; ok=inconclusive
@@ -4139,6 +4446,7 @@ layer_autotest_main() {
 
   if [[ "${only}" == "all" || "${only}" == *dns* ]]; then
     local ok=FAIL note=""
+    layer_autotest_probe_begin "Phormal DNS"
     if have dig && dig +time=3 +tries=1 @8.8.8.8 google.com A +short 2>/dev/null | grep -qE '^[0-9]'; then
       ok=PASS; note="recursive DNS works from this host"
     else
@@ -4150,14 +4458,19 @@ layer_autotest_main() {
   if [[ "${only}" == "all" || "${only}" == *edge* ]]; then
     if [[ "${only}" == *edge* && "${only}" != "all" ]]; then
       layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Edge"
+    elif [[ "$(layer_autotest_row_get "Phormal Reverse" result 2>/dev/null)" == "PASS" ]]; then
+      layer_autotest_probe_begin "Phormal Edge"
+      layer_autotest_copy_row "Phormal Reverse" "Phormal Edge" " — TCP forwarding path (proxyforwarder)"
     else
-      layer_autotest_mirror_row "Phormal Edge" " — TCP forwarding path (proxyforwarder)"
+      layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Edge"
     fi
   fi
 
+  printf '\n'
   layer_autotest_print_table
   layer_autotest_recommendation
-  info "Run option 1 first whenever you add a new peer — then pick the PASS product from the menu."
+  layer_autotest_verdict
+  layer_ssh_session_close "${ssh_host}" "${ssh_port}" "${ssh_user}"
 }
 
 layer_autotest_cli() {
