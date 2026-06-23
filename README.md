@@ -1,229 +1,150 @@
-<h1 align="center">🌀 Phormal Tunnel</h1>
+<div align="center">
 
-<p align="center">
-  <em>A fast, resilient tunneling layer for bridging entry and exit servers across hostile networks.</em>
-</p>
-
-<p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-5.4.0-7aa2f7?style=flat-square">
-  <img alt="platform" src="https://img.shields.io/badge/platform-Linux-78dba9?style=flat-square">
-  <img alt="shell" src="https://img.shields.io/badge/made%20with-Bash-f7768e?style=flat-square">
-  <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-c0caf5?style=flat-square">
-</p>
-
-<p align="center">
-  <a href="https://github.com/Schmi7zz">GitHub</a> ·
-  <a href="https://t.me/SchmitzWS">Telegram</a> ·
-  <a href="./README.fa.md">🇮🇷 فارسی</a>
-</p>
-
----
-
-## ✨ What is Phormal?
-
-**Phormal** connects an **entry node** (restricted uplink, e.g. Iran) to an **exit node** (clean foreign uplink), then publishes your service ports on the **entry public IP** — users never connect to the exit directly.
-
-Every product is **multi-tunnel**: many named instances per server, each with its own config, ports, and systemd unit.
-
-| Product | Best for | Transport |
-| ------- | -------- | --------- |
-| 🌉 **Phormal Bridge** | Stable point-to-point paths | SIT (proto-41) + gost publisher |
-| 🛰️ **Phormal Relay** | Lossy / filtered UDP paths | Hysteria2 QUIC + Salamander |
-| 🔁 **Phormal Reverse** | TCP reverse connectivity | rathole |
-| 🪨 **Phormal GRE** | When SIT is blocked | Kernel GRE / IPIP |
-| 📡 **Phormal Echo** | ICMP-friendly paths | icmp_tun |
-| 🧱 **Phormal Raw** | UDP with faketcp disguise | udp2raw |
-| 🌊 **Phormal Stream** | Reliable TCP tunnel | Backhaul TCP |
-| 🥷 **Phormal Cloak** | TLS / WebSocket lookalike | Backhaul WSS |
-| 🌐 **Phormal DNS** | DNS-only egress | iodine |
-| ⚡ **Phormal Edge** | Lightweight TCP forward | proxyforwarder |
-
-```mermaid
-flowchart LR
-  subgraph users [End users]
-    C[Client]
-  end
-  subgraph entry [Entry — Iran]
-    E[Published ports]
-  end
-  subgraph link [Phormal link]
-    T[Bridge / Relay / Reverse / GRE / …]
-  end
-  subgraph exit [Exit — Kharej]
-    X[Xray / 3x-ui / …]
-  end
-  C --> E --> T --> X
+```
+██████  ██   ██  ████  ██████  ███    ███  ████  ██
+██   ██ ██   ██ ██  ██ ██   ██ ████  ████ ██  ██ ██
+██████  ███████ ██  ██ ██████  ██ ████ ██ ██████ ██
+██      ██   ██ ██  ██ ██   ██ ██  ██  ██ ██  ██ ██
+██      ██   ██  ████  ██   ██ ██      ██ ██  ██ ███████
+                     T   U   N   N   E   L
 ```
 
+# Phormal Tunnel
+
+**A fast, resilient tunneling layer for bridging two servers across hostile networks.**
+
+[![License: GPL v3](https://img.shields.io/badge/License-GPL%20v3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Version](https://img.shields.io/badge/version-5.6.0-brightgreen.svg)](https://github.com/Schmi7zz/Phormal)
+[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements)
+
+[Telegram Channel](https://t.me/SchmitzWS) • [Contact](https://t.me/Schmi7zz) • [GitHub](https://github.com/Schmi7zz/Phormal)
+
+</div>
+
 ---
 
-## 🚀 Install
+## What is Phormal?
+
+Phormal is an all-in-one, menu-driven tunnel manager that links **two servers** — typically one inside Iran and one abroad — and keeps the link alive even on filtered, throttled, or hostile network paths.
+
+Different paths break in different ways: some drop UDP, some only let TCP out, some barely pass anything but ICMP. Instead of betting on a single method, Phormal ships **six independent tunnel products**, tests every one of them against your actual path, and tells you which to use. You pick the winner and you're done.
+
+Every product is fully self-contained under the Phormal brand — one installer, one command, one consistent workflow.
+
+---
+
+## Highlights
+
+- **Six tunnel products** under one roof — pick whatever survives your path.
+- **Path Auto-Test** — one command probes every product end-to-end between the two servers and recommends the best one, with a confidence rating.
+- **Role-aware setup** — each product has a clean *exit* (abroad) and *entry* (Iran) side; the menu guides you through both.
+- **Self-healing** — optional auto-refresh schedule keeps tunnels warm and healthy.
+- **Built-in speedtest** for the main products.
+- **Network tuning** — queue-discipline and buffer tuning applied with one option.
+- **Clean install / clean uninstall** — everything lives under `/etc/phormal`, and removal is a single menu entry.
+
+---
+
+## Installation
+
+Run this on **both** servers (Iran side and abroad side):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Schmi7zz/Phormal/main/phormal.sh -o phormal.sh && sed -i 's/\r$//' phormal.sh && chmod +x phormal.sh && sudo ./phormal.sh
 ```
 
-After the first run:
+After the first run, Phormal installs a global command, so next time you can simply launch it with:
 
 ```bash
 sudo phormal
-```
-
-### Mirror (Iran — fast binary downloads)
-
-On your mirror host:
-
-```bash
-sudo bash mirror-host-setup.sh
-```
-
-Clients use `MIRROR_BASE=http://YOUR_MIRROR:8880/phormal` in `/etc/phormal/phormal.conf` (seeded automatically on first run).
-
----
-
-## 🧪 Phormal Path Test (menu **1**)
-
-**Always run this first** when pairing a new Iran ↔ Kharej servers.
-
-- Tests **every** product with real bidirectional traffic (kernel tunnels, UDP, TCP, ICMP, TLS, DNS).
-- Needs **SSH access to the peer** (key preferred; password works — prompted once per test).
-- Prints a PASS/FAIL table and tells you **which menu block** to use next.
-
-Peer SSH host/port/user are remembered in `/etc/phormal/phormal.conf`.
-
----
-
-## 🧭 Menu reference (v5.4.0)
-
-### Path test
-
-| # | Action |
-| - | ------ |
-| **1** | Run path auto-test (SSH to peer) |
-
-### Core products
-
-| # | Product | Exit | Entry | Manage |
-| - | ------- | ---- | ----- | ------ |
-| 2–5 | **Bridge** | 2 | 3 | 4 (+5 speedtest) |
-| 6–9 | **Relay** | 6 | 7 | 8 (+9 speedtest) |
-| 10–12 | **Reverse** | 10 | 11 | 12 |
-
-### Extended products
-
-| # | Product | Exit | Entry | Manage |
-| - | ------- | ---- | ----- | ------ |
-| 13–15 | **GRE** | 13 | 14 | 15 |
-| 16–18 | **Echo** | 16 | 17 | 18 |
-| 19–21 | **Raw** | 19 | 20 | 21 |
-| 22–24 | **Stream** | 22 | 23 | 24 |
-| 25–27 | **Cloak** | 25 | 26 | 27 |
-| 28–30 | **DNS** | 28 | 29 | 30 |
-| 31–33 | **Edge** | 31 | 32 | 33 |
-
-### Manage
-
-| # | Action |
-| - | ------ |
-| 34 | Status — all tunnels |
-| 35 | Phormal tuning (BBR / fq / cake) |
-| 36 | Auto-refresh schedule (cron) |
-| 37 | Uninstall |
-| 0 | Exit |
-
-Each **Manage** submenu lists instances and offers restart, stop, logs, edit ports, delete, etc.
-
----
-
-## 🛰️ Quick start — Phormal Relay
-
-**Exit (Kharej) — menu 6**
-
-1. Name the tunnel, pick a **link port** (UDP, e.g. `8531`).
-2. Note auth + obfuscation passwords.
-3. Open firewall: `ufw allow 8531/udp`
-4. Run your service on the user port (e.g. `5151`).
-
-**Entry (Iran) — menu 7**
-
-1. Enter exit IP, same link port, same passwords.
-2. Enter **user ports** to publish.
-
-Users connect to **Iran IP : user port**.
-
----
-
-## 🌉 Quick start — Phormal Bridge
-
-SIT is point-to-point: **one exit link per Iran peer**.
-
-- **Exit — menu 2:** name, IPs, note the **bridge key**.
-- **Entry — menu 3:** matching key, transport, user ports.
-
----
-
-## 🗂️ Files & services
-
-| Path | Purpose |
-| ---- | ------- |
-| `/etc/phormal/bridge/<name>/meta.conf` | Bridge link metadata |
-| `/etc/phormal/relay/<name>/config.yaml` | Hysteria config |
-| `/etc/phormal/reverse/<name>/` | Reverse tunnel |
-| `/etc/phormal/<product>/<name>/` | GRE, Echo, Raw, Stream, … |
-| `/etc/phormal/phormal.conf` | Mirror URL, path-test SSH defaults |
-
-| Service pattern | Product |
-| --------------- | ------- |
-| `phormal-core@<name>` | Bridge SIT |
-| `phormal-relay@<name>` | Relay |
-| `phormal-reverse@<name>` | Reverse |
-| `phormal-gre@<name>` | GRE |
-| `phormal-icmp@<name>` | Echo |
-| `phormal-udp2raw@<name>` | Raw |
-| `phormal-btcp@<name>` | Stream |
-| `phormal-bwss@<name>` | Cloak |
-| `phormal-dns@<name>` | DNS |
-| `phormal-fwd@<name>` | Edge |
-
----
-
-## 🩺 Troubleshooting
-
-**Path test SSH fails**
-
-- Ensure key auth **or** be ready to type the peer root password when prompted.
-- Test manually: `ssh root@PEER_IP echo OK`
-
-**Relay clients timeout**
-
-- Users must use **entry IP + user port**, not exit IP or link port.
-- Restart exit first, then entry.
-
-**View logs**
-
-```bash
-journalctl -u 'phormal-relay@*' -f
-journalctl -u 'phormal-core@*' -f
-journalctl -u 'phormal-btcp@*' -f
+# or
+phormal
 ```
 
 ---
 
-## 🔄 Updating
+## Quick Start
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Schmi7zz/Phormal/main/phormal.sh -o /usr/local/bin/phormal && sed -i 's/\r$//' /usr/local/bin/phormal && chmod +x /usr/local/bin/phormal && sudo phormal
-```
+1. Install Phormal on **both** servers (command above).
+2. On one server, open the menu and run **option 1 — Path Auto-Test**. Enter the peer's SSH details once; Phormal probes every product across the real path.
+3. Read the results table. Phormal marks each product **PASS / FAIL** with a confidence level and prints a **BEST CHOICE**.
+4. Set up the recommended product: add the **exit** on the abroad server and the **entry** on the Iran server, using the menu options listed next to that product.
+5. (Optional) Enable the **auto-refresh schedule** to keep the link healthy automatically.
 
-See also [MULTILAYER.md](./MULTILAYER.md) for extended products and path-test details.
+> **Tip:** Re-run the Path Auto-Test whenever you add a new peer or the network behavior changes — then just follow the BEST CHOICE.
 
 ---
 
-## 🙌 Credits
+## Products & Menu Map
 
-- **Author:** [Schmi7z](https://github.com/Schmi7zz)
-- **Channel:** [@SchmitzWS](https://t.me/SchmitzWS)
+| Menu | Section | Purpose |
+|------|---------|---------|
+| **1** | **Phormal Path Test** | Auto-probe every product between the two servers and recommend the best one |
+| **2–5** | **Phormal Bridge** | Add exit link · Add entry link · Manage links · Speedtest |
+| **6–9** | **Phormal Relay** | Add exit tunnel · Add entry tunnel · Manage tunnels · Speedtest |
+| **10–12** | **Phormal Reverse** | Add exit tunnel · Add entry tunnel · Manage tunnels |
+| **13–15** | **Phormal GRE** | Add exit tunnel · Add entry tunnel · Manage tunnels |
+| **16–18** | **Phormal Echo** | Add exit tunnel · Add entry tunnel · Manage tunnels |
+| **19–21** | **Phormal Raw** | Add exit tunnel · Add entry tunnel · Manage tunnels |
+| **22** | Manage | Status — overview of all links/tunnels and service health |
+| **23** | Manage | Phormal tuning — apply network/queue/buffer tuning |
+| **24** | Manage | Auto-refresh schedule — keep tunnels warm automatically |
+| **25** | Manage | Uninstall — clean, complete removal |
+| **0** | — | Exit |
 
-## 📄 License
+---
 
-GPL-3.0 — see [LICENSE](LICENSE.txt).
+## Choosing a Product
+
+You don't have to memorize this — the **Path Auto-Test (option 1)** decides for you. But here's what each product is built for:
+
+| Product | Best for | Notes |
+|---------|----------|-------|
+| **Phormal Bridge** | A solid general-purpose default on clean paths | Stable point-to-point link with a private internal address space between the two servers |
+| **Phormal Relay** | Maximum throughput when the path is open | High-speed, obfuscated relay with port-hopping; *Iran = entry, abroad = exit* |
+| **Phormal Reverse** | Paths where only outbound TCP survives | The abroad side accepts the connection; the Iran side dials out |
+| **Phormal GRE** | Low-latency, low-overhead links on friendly paths | Lightweight kernel-level point-to-point tunnel |
+| **Phormal Echo** | Heavily restricted paths | Carries the link over basic echo traffic when little else passes |
+| **Phormal Raw** | UDP-hostile filtering | Shapes the link to slip past filters that punish raw UDP |
+
+**Roles in one line:** every product has an **exit** side (set up on the **abroad / kharej** server) and an **entry** side (set up on the **Iran** server). Add the exit first, then the entry.
+
+---
+
+## Requirements
+
+- A Linux server on each side (Debian/Ubuntu family recommended).
+- **root** / `sudo` access on both servers.
+- **Two servers** — typically one in Iran and one abroad.
+- For the Path Auto-Test: outbound **SSH** from the server you run the test on, to the peer (one direction only — Phormal never opens SSH back from the peer).
+
+---
+
+## Uninstall
+
+Open the menu and choose **option 25 — Uninstall**. Phormal removes its services, binaries, and files cleanly. Everything Phormal creates lives under `/etc/phormal`, so nothing is left scattered across the system.
+
+---
+
+## License
+
+This project is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
+See the [LICENSE](LICENSE) file for the full text.
+
+```
+Copyright (C) 2026 Schmi7z — github.com/Schmi7zz
+```
+
+---
+
+## Links & Contact
+
+- **Telegram Channel:** [@SchmitzWS](https://t.me/SchmitzWS)
+- **Contact:** [@Schmi7zz](https://t.me/Schmi7zz)
+- **GitHub:** [github.com/Schmi7zz/Phormal](https://github.com/Schmi7zz/Phormal)
+
+<div align="center">
+
+**Phormal Tunnel** — pick the mode that fits your path.
+
+</div>
