@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.4.12"
+readonly PHORMAL_VERSION="5.5.1"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -39,8 +39,8 @@ readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 # /etc/phormal/phormal.conf with  MIRROR_BASE=http://your-server:8880/phormal
 # Files expected on the mirror host (served at MIRROR_BASE):
 #   gost-linux-{amd64,arm64}  hysteria-linux-{amd64,arm64}
-#   rathole-linux-{amd64,arm64}  backhaul-linux-{amd64,arm64}
-#   backhaul-linux-{amd64,arm64}  icmp_tun-linux-{amd64,arm64}  udp2raw-linux-{amd64,arm64}
+#   rathole-linux-{amd64,arm64}
+#   icmp_tun-linux-{amd64,arm64}  udp2raw-linux-{amd64,arm64}
 #   iodine-linux-{amd64,arm64}  iodined-linux-{amd64,arm64}  proxyforwarder-linux-{amd64,arm64}
 # phormal.sh itself is installed from GitHub, not the mirror.
 readonly DEFAULT_MIRROR_BASE="http://85.198.16.108:8880/phormal"
@@ -55,9 +55,6 @@ readonly REVERSE_RUN="/usr/local/bin/phormal-reverse-run"
 readonly REVERSE_TMPL="/etc/systemd/system/phormal-reverse@.service"
 readonly RATHOLE_RELEASE_REPO="rapiz1/rathole"
 readonly RATHOLE_RELEASE_TAG="v0.5.0"
-readonly BACKHAUL_RELEASE_REPO="Musixal/Backhaul"
-readonly BACKHAUL_RELEASE_TAG="v0.7.2"
-
 
 # Set once per phormal invocation when a binary must be downloaded (mirror/github/manual).
 BINARY_SOURCE=""
@@ -1534,7 +1531,10 @@ readonly CDN_TMPL="/etc/systemd/system/phormal-cdn@.service"
 readonly CDN_RUN="/usr/local/bin/phormal-cdn-run"
 
 cdn_svc()       { printf 'phormal-cdn@%s.service' "$1"; }
-cdn_svc_state() { systemctl is-active "$(cdn_svc "$1")" 2>/dev/null || echo unknown; }
+cdn_svc_state() {
+  local st; st="$(systemctl is-active "$(cdn_svc "$1")" 2>/dev/null || true)"
+  printf '%s' "${st:-unknown}"
+}
 
 # gost is the same binary used by Bridge publishers; for CDN we reuse it and the
 # same source selection (mirror / github / manual), just with CDN wording.
@@ -1620,8 +1620,16 @@ relay_cdn_setup() {
 }
 
 
-relay_svc()        { printf 'phormal-relay@%s.service' "$1"; }
-relay_svc_state()  { systemctl is-active "$(relay_svc "$1")" 2>/dev/null || echo unknown; }
+relay_svc() { printf 'phormal-relay@%s.service' "$1"; }
+
+systemd_is_active_clean() {
+  local unit="$1" st
+  st="$(systemctl is-active "${unit}" 2>/dev/null || true)"
+  printf '%s' "${st:-unknown}"
+}
+
+relay_svc_state() { systemd_is_active_clean "$(relay_svc "$1")"; }
+relay_svc_is_active() { [[ "$(relay_svc_state "$1")" == "active" ]]; }
 
 # ------------------------------------------------------------------------------
 #  systemd template + run wrapper (installed once)
@@ -1980,7 +1988,7 @@ diagnose_instance() {
   rule
   info "Diagnostics — tunnel '${name}' (${role})"
   rule
-  if [[ "$(relay_svc_state "${name}")" == "active" ]]; then
+  if relay_svc_is_active "${name}"; then
     good "service active"
   else
     fail "service $(relay_svc_state "${name}")"
@@ -2278,7 +2286,7 @@ rmeta_set() {
 }
 
 rev_svc()       { printf 'phormal-reverse@%s.service' "$1"; }
-rev_svc_state() { systemctl is-active "$(rev_svc "$1")" 2>/dev/null || echo unknown; }
+rev_svc_state() { systemd_is_active_clean "$(rev_svc "$1")"; }
 
 reverse_pick_name() {
   local raw name
@@ -2739,8 +2747,6 @@ systemctl restart 'phormal-reverse@*.service' 2>/dev/null || true
 systemctl restart 'phormal-gre@*.service'    2>/dev/null || true
 systemctl restart 'phormal-icmp@*.service'   2>/dev/null || true
 systemctl restart 'phormal-udp2raw@*.service' 2>/dev/null || true
-systemctl restart 'phormal-btcp@*.service'   2>/dev/null || true
-systemctl restart 'phormal-bwss@*.service'   2>/dev/null || true
 systemctl restart 'phormal-dns@*.service'    2>/dev/null || true
 systemctl restart 'phormal-fwd@*.service'    2>/dev/null || true
 EOF
@@ -2793,9 +2799,9 @@ status() {
   done < <(reverse_instances)
   [[ ${rany} -eq 0 ]] && warn "no reverse tunnels configured"
   echo
-  info "PHORMAL GRE / ECHO / RAW / STREAM / CLOAK / DNS / EDGE"
+  info "PHORMAL GRE / ECHO / RAW / DNS / EDGE"
   local lany=0 lk ln pname
-  for lk in gre icmp udp2raw btcp bwss dns fwd; do
+  for lk in gre icmp udp2raw dns fwd; do
     pname="$(layer_phormal_name "${lk}")"
     while read -r ln; do
       [[ -n "${ln}" ]] || continue
@@ -2870,7 +2876,7 @@ purge() {
   rm -f /usr/bin/phormal-refresh.sh
   crontab -l 2>/dev/null | grep -v 'phormal-refresh' | crontab - 2>/dev/null || true
   local lk ln
-  for lk in gre icmp udp2raw btcp bwss dns fwd; do
+  for lk in gre icmp udp2raw dns fwd btcp bwss; do
     while read -r ln; do
       [[ -n "${ln}" ]] || continue
       systemctl stop "phormal-${lk}@${ln}" 2>/dev/null || true
@@ -2879,8 +2885,10 @@ purge() {
     done < <(layer_instances "${lk}" 2>/dev/null || true)
     rm -f "/etc/systemd/system/phormal-${lk}@.service"
   done
-  rm -f "${LAYER_RUN}" "${LAYER_GRE_RUN}" "${LAYER_BACKHAUL_BIN}" "${LAYER_ICMP_BIN}" \
-    "${LAYER_UDP2RAW_BIN}" "${LAYER_IODINE_BIN}" "${LAYER_IODINED_BIN}" "${LAYER_FWD_BIN}"
+  rm -f "${LAYER_RUN}" "${LAYER_GRE_RUN}" "${LAYER_ICMP_BIN}" \
+    "${LAYER_UDP2RAW_BIN}" "${LAYER_IODINE_BIN}" "${LAYER_IODINED_BIN}" "${LAYER_FWD_BIN}" \
+    /usr/local/bin/phormal-backhaul \
+    /etc/systemd/system/phormal-btcp@.service /etc/systemd/system/phormal-bwss@.service
   rm -rf "${PHORMAL_HOME}"
   systemctl daemon-reload
   good "Phormal removed. (CLI shortcut left at ${CLI_LINK}; delete manually if desired.)"
@@ -2908,7 +2916,6 @@ readonly UDP2RAW_RELEASE_TAG="20230206.0"
 readonly UDP2RAW_RELEASE_REPO="wangyu-/udp2raw"
 readonly IODINE_SRC_REPO="yarrick/iodine"
 readonly PROXYFWD_REPO="Azumi67/proxyforwarder"
-readonly LAYER_BACKHAUL_BIN="/usr/local/bin/phormal-backhaul"
 readonly LAYER_ICMP_BIN="/usr/local/bin/phormal-icmp-tun"
 readonly LAYER_UDP2RAW_BIN="/usr/local/bin/phormal-udp2raw"
 readonly LAYER_IODINE_BIN="/usr/local/bin/phormal-iodine"
@@ -2916,7 +2923,7 @@ readonly LAYER_IODINED_BIN="/usr/local/bin/phormal-iodined"
 readonly LAYER_FWD_BIN="/usr/local/bin/phormal-layer-fwd"
 readonly LAYER_RUN="/usr/local/bin/phormal-layer-run"
 readonly LAYER_GRE_RUN="/usr/local/bin/phormal-gre-run"
-readonly LAYER_KEYS=(gre icmp udp2raw btcp bwss dns fwd)
+readonly LAYER_KEYS=(gre icmp udp2raw dns fwd)
 
 # Phormal product display names (internal key → user-facing brand)
 layer_phormal_name() {
@@ -2924,8 +2931,6 @@ layer_phormal_name() {
     gre)     printf 'Phormal GRE' ;;
     icmp)    printf 'Phormal Echo' ;;
     udp2raw) printf 'Phormal Raw' ;;
-    btcp)    printf 'Phormal Stream' ;;
-    bwss)    printf 'Phormal Cloak' ;;
     dns)     printf 'Phormal DNS' ;;
     fwd)     printf 'Phormal Edge' ;;
     *)       printf 'Phormal Layer' ;;
@@ -2989,8 +2994,6 @@ layer_create_entry() {
     gre)     create_layer_gre_entry ;;
     icmp)    create_layer_icmp_entry ;;
     udp2raw) create_layer_udp2raw_entry ;;
-    btcp)    create_layer_backhaul_entry btcp tcp ;;
-    bwss)    create_layer_backhaul_entry bwss wss ;;
     dns)     create_layer_dns_entry ;;
     fwd)     create_layer_edge_entry ;;
     *)       fail "Unknown product."; return 1 ;;
@@ -3003,8 +3006,6 @@ layer_create_exit() {
     gre)     create_layer_gre_exit ;;
     icmp)    create_layer_icmp_exit ;;
     udp2raw) create_layer_udp2raw_exit ;;
-    btcp)    create_layer_backhaul_exit btcp tcp ;;
-    bwss)    create_layer_backhaul_exit bwss wss ;;
     dns)     create_layer_dns_exit ;;
     fwd)     create_layer_edge_exit ;;
     *)       fail "Unknown product."; return 1 ;;
@@ -3014,8 +3015,6 @@ layer_create_exit() {
 manage_gre_menu()    { manage_phormal_layer_menu gre; }
 manage_echo_menu()   { manage_phormal_layer_menu icmp; }
 manage_raw_menu()    { manage_phormal_layer_menu udp2raw; }
-manage_stream_menu() { manage_phormal_layer_menu btcp; }
-manage_cloak_menu()  { manage_phormal_layer_menu bwss; }
 manage_dns_layer_menu() { manage_phormal_layer_menu dns; }
 manage_edge_menu()   { manage_phormal_layer_menu fwd; }
 
@@ -3066,8 +3065,9 @@ layer_pick_name() {
 }
 
 layer_svc_state() {
-  local svc="$1"
-  systemctl is-active "${svc}" 2>/dev/null || printf 'inactive'
+  local svc="$1" st
+  st="$(systemctl is-active "${svc}" 2>/dev/null || true)"
+  printf '%s' "${st:-inactive}"
 }
 
 # ---- Mirror URL helpers ----
@@ -3076,11 +3076,6 @@ mirror_layer_url() {
   base="$(mirror_base)"
   [[ -n "${base}" ]] || return 1
   printf '%s/%s' "${base%/}" "${file}"
-}
-
-mirror_backhaul_url() {
-  local arch="$1"
-  mirror_layer_url "backhaul-linux-${arch}"
 }
 
 mirror_icmp_tun_url() {
@@ -3108,22 +3103,11 @@ mirror_proxyfwd_url() {
   mirror_layer_url "proxyforwarder-linux-${arch}"
 }
 
-backhaul_layer_tgz_url() {
-  local arch="$1"
-  printf 'https://github.com/%s/releases/download/%s/backhaul_linux_%s.tar.gz' \
-    "${BACKHAUL_RELEASE_REPO}" "${BACKHAUL_RELEASE_TAG}" "${arch}"
-}
-
 udp2raw_upstream_tgz_url() {
   printf 'https://github.com/%s/releases/download/%s/udp2raw_binaries.tar.gz' \
     "${UDP2RAW_RELEASE_REPO}" "${UDP2RAW_RELEASE_TAG}"
 }
 
-verify_backhaul_layer_tmp() {
-  local bin="$1"
-  [[ -x "${bin}" ]] || return 1
-  "${bin}" -h >/dev/null 2>&1 || "${bin}" --help >/dev/null 2>&1
-}
 verify_icmp_tun_tmp() {
   local b="$1" out
   [[ -x "${b}" ]] || return 1
@@ -3141,53 +3125,6 @@ verify_iodine_tmp() {
 }
 verify_proxyfwd_tmp() {
   [[ -x "$1" ]] && "$1" --help >/dev/null 2>&1
-}
-
-install_layer_backhaul() {
-  local arch urls=() dest="${LAYER_BACKHAUL_BIN}" mirror manual
-  arch="$(machine_arch)" || return 1
-  [[ -x "${dest}" ]] && verify_backhaul_layer_tmp "${dest}" && return 0
-  choose_binary_source || true
-  if [[ "${BINARY_SOURCE}" == "manual" ]]; then
-    manual="${MANUAL_DIR}/backhaul-linux-${arch}"
-    [[ -f "${manual}" ]] || { fail "Place backhaul at ${MANUAL_DIR}/backhaul-linux-${arch}"; return 1; }
-    cp -f "${manual}" "${dest}" && chmod +x "${dest}"
-    verify_backhaul_layer_tmp "${dest}" && { good "Backhaul engine installed (manual)."; return 0; }
-    return 1
-  fi
-  if [[ "${BINARY_SOURCE}" == "mirror" ]]; then
-    mirror="$(mirror_backhaul_url "${arch}" 2>/dev/null || true)"
-    [[ -n "${mirror}" ]] && urls+=("${mirror}")
-  fi
-  urls+=("$(backhaul_layer_tgz_url "${arch}")")
-  local tmp tgz td
-  for mirror in "${urls[@]}"; do
-    [[ -z "${mirror}" ]] && continue
-    if [[ "${mirror}" == *".tar.gz" ]]; then
-      tgz="$(mktemp)"; td="$(mktemp -d)"
-      if fetch_url "${mirror}" "${tgz}"; then
-        tar xzf "${tgz}" -C "${td}" 2>/dev/null || true
-        if [[ -f "${td}/backhaul" ]]; then
-          cp -f "${td}/backhaul" "${dest}"
-        else
-          local found
-          found="$(find "${td}" -maxdepth 2 -name backhaul -type f 2>/dev/null | head -n1)"
-          [[ -n "${found}" ]] && cp -f "${found}" "${dest}"
-        fi
-        rm -rf "${td}" "${tgz}"
-        chmod +x "${dest}" 2>/dev/null || true
-        if verify_backhaul_layer_tmp "${dest}"; then
-          good "Backhaul engine installed."
-          return 0
-        fi
-      fi
-      rm -rf "${td}" "${tgz}" 2>/dev/null || true
-    else
-      fetch_binary "${dest}" verify_backhaul_layer_tmp "Backhaul" "${mirror}" && return 0
-    fi
-  done
-  install_local_binary "${dest}" || return 1
-  verify_backhaul_layer_tmp "${dest}"
 }
 
 install_layer_icmp_tun() {
@@ -3283,9 +3220,6 @@ meta="${dir}/meta.conf"
 # shellcheck disable=SC1090
 source "${meta}"
 case "${key}" in
-  btcp|bwss)
-    exec /usr/local/bin/phormal-backhaul -c "${dir}/config.toml"
-    ;;
   icmp)
     # shellcheck disable=SC2086
     exec /usr/local/bin/phormal-icmp-tun ${ICMP_ARGS:-}
@@ -3353,7 +3287,7 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 WantedBy=multi-user.target
 EOF
   local key
-  for key in icmp udp2raw btcp bwss dns fwd; do
+  for key in icmp udp2raw dns fwd; do
     cat > "/etc/systemd/system/phormal-${key}@.service" <<EOF
 [Unit]
 Description=Phormal layer ${key} (%i)
@@ -3373,54 +3307,6 @@ WantedBy=multi-user.target
 EOF
   done
   systemctl daemon-reload
-}
-
-layer_write_ports_block() {
-  local ports="$1" p
-  IFS=',' read -ra parr <<< "${ports}"
-  for p in "${parr[@]}"; do
-    p="${p// /}"
-    [[ -n "${p}" && "${p}" =~ ^[0-9]+$ ]] || continue
-    echo '[[ports]]'
-    echo "local = \"127.0.0.1:${p}\""
-    echo "remote = \"${p}\""
-  done
-}
-
-layer_write_backhaul_entry() {
-  local key="$1" name="$2" transport dir token link_port ports
-  dir="$(layer_idir "${key}" "${name}")"
-  token="$(layer_meta_get "${key}" "${name}" TOKEN)"
-  link_port="$(layer_meta_get "${key}" "${name}" LINK_PORT)"
-  ports="$(layer_meta_get "${key}" "${name}" PORTS)"
-  {
-    echo '[server]'
-    echo "bind_addr = \"0.0.0.0:${link_port}\""
-    echo "transport = \"${transport}\""
-    echo "token = \"${token}\""
-    echo 'heartbeat = 40'
-    echo 'channel_size = 2048'
-    echo 'accept_udp = true'
-    if [[ -n "${ports}" ]]; then
-      layer_write_ports_block "${ports}"
-    fi
-  } > "${dir}/config.toml"
-}
-
-layer_write_backhaul_exit() {
-  local key="$1" name="$2" transport dir token link_port remote
-  dir="$(layer_idir "${key}" "${name}")"
-  token="$(layer_meta_get "${key}" "${name}" TOKEN)"
-  link_port="$(layer_meta_get "${key}" "${name}" LINK_PORT)"
-  remote="$(layer_meta_get "${key}" "${name}" REMOTE_V4)"
-  {
-    echo '[client]'
-    echo "remote_addr = \"${remote}:${link_port}\""
-    echo "transport = \"${transport}\""
-    echo "token = \"${token}\""
-    echo 'heartbeat = 40'
-    echo 'connection_pool = 8'
-  } > "${dir}/config.toml"
 }
 
 layer_start_instance() {
@@ -3489,55 +3375,6 @@ _create_layer_gre_tunnel() {
 
 create_layer_gre_entry() { _create_layer_gre_tunnel entry; }
 create_layer_gre_exit()  { _create_layer_gre_tunnel exit; }
-
-create_layer_backhaul_entry() {
-  local key="$1" transport name token link_port ports sug pname
-  pname="$(layer_phormal_name "${key}")"
-  rule
-  info "${pname} — add entry tunnel (Backhaul ${transport})"
-  rule
-  name="$(layer_pick_name "${key}")" || return 1
-  install_layer_backhaul || return 1
-  layer_install_runtime
-  mkdir -p "$(layer_idir "${key}" "${name}")"
-  layer_meta_set "${key}" "${name}" ROLE entry
-  link_port="$(ask 'Link port [3080]')"; link_port="${link_port:-3080}"
-  layer_meta_set "${key}" "${name}" LINK_PORT "${link_port}"
-  sug="$(rand_secret)"
-  token="$(ask "Token [${sug}]")"; token="${token:-${sug}}"
-  layer_meta_set "${key}" "${name}" TOKEN "${token}"
-  ports="$(gather_ports)" || return 1
-  layer_meta_set "${key}" "${name}" PORTS "${ports}"
-  layer_write_backhaul_entry "${key}" "${name}" "${transport}"
-  layer_start_instance "${key}" "${name}"
-  layer_print_connect_line "${key}" "${name}"
-}
-
-create_layer_backhaul_exit() {
-  local key="$1" transport name remote token link_port ports local_host pname
-  pname="$(layer_phormal_name "${key}")"
-  rule
-  info "${pname} — add exit tunnel (Backhaul ${transport})"
-  rule
-  name="$(layer_pick_name "${key}")" || return 1
-  install_layer_backhaul || return 1
-  layer_install_runtime
-  mkdir -p "$(layer_idir "${key}" "${name}")"
-  layer_meta_set "${key}" "${name}" ROLE exit
-  remote="$(ask 'Iran entry public IPv4')"; valid_ipv4 "${remote}" || return 1
-  layer_meta_set "${key}" "${name}" REMOTE_V4 "${remote}"
-  link_port="$(ask 'Link port (match entry) [3080]')"; link_port="${link_port:-3080}"
-  layer_meta_set "${key}" "${name}" LINK_PORT "${link_port}"
-  token="$(ask 'Token (match entry)')"; [[ -n "${token}" ]] || return 1
-  layer_meta_set "${key}" "${name}" TOKEN "${token}"
-  ports="$(gather_ports)" || return 1
-  layer_meta_set "${key}" "${name}" PORTS "${ports}"
-  local_host="$(ask 'Local upstream host [127.0.0.1]')"; local_host="${local_host:-127.0.0.1}"
-  layer_meta_set "${key}" "${name}" LOCAL_HOST "${local_host}"
-  layer_write_backhaul_exit "${key}" "${name}" "${transport}"
-  layer_start_instance "${key}" "${name}"
-  good "Exit ${pname}/${name} dials ${remote}:${link_port}"
-}
 
 create_layer_icmp_entry() {
   rule
@@ -4033,7 +3870,7 @@ layer_autotest_prepare_hosts() {
       "${RELAY_BIN}" "version" "hysteria (Relay)" "${urls[@]}" 2>/dev/null || true
   fi
 
-  if [[ "${only}" == "all" || "${only}" == *reverse* || "${only}" == *tcp* || "${only}" == *stream* ]]; then
+  if [[ "${only}" == "all" || "${only}" == *reverse* || "${only}" == *tcp* ]]; then
     install_reverse_engine || warn "Local rathole (Reverse) download failed — continuing"
     urls=()
     while IFS= read -r u; do [[ -n "${u}" ]] && urls+=("${u}"); done < <(layer_build_engine_urls reverse "${peer_arch}")
@@ -4291,7 +4128,8 @@ layer_ssh_peer_relay_lookup() {
        remote=\$(grep -E '^REMOTE_V4=' \"\${f}\" | head -n1 | cut -d= -f2-)
        listen=\$(grep -E '^LISTEN=' \"\${f}\" | head -n1 | cut -d= -f2-)
        listen=\${listen:-443}
-       st=\$(systemctl is-active phormal-relay@\${name}.service 2>/dev/null || echo down)
+       st=\$(systemctl is-active phormal-relay@\${name}.service 2>/dev/null || true)
+       st=\${st:-down}
        if [[ \"\${st}\" == active ]]; then
          if [[ \"\${role}\" == entry && \"\${remote}\" == \"\${toward}\" ]]; then
            echo \"UP:entry:\${name}:\${remote}:\${listen}\"; exit 0
@@ -4356,7 +4194,8 @@ layer_ssh_peer_relay_meta() {
        remote=\$(grep -E '^REMOTE_V4=' \"\${f}\" | head -n1 | cut -d= -f2-)
        listen=\$(grep -E '^LISTEN=' \"\${f}\" | head -n1 | cut -d= -f2-)
        listen=\${listen:-443}
-       st=\$(systemctl is-active phormal-relay@\${name}.service 2>/dev/null || echo stopped)
+       st=\$(systemctl is-active phormal-relay@\${name}.service 2>/dev/null || true)
+       st=\${st:-stopped}
        [[ \"\${st}\" == active ]] && st=up || st=stopped
        if [[ \"\${role}\" == entry && \"\${remote}\" == \"\${toward}\" ]]; then
          echo \"\${name}|\${role}|\${st}|\${remote}|\${listen}\"
@@ -4443,8 +4282,12 @@ layer_autotest_verify_peer_pairing() {
     [[ -n "${n}" ]] || continue
     remote="$(imeta_get "${n}" REMOTE_V4)"
     role="$(imeta_get "${n}" ROLE)"
-    [[ "${remote}" == "${peer_v4}" && "${role}" == entry ]] && \
-      info "  Relay: this host has entry '${n}' toward ${peer_v4}"
+    listen="$(imeta_get "${n}" LISTEN)"; listen="${listen:-443}"
+    if [[ "${role}" == entry && "${remote}" == "${peer_v4}" ]]; then
+      info "  Relay: this host has entry '${n}' toward ${peer_v4} ($(relay_svc_state "${n}"))"
+    elif [[ "${role}" == exit ]]; then
+      info "  Relay: this host has exit '${n}' on :${listen} ($(relay_svc_state "${n}"))"
+    fi
   done < <(relay_instances 2>/dev/null)
   case "${peer_relay}" in
     NONE|'') ;;
@@ -4546,10 +4389,8 @@ layer_autotest_recommendation() {
       "Phormal GRE (IPIP)")   menu_hint="options 13–15 (GRE, IPIP mode)" ;;
       "Phormal Echo")         menu_hint="options 16–18 (Echo)" ;;
       "Phormal Raw")          menu_hint="options 19–21 (Raw)" ;;
-      "Phormal Stream")       menu_hint="options 22–24 (Stream)" ;;
-      "Phormal Cloak")        menu_hint="options 25–27 (Cloak)" ;;
-      "Phormal DNS")          menu_hint="options 28–30 (DNS)" ;;
-      "Phormal Edge")         menu_hint="options 31–33 (Edge)" ;;
+      "Phormal DNS")          menu_hint="options 22–24 (DNS)" ;;
+      "Phormal Edge")         menu_hint="options 25–27 (Edge)" ;;
       *)                      menu_hint="see menu" ;;
     esac
     printf '  %-28s → %s\n' "${product}" "${menu_hint}"
@@ -4573,10 +4414,8 @@ layer_autotest_product_rank() {
     "Phormal GRE")          printf '80' ;;
     "Phormal GRE (IPIP)")  printf '79' ;;
     "Phormal Reverse")      printf '75' ;;
-    "Phormal Stream")       printf '74' ;;
     "Phormal Echo")         printf '70' ;;
     "Phormal Raw")          printf '65' ;;
-    "Phormal Cloak")        printf '60' ;;
     "Phormal Edge")         printf '20' ;;
     "Phormal DNS")          printf '10' ;;
     *)                      printf '50' ;;
@@ -4625,10 +4464,8 @@ layer_autotest_verdict() {
       "Phormal GRE"|"Phormal GRE (IPIP)") menu_hint="13–15 (GRE)" ;;
       "Phormal Echo")         menu_hint="16–18 (Echo)" ;;
       "Phormal Raw")          menu_hint="19–21 (Raw)" ;;
-      "Phormal Stream")       menu_hint="22–24 (Stream)" ;;
-      "Phormal Cloak")        menu_hint="25–27 (Cloak)" ;;
-      "Phormal DNS")          menu_hint="28–30 (DNS)" ;;
-      "Phormal Edge")         menu_hint="31–33 (Edge)" ;;
+      "Phormal DNS")          menu_hint="22–24 (DNS)" ;;
+      "Phormal Edge")         menu_hint="25–27 (Edge)" ;;
       *) menu_hint="see menu" ;;
     esac
     printf '\n'
@@ -4648,9 +4485,79 @@ layer_tunnel_modprobe() {
   local mode="$1"
   case "${mode}" in
     sit)  modprobe sit 2>/dev/null || true ;;
-    gre)  modprobe gre 2>/dev/null || true ;;
-    ipip) modprobe ipip 2>/dev/null || true; modprobe ip_gre 2>/dev/null || true ;;
+    gre)  modprobe gre 2>/dev/null || true; modprobe ip_gre 2>/dev/null || true ;;
+    ipip) modprobe ipip 2>/dev/null || true; modprobe ip_tunnel 2>/dev/null || true ;;
   esac
+}
+
+layer_kernel_tune_for_tunnel() {
+  local iface="$1"
+  sysctl -qw net.ipv4.conf.all.rp_filter=0 \
+    net.ipv4.conf.default.rp_filter=0 \
+    "net.ipv4.conf.${iface}.rp_filter=0" \
+    net.ipv4.ip_forward=1 2>/dev/null || true
+  iptables -C INPUT -p gre -j ACCEPT 2>/dev/null || iptables -I INPUT -p gre -j ACCEPT 2>/dev/null || true
+  iptables -C INPUT -p 4 -j ACCEPT 2>/dev/null || iptables -I INPUT -p 4 -j ACCEPT 2>/dev/null || true
+}
+
+layer_kernel_add_tunnel() {
+  local iface="$1" mode="$2" lip="$3" rip="$4" gkey="$5"
+  case "${mode}" in
+    gre)
+      layer_local_root_run "ip link del ${iface} 2>/dev/null; \
+        (ip link add ${iface} type gre remote ${rip} local ${lip} ttl 64 key ${gkey} 2>/dev/null || \
+         ip tunnel add ${iface} mode gre remote ${rip} local ${lip} ttl 64 key ${gkey})" 2>/dev/null
+      ;;
+    ipip)
+      layer_local_root_run "ip link del ${iface} 2>/dev/null; \
+        (ip link add ${iface} type ipip remote ${rip} local ${lip} ttl 64 2>/dev/null || \
+         ip tunnel add ${iface} mode ipip remote ${rip} local ${lip} ttl 64)" 2>/dev/null
+      ;;
+    sit)
+      layer_local_root_run "ip link del ${iface} 2>/dev/null; \
+        (ip link add ${iface} type sit remote ${rip} local ${lip} ttl 64 2>/dev/null || \
+         ip tunnel add ${iface} mode sit remote ${rip} local ${lip} ttl 64)" 2>/dev/null
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+layer_kernel_remote_tunnel_cmd() {
+  local iface="$1" mode="$2" lip="$3" rip="$4" gkey="$5" lpriv="$6" rpriv="$7"
+  local add_cmd tune_cmd
+  tune_cmd="sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 \
+    net.ipv4.conf.${iface}.rp_filter=0 net.ipv4.ip_forward=1 2>/dev/null; \
+    iptables -C INPUT -p gre -j ACCEPT 2>/dev/null || iptables -I INPUT -p gre -j ACCEPT 2>/dev/null; \
+    iptables -C INPUT -p 4 -j ACCEPT 2>/dev/null || iptables -I INPUT -p 4 -j ACCEPT 2>/dev/null"
+  case "${mode}" in
+    gre)
+      add_cmd="ip link del ${iface} 2>/dev/null; \
+        (ip link add ${iface} type gre remote ${lip} local ${rip} ttl 64 key ${gkey} 2>/dev/null || \
+         ip tunnel add ${iface} mode gre remote ${lip} local ${rip} ttl 64 key ${gkey}) && \
+        ip link set ${iface} up && ip addr add ${rpriv}/30 dev ${iface}"
+      ;;
+    ipip)
+      add_cmd="ip link del ${iface} 2>/dev/null; \
+        (ip link add ${iface} type ipip remote ${lip} local ${rip} ttl 64 2>/dev/null || \
+         ip tunnel add ${iface} mode ipip remote ${lip} local ${rip} ttl 64) && \
+        ip link set ${iface} up && ip addr add ${rpriv}/30 dev ${iface}"
+      ;;
+    sit)
+      add_cmd="ip link del ${iface} 2>/dev/null; \
+        (ip link add ${iface} type sit remote ${lip} local ${rip} ttl 64 2>/dev/null || \
+         ip tunnel add ${iface} mode sit remote ${lip} local ${rip} ttl 64) && \
+        ip link set ${iface} up && ip addr add ${rpriv}/30 dev ${iface}"
+      ;;
+    *) return 1 ;;
+  esac
+  printf '%s; %s' "${add_cmd}" "${tune_cmd}"
+}
+
+layer_kernel_ping_via_tunnel() {
+  local iface="$1" src="$2" dst="$3"
+  ping -c 3 -W 3 -I "${src}" "${dst}" >/dev/null 2>&1 && return 0
+  ping -c 3 -W 3 -I "${iface}" "${dst}" >/dev/null 2>&1 && return 0
+  return 1
 }
 
 layer_local_root_run() {
@@ -4711,6 +4618,7 @@ layer_test_bridge_sit_ipv6_probe() {
 layer_test_kernel_pair() {
   local mode="$1" label="$2" local_v4="$3" remote_v4="$4" ssh_host ssh_port ssh_user
   local iface="pht${mode}$$" lip rip lpriv rpriv ok=FAIL conf=high note="" rerr=""
+  local gkey=$(( (RANDOM + $$) % 65535 )); [[ ${gkey} -eq 0 ]] && gkey=42
   ssh_host="$5"; ssh_port="$6"; ssh_user="$7"
   layer_autotest_require_peer_ssh || {
     layer_autotest_probe_begin "${label} (kernel ${mode} probe)"
@@ -4722,41 +4630,25 @@ layer_test_kernel_pair() {
   lpriv="10.99.1.1"; rpriv="10.99.1.2"
   layer_tunnel_modprobe "${mode}"
   layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-    "modprobe ${mode} 2>/dev/null; modprobe sit 2>/dev/null; modprobe gre 2>/dev/null" 2>/dev/null || true
+    "modprobe ${mode} 2>/dev/null; modprobe sit 2>/dev/null; modprobe gre 2>/dev/null; \
+     modprobe ipip 2>/dev/null; modprobe ip_tunnel 2>/dev/null" 2>/dev/null || true
   ip link del "${iface}" 2>/dev/null || true
-  case "${mode}" in
-    sit)
-      layer_local_root_run "ip tunnel add ${iface} mode sit remote ${rip} local ${lip} ttl 64" 2>/dev/null \
-        || note="local sit add failed (need root/sudo or kernel sit module)"
-      ;;
-    gre)
-      layer_local_root_run "ip tunnel add ${iface} mode gre remote ${rip} local ${lip} ttl 64 key $(($$ % 65535))" 2>/dev/null \
-        || note="local gre add failed (need root/sudo or kernel gre module)"
-      ;;
-    ipip)
-      layer_local_root_run "ip tunnel add ${iface} mode ipip remote ${rip} local ${lip} ttl 64" 2>/dev/null \
-        || note="local ipip add failed (need root/sudo or modprobe ipip)"
-      ;;
-  esac
+  if ! layer_kernel_add_tunnel "${iface}" "${mode}" "${lip}" "${rip}" "${gkey}"; then
+    note="local ${mode} add failed (need root/sudo or modprobe ${mode})"
+  fi
   if [[ -z "${note}" ]]; then
     layer_local_root_run "ip link set ${iface} up && ip addr add ${lpriv}/30 dev ${iface}" 2>/dev/null \
       || note="local ${mode} iface up failed"
+    layer_kernel_tune_for_tunnel "${iface}"
   fi
   if [[ -z "${note}" ]]; then
-    local gkey; gkey="$(($$ % 65535))"
-    if [[ "${mode}" == gre ]]; then
-      rerr="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-        "ip link del ${iface} 2>/dev/null; ip tunnel add ${iface} mode gre remote ${lip} local ${rip} ttl 64 key ${gkey} && ip link set ${iface} up && ip addr add ${rpriv}/30 dev ${iface}" 2>&1)" \
-        || note="remote gre probe failed (peer needs root/sudo)"
-    else
-      rerr="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-        "ip link del ${iface} 2>/dev/null; ip tunnel add ${iface} mode ${mode} remote ${lip} local ${rip} ttl 64 && ip link set ${iface} up && ip addr add ${rpriv}/30 dev ${iface}" 2>&1)" \
-        || note="remote ${mode} probe failed (peer needs root/sudo)"
-    fi
+    rerr="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "$(layer_kernel_remote_tunnel_cmd "${iface}" "${mode}" "${lip}" "${rip}" "${gkey}" "${lpriv}" "${rpriv}")" 2>&1)" \
+      || note="remote ${mode} probe failed (peer needs root/sudo)"
     [[ -n "${note}" && -n "${rerr}" ]] && note="${note}: ${rerr##*$'\n'}"
   fi
   if [[ -z "${note}" ]]; then
-    sleep 2
+    sleep 3
     layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
       "ip link show ${iface} 2>/dev/null | grep -qE 'UP|LOWER_UP'" >/dev/null 2>&1 \
       || note="remote ${mode} iface not UP after setup"
@@ -4764,10 +4656,11 @@ layer_test_kernel_pair() {
   if [[ -z "${note}" ]]; then
     local local_ok=0 peer_ok=0
     info "  [1/2] this→peer ping on ${mode} (${lpriv}→${rpriv})…"
-    ping -c 3 -W 3 -I "${iface}" "${rpriv}" >/dev/null 2>&1 && local_ok=1
+    layer_kernel_ping_via_tunnel "${iface}" "${lpriv}" "${rpriv}" && local_ok=1
     info "  [2/2] peer→this ping on ${mode} (${rpriv}→${lpriv})…"
     layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-      "ping -c 3 -W 3 -I ${iface} ${lpriv}" >/dev/null 2>&1 && peer_ok=1
+      "ping -c 3 -W 3 -I ${rpriv} ${lpriv} >/dev/null 2>&1 || ping -c 3 -W 3 -I ${iface} ${lpriv} >/dev/null 2>&1" \
+      && peer_ok=1
     if [[ "${local_ok}" -eq 1 && "${peer_ok}" -eq 1 ]]; then
       ok=PASS
       note="bidirectional ping on ${mode} (this→peer:${local_ok} peer→this:${peer_ok})"
@@ -4775,7 +4668,7 @@ layer_test_kernel_pair() {
       ok=PASS; conf=med
       note="one-way ping on ${mode} (this→peer:${local_ok} peer→this:${peer_ok})"
     else
-      note="no ping on synthetic ${mode} tunnel (this→peer:${local_ok} peer→this:${peer_ok})"
+      note="no ping on synthetic ${mode} tunnel (this→peer:${local_ok} peer→this:${peer_ok}) — proto may be filtered"
     fi
   fi
   ip link del "${iface}" 2>/dev/null || true
@@ -4799,11 +4692,6 @@ layer_test_bridge_configured() {
   peer_meta="$(layer_ssh_peer_bridge_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
 
   if [[ -z "${info}" && ( -z "${peer_meta}" || "${peer_meta}" == NONE ) ]]; then
-    if layer_local_sit_to_peer "${peer_v4}"; then
-      layer_autotest_record "Phormal Bridge" "PASS" "med" \
-        "kernel SIT UP toward ${peer_v4} (no phormal meta on either side)"
-      return 0
-    fi
     info "  No Bridge config — creating paired SIT + internal IPv6 on both servers (like real Bridge)…"
     layer_test_bridge_sit_ipv6_probe "${local_v4}" "${peer_v4}" \
       "${ssh_host}" "${ssh_port}" "${ssh_user}"
@@ -4920,16 +4808,294 @@ layer_test_udp_echo() {
   layer_autotest_record "${label}" "${ok}" "${conf}" "${note}"
 }
 
+layer_relay_journal_connect_hint() {
+  local name="$1" hint
+  hint="$(journalctl -u "$(relay_svc "${name}")" -n 20 --no-pager 2>/dev/null \
+    | grep -oE 'connect error[^",}]*|failed to initialize[^",}]*' | tail -1 \
+    | sed 's/^[[:space:]]*//' | head -c 120)"
+  printf '%s' "${hint}"
+}
+
+layer_test_udp_port_open() {
+  local host="$1" port="$2" hp
+  hp="${port%-*}"
+  [[ "${hp}" =~ ^[0-9]+$ ]] || return 1
+  if command -v nc &>/dev/null; then
+    nc -z -u -w 3 "${host}" "${hp}" 2>/dev/null && return 0
+  fi
+  timeout 3 bash -c "echo >/dev/udp/${host}/${hp}" 2>/dev/null && return 0
+  return 1
+}
+
+layer_relay_probe_gen_tls() {
+  local tls_dir="$1"
+  local cert="${tls_dir}/cert.crt" key="${tls_dir}/cert.key"
+  mkdir -p "${tls_dir}"
+  [[ -f "${cert}" && -f "${key}" ]] && return 0
+  openssl req -x509 -nodes -newkey rsa:2048 \
+    -keyout "${key}" -out "${cert}" -days 1 -subj "/CN=phormal-probe" 2>/dev/null
+}
+
+layer_relay_probe_write_exit_yaml() {
+  local file="$1" port="$2" auth="$3" obfs="$4" tls_dir="$5"
+  mkdir -p "$(dirname "${file}")" "${tls_dir}" 2>/dev/null || return 1
+  {
+    echo "listen: :${port}"
+    echo ""
+    echo "tls:"
+    echo "  cert: ${tls_dir}/cert.crt"
+    echo "  key: ${tls_dir}/cert.key"
+    echo ""
+    echo "auth:"
+    echo "  type: password"
+    echo "  password: ${auth}"
+    echo ""
+    echo "obfs:"
+    echo "  type: salamander"
+    echo "  salamander:"
+    echo "    password: ${obfs}"
+    echo ""
+    echo "bandwidth:"
+    echo "  up: 50 mbps"
+    echo "  down: 50 mbps"
+    echo ""
+    relay_engine_block
+  } > "${file}"
+}
+
+layer_relay_probe_write_entry_yaml() {
+  local file="$1" server_ip="$2" port="$3" auth="$4" obfs="$5"
+  mkdir -p "$(dirname "${file}")" 2>/dev/null || return 1
+  {
+    echo "server: ${server_ip}:${port}"
+    echo ""
+    echo "auth: ${auth}"
+    echo ""
+    echo "tls:"
+    echo "  insecure: true"
+    echo ""
+    echo "obfs:"
+    echo "  type: salamander"
+    echo "  salamander:"
+    echo "    password: ${obfs}"
+    echo ""
+    echo "bandwidth:"
+    echo "  up: 50 mbps"
+    echo "  down: 50 mbps"
+    echo ""
+    relay_engine_block
+    echo ""
+    echo "fastOpen: true"
+  } > "${file}"
+}
+
+layer_relay_probe_wait_server_log() {
+  local log="$1" i
+  for i in $(seq 1 15); do
+    [[ -f "${log}" ]] && grep -q 'server up and running' "${log}" 2>/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
+layer_relay_probe_wait_client_log() {
+  local log="$1" pid="$2" i
+  for i in $(seq 1 15); do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      [[ -f "${log}" ]] && grep -qi FATAL "${log}" 2>/dev/null && return 1
+      return 1
+    fi
+    [[ -f "${log}" ]] && grep -qiE 'connected|established|ready' "${log}" 2>/dev/null && return 0
+    [[ ${i} -ge 8 ]] && [[ -f "${log}" ]] && ! grep -qi FATAL "${log}" 2>/dev/null && return 0
+    sleep 1
+  done
+  kill "${pid}" 2>/dev/null || true
+  return 1
+}
+
+layer_relay_probe_cleanup_local() {
+  local dir="$1"
+  [[ -z "${dir}" || ! -d "${dir}" ]] && return 0
+  [[ -f "${dir}/cli.pid" ]] && kill "$(cat "${dir}/cli.pid" 2>/dev/null)" 2>/dev/null || true
+  [[ -f "${dir}/srv.pid" ]] && kill "$(cat "${dir}/srv.pid" 2>/dev/null)" 2>/dev/null || true
+  pkill -f "${dir}/" 2>/dev/null || true
+  rm -rf "${dir}"
+}
+
+layer_relay_probe_synthetic_fini() {
+  local dir="$1" pdir="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
+  kill "${LAYER_RELAY_PROBE_SRV_PID:-}" 2>/dev/null || true
+  kill "${LAYER_RELAY_PROBE_CLI_PID:-}" 2>/dev/null || true
+  LAYER_RELAY_PROBE_SRV_PID=""
+  LAYER_RELAY_PROBE_CLI_PID=""
+  layer_relay_probe_cleanup_peer "${ssh_host}" "${ssh_port}" "${ssh_user}" "${pdir}"
+  layer_relay_probe_cleanup_local "${dir}"
+}
+
+layer_relay_probe_cleanup_peer() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3" pdir="$4"
+  [[ -z "${pdir}" ]] && return 0
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "[[ -f '${pdir}/cli.pid' ]] && kill \$(cat '${pdir}/cli.pid') 2>/dev/null; \
+     [[ -f '${pdir}/srv.pid' ]] && kill \$(cat '${pdir}/srv.pid') 2>/dev/null; \
+     pkill -f '${pdir}/entry.yaml' 2>/dev/null; pkill -f '${pdir}/exit.yaml' 2>/dev/null; \
+     rm -rf '${pdir}'" 2>/dev/null || true
+}
+
+layer_local_relay_toward_peer() {
+  local peer_v4="$1" n role remote found_exit=""
+  while read -r n; do
+    [[ -n "${n}" ]] || continue
+    role="$(imeta_get "${n}" ROLE)"
+    remote="$(imeta_get "${n}" REMOTE_V4)"
+    if [[ "${role}" == entry && "${remote}" == "${peer_v4}" ]]; then
+      printf '%s|entry' "${n}"
+      return 0
+    fi
+    [[ "${role}" == exit ]] && found_exit="${n}"
+  done < <(relay_instances 2>/dev/null)
+  [[ -n "${found_exit}" ]] && { printf '%s|exit' "${found_exit}"; return 0; }
+  return 1
+}
+
+layer_test_relay_synthetic_probe() {
+  local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
+  local probe_id="phmr$$"
+  local dir="/tmp/phormal-relay-probe-${probe_id}"
+  local pdir="/tmp/phormal-relay-probe-${probe_id}"
+  local port_fwd port_rev auth obfs tls_dir ok=FAIL conf=high note=""
+  local local_ok=0 peer_ok=0 cli_pid srv_pid err_fwd err_rev
+
+  install_relay_engine 2>/dev/null || true
+  if [[ ! -x "${RELAY_BIN}" ]]; then
+    layer_autotest_record "Phormal Relay" "inconclusive" "low" "hysteria binary missing on this host"
+    return 0
+  fi
+
+  layer_relay_probe_cleanup_peer "${ssh_host}" "${ssh_port}" "${ssh_user}" "${pdir}"
+  layer_relay_probe_cleanup_local "${dir}"
+
+  port_fwd=$((47000 + ($$ % 2000)))
+  port_rev=$((port_fwd + 1))
+  auth="$(rand_secret)"
+  obfs="$(rand_secret)"
+  tls_dir="${dir}/tls"
+  if ! mkdir -p "${dir}/tls" "${dir}/peer-tls-staging"; then
+    layer_autotest_record "Phormal Relay" "inconclusive" "low" "cannot create probe workspace ${dir}"
+    return 0
+  fi
+  layer_relay_probe_gen_tls "${tls_dir}" || true
+
+  info "  [1/2] synthetic Relay — local entry → peer exit (QUIC ${peer_v4}:${port_fwd})…"
+  if ! layer_relay_probe_write_entry_yaml "${dir}/entry-local.yaml" "${peer_v4}" "${port_fwd}" "${auth}" "${obfs}" \
+      || ! layer_relay_probe_write_exit_yaml "${dir}/peer-exit.yaml" "${port_fwd}" "${auth}" "${obfs}" "${pdir}/tls"; then
+    layer_autotest_record "Phormal Relay" "inconclusive" "low" "failed to write synthetic Relay configs in ${dir}"
+    layer_relay_probe_synthetic_fini "${dir}" "${pdir}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+    return 0
+  fi
+
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" "mkdir -p '${pdir}/tls'" 2>/dev/null || true
+  layer_relay_probe_gen_tls "${dir}/peer-tls-staging" || true
+  layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dir}/peer-tls-staging/cert.crt" "${pdir}/tls/cert.crt" 2>/dev/null || true
+  layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dir}/peer-tls-staging/cert.key" "${pdir}/tls/cert.key" 2>/dev/null || true
+  layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dir}/peer-exit.yaml" "${pdir}/exit.yaml" 2>/dev/null || true
+
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "pkill -f '${pdir}/' 2>/dev/null; \
+     nohup ${RELAY_BIN} server -c '${pdir}/exit.yaml' >'${pdir}/srv.log' 2>&1 & echo \$! >'${pdir}/srv.pid'" 2>/dev/null || true
+
+  sleep 2
+  if layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "for i in \$(seq 1 12); do grep -q 'server up and running' '${pdir}/srv.log' 2>/dev/null && exit 0; sleep 1; done; exit 1" 2>/dev/null; then
+    "${RELAY_BIN}" client -c "${dir}/entry-local.yaml" >"${dir}/cli-fwd.log" 2>&1 &
+    cli_pid=$!
+    LAYER_RELAY_PROBE_CLI_PID="${cli_pid}"
+    echo "${cli_pid}" > "${dir}/cli.pid"
+    if layer_relay_probe_wait_client_log "${dir}/cli-fwd.log" "${cli_pid}"; then
+      local_ok=1
+    else
+      err_fwd="$(grep -oE 'connect error[^",}]*|FATAL[^",}]*' "${dir}/cli-fwd.log" 2>/dev/null | tail -1 | head -c 100)"
+    fi
+    kill "${cli_pid}" 2>/dev/null || true
+    LAYER_RELAY_PROBE_CLI_PID=""
+  else
+    err_fwd="peer exit did not start on :${port_fwd}"
+  fi
+  layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+    "[[ -f '${pdir}/srv.pid' ]] && kill \$(cat '${pdir}/srv.pid') 2>/dev/null; pkill -f '${pdir}/' 2>/dev/null" 2>/dev/null || true
+
+  info "  [2/2] synthetic Relay — peer entry → local exit (QUIC ${local_v4}:${port_rev})…"
+  if ! layer_relay_probe_write_exit_yaml "${dir}/exit-local.yaml" "${port_rev}" "${auth}" "${obfs}" "${tls_dir}" \
+      || ! layer_relay_probe_write_entry_yaml "${dir}/peer-entry.yaml" "${local_v4}" "${port_rev}" "${auth}" "${obfs}"; then
+    ok=FAIL; conf=high
+    note="synthetic Relay — could not write phase-2 configs"
+    layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
+    layer_relay_probe_synthetic_fini "${dir}" "${pdir}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+    return 0
+  fi
+  pkill -f "${dir}/exit-local.yaml" 2>/dev/null || true
+  "${RELAY_BIN}" server -c "${dir}/exit-local.yaml" >"${dir}/srv-rev.log" 2>&1 &
+  srv_pid=$!
+  LAYER_RELAY_PROBE_SRV_PID="${srv_pid}"
+  echo "${srv_pid}" > "${dir}/srv.pid"
+
+  if layer_relay_probe_wait_server_log "${dir}/srv-rev.log"; then
+    layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dir}/peer-entry.yaml" "${pdir}/entry.yaml" 2>/dev/null || true
+    layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "nohup ${RELAY_BIN} client -c '${pdir}/entry.yaml' >'${pdir}/cli.log' 2>&1 & echo \$! >'${pdir}/cli.pid'" 2>/dev/null || true
+    sleep 2
+    if layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+        "for i in \$(seq 1 12); do \
+           [[ -f '${pdir}/cli.pid' ]] && kill -0 \$(cat '${pdir}/cli.pid') 2>/dev/null || break; \
+           grep -qiE 'connected|established|ready' '${pdir}/cli.log' 2>/dev/null && exit 0; \
+           grep -qi FATAL '${pdir}/cli.log' 2>/dev/null && exit 1; \
+           [[ \${i} -ge 8 ]] && ! grep -qi FATAL '${pdir}/cli.log' 2>/dev/null && exit 0; \
+           sleep 1; \
+         done; exit 1" 2>/dev/null; then
+      peer_ok=1
+    else
+      err_rev="$(layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+        "grep -oE 'connect error[^\",}]*|FATAL[^\",}]*' '${pdir}/cli.log' 2>/dev/null | tail -1 | head -c 100" 2>/dev/null | tr -d '\r')"
+    fi
+  else
+    err_rev="local exit did not start on :${port_rev}"
+  fi
+
+  if [[ "${local_ok}" -eq 1 && "${peer_ok}" -eq 1 ]]; then
+    ok=PASS; conf=high
+    note="synthetic Relay — bidirectional QUIC OK (:${port_fwd} this→peer, :${port_rev} peer→this)"
+  elif [[ "${local_ok}" -eq 1 || "${peer_ok}" -eq 1 ]]; then
+    ok=PASS; conf=med
+    note="synthetic Relay — one-way QUIC (this→peer:${local_ok} peer→this:${peer_ok})"
+    [[ -n "${err_fwd}${err_rev}" ]] && note="${note} — ${err_fwd:-${err_rev}}"
+  else
+    ok=FAIL; conf=high
+    note="synthetic Relay QUIC failed both ways (this→peer:0 peer→this:0)"
+    [[ -n "${err_fwd}" ]] && note="${note} — fwd: ${err_fwd}"
+    [[ -n "${err_rev}" ]] && note="${note} — rev: ${err_rev}"
+  fi
+  layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
+  layer_relay_probe_synthetic_fini "${dir}" "${pdir}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+}
+
 layer_test_relay_path() {
   local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
   local n role remote listen st peer_info peer_meta ok=FAIL conf=high note=""
-  local peer_n peer_role peer_st peer_listen started_any=0 local_st
+  local peer_n peer_role peer_st peer_listen started_any=0 err_hint udp_ok=0
 
   layer_autotest_probe_begin "Phormal Relay (paired Hysteria — both servers)"
   layer_autotest_require_peer_ssh || {
     layer_autotest_record "Phormal Relay" "inconclusive" "low" "peer SSH not ready"
     return 0
   }
+  local local_pair peer_meta_early
+  local_pair="$(layer_local_relay_toward_peer "${peer_v4}" 2>/dev/null || true)"
+  peer_meta_early="$(layer_ssh_peer_relay_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+  if [[ -z "${local_pair}" && ( -z "${peer_meta_early}" || "${peer_meta_early}" == NONE ) ]]; then
+    info "  No Relay config — creating paired synthetic Hysteria on both servers (like real Relay)…"
+    layer_test_relay_synthetic_probe "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
+    return 0
+  fi
   while read -r n; do
     [[ -n "${n}" ]] || continue
     role="$(imeta_get "${n}" ROLE)"
@@ -4948,14 +5114,15 @@ layer_test_relay_path() {
         fi
         IFS='|' read -r peer_n peer_role peer_st _ peer_listen <<<"${peer_meta}"
         [[ "${peer_role}" == exit ]] || warn "  Peer Relay role is '${peer_role}' — expected exit for entry '${n}'"
-        if [[ "${st}" != active ]]; then
-          info "  Local Relay '${n}' stopped — starting on this host…"
+        if ! relay_svc_is_active "${n}"; then
+          info "  Local Relay '${n}' is ${st} — starting on this host…"
           systemctl start "phormal-relay@${n}" 2>/dev/null || true
           started_any=1
+          sleep 3
           st="$(relay_svc_state "${n}")"
         fi
-        if [[ "${peer_st}" == stopped ]]; then
-          info "  Peer Relay '${peer_n}' stopped — starting on peer via SSH…"
+        if [[ "${peer_st}" != up ]]; then
+          info "  Peer Relay '${peer_n}' not active — starting on peer via SSH…"
           layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
             "systemctl start phormal-relay@${peer_n}" 2>/dev/null || true
           started_any=1
@@ -4964,30 +5131,71 @@ layer_test_relay_path() {
           IFS='|' read -r peer_n peer_role peer_st _ peer_listen <<<"${peer_meta}"
         fi
         [[ "${started_any}" -eq 1 ]] && sleep 2
-        if [[ "${st}" == active && "${peer_st}" == up ]]; then
+        info "  Probing UDP to Hysteria exit ${peer_v4}:${listen%-*}…"
+        layer_test_udp_port_open "${peer_v4}" "${listen}" && udp_ok=1
+        if relay_svc_is_active "${n}" && [[ "${peer_st}" == up ]]; then
           ok=PASS; conf=high
           note="paired entry '${n}' ↔ exit '${peer_n}' — both phormal-relay@ active (${peer_v4}:${listen})"
-        elif [[ "${st}" == active || "${peer_st}" == up ]]; then
+        elif relay_svc_is_active "${n}"; then
           ok=PASS; conf=med
-          note="Relay partial — local:${st} peer:${peer_st} (both must be active for traffic)"
+          note="local entry active but peer exit not running (peer:${peer_st})"
+        elif [[ "${peer_st}" == up ]]; then
+          err_hint="$(layer_relay_journal_connect_hint "${n}")"
+          ok=FAIL; conf=high
+          if [[ -n "${err_hint}" ]]; then
+            note="entry '${n}' cannot reach exit ${peer_v4}:${listen} — ${err_hint}"
+          else
+            note="entry '${n}' not connected (service ${st}) while exit '${peer_n}' is up on peer"
+          fi
+          if [[ "${udp_ok}" -eq 0 ]]; then
+            note="${note}; UDP ${peer_v4}:${listen%-*} may be filtered from here"
+          fi
         else
-          layer_autotest_record "Phormal Relay" "inconclusive" "med" \
-            "paired Relay configured but both stopped — systemctl enable --now phormal-relay@${n} and on peer phormal-relay@${peer_n}"
-          info "  (UDP echo skipped — start both sides)"
-          return 0
+          err_hint="$(layer_relay_journal_connect_hint "${n}")"
+          if [[ -n "${err_hint}" ]]; then
+            ok=FAIL; conf=high
+            note="paired Relay configured but entry failed — ${err_hint}"
+          else
+            layer_autotest_record "Phormal Relay" "inconclusive" "med" \
+              "paired Relay configured but both sides down (local:${st} peer:${peer_st}) — systemctl enable --now phormal-relay@${n} and on peer phormal-relay@${peer_n}"
+            info "  (UDP echo skipped — start both sides)"
+            return 0
+          fi
         fi
         layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
         info "  (UDP echo skipped — Hysteria/QUIC does not echo arbitrary UDP)"
         return 0
         ;;
       exit)
-        [[ "${st}" == "active" ]] || continue
         peer_meta="$(layer_ssh_peer_relay_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
-        ok=PASS; conf=med
+        if ! relay_svc_is_active "${n}"; then
+          info "  Local Relay exit '${n}' is ${st} — starting…"
+          systemctl start "phormal-relay@${n}" 2>/dev/null || true
+          sleep 2
+          st="$(relay_svc_state "${n}")"
+        fi
         if [[ -n "${peer_meta}" && "${peer_meta}" != NONE ]]; then
-          note="exit '${n}' active + peer entry '${peer_meta%%|*}' (${peer_meta#*|*|})"
-        else
+          IFS='|' read -r peer_n peer_role peer_st _ peer_listen <<<"${peer_meta}"
+          if relay_svc_is_active "${n}" && [[ "${peer_st}" == up ]]; then
+            ok=PASS; conf=high
+            note="paired exit '${n}' ↔ entry '${peer_n}' — both phormal-relay@ active"
+          elif relay_svc_is_active "${n}"; then
+            ok=PASS; conf=med
+            note="exit '${n}' active; peer entry '${peer_n}' is ${peer_st}"
+          elif [[ "${peer_st}" == up ]]; then
+            ok=FAIL; conf=med
+            note="peer entry '${peer_n}' active but local exit '${n}' is ${st}"
+          else
+            ok=FAIL; conf=med
+            note="exit '${n}' and peer entry '${peer_n}' both down (local:${st} peer:${peer_st})"
+          fi
+        elif relay_svc_is_active "${n}"; then
+          ok=PASS; conf=med
           note="exit '${n}' — phormal-relay@${n} listening (no matching peer entry seen via SSH)"
+        else
+          layer_autotest_record "Phormal Relay" "inconclusive" "med" \
+            "local exit '${n}' configured but service is ${st} — systemctl enable --now phormal-relay@${n}"
+          return 0
         fi
         layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
         info "  (UDP echo skipped — Relay exit is up on this host)"
@@ -4999,7 +5207,7 @@ layer_test_relay_path() {
   case "${peer_info}" in
     UP:*)
       ok=PASS; conf=med
-      note="peer Relay active (${peer_info#UP:})"
+      note="peer Relay active (${peer_info#UP:}) — no local Relay toward ${peer_v4}"
       layer_autotest_record "Phormal Relay" "${ok}" "${conf}" "${note}"
       info "  (UDP echo skipped — configured Relay seen on peer via SSH)"
       return 0
@@ -5021,15 +5229,20 @@ layer_test_relay_path() {
       exit) ;;
       *) continue ;;
     esac
-    [[ "${st}" == "active" ]] && continue
-    layer_autotest_record "Phormal Relay" "inconclusive" "med" \
-      "Relay '${n}' (${role}) configured but STOPPED — systemctl enable --now phormal-relay@${n}"
+    relay_svc_is_active "${n}" && continue
+    err_hint="$(layer_relay_journal_connect_hint "${n}")"
+    if [[ -n "${err_hint}" ]]; then
+      layer_autotest_record "Phormal Relay" "FAIL" "high" \
+        "Relay '${n}' (${role}) configured but not connected — ${err_hint}"
+    else
+      layer_autotest_record "Phormal Relay" "inconclusive" "med" \
+        "Relay '${n}' (${role}) configured but service is ${st} — systemctl enable --now phormal-relay@${n}"
+    fi
     info "  (UDP echo skipped — tunnel configured but service not active)"
     return 0
   done < <(relay_instances 2>/dev/null)
-  warn "  No Relay tunnel found locally or on peer — UDP echo is not valid for Hysteria (expect FAIL)"
-  layer_autotest_record "Phormal Relay" "inconclusive" "low" \
-    "no phormal-relay@ to ${peer_v4} — install Relay on Iran (entry) and kharej (exit) first"
+  warn "  No paired Relay meta matched — running synthetic Hysteria probe…"
+  layer_test_relay_synthetic_probe "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
 }
 
 layer_write_probe_py() {
@@ -5139,7 +5352,7 @@ layer_autotest_main() {
   LAYER_TEST_ROWS=()
   LAYER_SSH_CTRL_PATH=""
   rule
-  info "Phormal Path Test — every product (Bridge, Relay, Reverse, GRE, Echo, Raw, Stream, Cloak, DNS, Edge)"
+  info "Phormal Path Test — every product (Bridge, Relay, Reverse, GRE, Echo, Raw, DNS, Edge)"
   info "Run on ONE server only (Iran or kharej). You enter peer SSH here — no second terminal on the peer."
   info "Paired tests use outbound SSH to run installs and probes on both sides."
   rule
@@ -5231,26 +5444,6 @@ layer_autotest_main() {
 
   if [[ "${only}" == "all" || "${only}" == *reverse* || "${only}" == *tcp* ]]; then
     layer_test_tcp_bidir "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Reverse"
-    if [[ "${only}" == "all" || "${only}" == *stream* ]]; then
-      layer_autotest_mirror_row "Phormal Stream" " — same TCP path as Reverse/Backhaul"
-    fi
-  elif [[ "${only}" == *stream* ]]; then
-    layer_test_tcp_bidir "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Stream"
-  fi
-
-  if [[ "${only}" == "all" || "${only}" == *cloak* || "${only}" == *tls* || "${only}" == *wss* ]]; then
-    local ok=FAIL note="not probed"
-    layer_autotest_probe_begin "Phormal Cloak"
-    if have openssl; then
-      if echo | timeout 8 openssl s_client -connect "${peer_v4}:443" -servername github.com 2>/dev/null | grep -qi "BEGIN CERTIFICATE"; then
-        ok=PASS; note="TLS handshake :443 ok"
-      else
-        note="no TLS listener on peer :443"
-      fi
-    else
-      note="openssl missing"; ok=inconclusive
-    fi
-    layer_autotest_record "Phormal Cloak" "${ok}" "med" "${note}"
   fi
 
   if [[ "${only}" == "all" || "${only}" == *dns* ]]; then
@@ -5297,7 +5490,7 @@ layer_autotest_cli() {
 phormal_path_test_menu() {
   rule
   info "Phormal Path Test — option 1"
-  info "Tests Bridge, Relay, Reverse, GRE, Echo, Raw, Stream, Cloak, DNS, Edge."
+  info "Tests Bridge, Relay, Reverse, GRE, Echo, Raw, DNS, Edge."
   rule
   layer_autotest_cli
 }
@@ -5336,27 +5529,19 @@ menu() {
     printf '   %s19%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s20%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s21%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL STREAM%s  %s(Backhaul TCP)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '\n  %sPHORMAL DNS%s  %s(iodine)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
     printf '   %s22%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s23%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s24%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL CLOAK%s  %s(Backhaul WSS / TLS)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '\n  %sPHORMAL EDGE%s  %s(proxyforwarder)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
     printf '   %s25%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s26%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s27%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL DNS%s  %s(iodine)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
-    printf '   %s28%s  Add exit tunnel\n' "${ACC}" "${RST}"
-    printf '   %s29%s  Add entry tunnel\n' "${ACC}" "${RST}"
-    printf '   %s30%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL EDGE%s  %s(proxyforwarder)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
-    printf '   %s31%s  Add exit tunnel\n' "${ACC}" "${RST}"
-    printf '   %s32%s  Add entry tunnel\n' "${ACC}" "${RST}"
-    printf '   %s33%s  Manage tunnels\n' "${ACC}" "${RST}"
     printf '\n  %sMANAGE%s\n' "${BOLD}" "${RST}"
-    printf '   %s34%s  Status\n' "${ACC}" "${RST}"
-    printf '   %s35%s  Phormal tuning\n' "${ACC}" "${RST}"
-    printf '   %s36%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
-    printf '   %s37%s  Uninstall\n' "${ACC}" "${RST}"
+    printf '   %s28%s  Status\n' "${ACC}" "${RST}"
+    printf '   %s29%s  Phormal tuning\n' "${ACC}" "${RST}"
+    printf '   %s30%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
+    printf '   %s31%s  Uninstall\n' "${ACC}" "${RST}"
     printf '    %s0%s  Exit\n\n' "${ACC}" "${RST}"
 
     local choice; choice="$(ask 'Select')"
@@ -5383,22 +5568,16 @@ menu() {
       19) create_layer_udp2raw_exit || true ;;
       20) create_layer_udp2raw_entry || true ;;
       21) manage_raw_menu || true ;;
-      22) create_layer_backhaul_exit btcp tcp || true ;;
-      23) create_layer_backhaul_entry btcp tcp || true ;;
-      24) manage_stream_menu || true ;;
-      25) create_layer_backhaul_exit bwss wss || true ;;
-      26) create_layer_backhaul_entry bwss wss || true ;;
-      27) manage_cloak_menu || true ;;
-      28) create_layer_dns_exit || true ;;
-      29) create_layer_dns_entry || true ;;
-      30) manage_dns_layer_menu || true ;;
-      31) create_layer_edge_exit || true ;;
-      32) create_layer_edge_entry || true ;;
-      33) manage_edge_menu || true ;;
-      34) status || true ;;
-      35) tune_menu || true ;;
-      36) schedule_refresh || true ;;
-      37) purge || true ;;
+      22) create_layer_dns_exit || true ;;
+      23) create_layer_dns_entry || true ;;
+      24) manage_dns_layer_menu || true ;;
+      25) create_layer_edge_exit || true ;;
+      26) create_layer_edge_entry || true ;;
+      27) manage_edge_menu || true ;;
+      28) status || true ;;
+      29) tune_menu || true ;;
+      30) schedule_refresh || true ;;
+      31) purge || true ;;
       0)  good "Goodbye — @SchmitzWS"; exit 0 ;;
       *)  fail "Invalid selection." ;;
     esac
