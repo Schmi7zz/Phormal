@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.4.8"
+readonly PHORMAL_VERSION="5.4.11"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -318,13 +318,8 @@ reset_binary_source() { BINARY_SOURCE=""; }
 
 choose_binary_source() {
   [[ -n "${BINARY_SOURCE}" ]] && return 0
-  if [[ -n "${PATH_TEST_AUTO_INSTALL:-}" ]]; then
-    BINARY_SOURCE="$(conf_get BINARY_SOURCE)"
-    BINARY_SOURCE="${BINARY_SOURCE:-mirror}"
-    return 0
-  fi
   rule
-  info "Binary download source (gost + hysteria)"
+  info "Binary download source (gost, hysteria, rathole — local host and peer via SSH)"
   rule
   printf '  %s1%s  Iran mirror download [default]\n' "${ACC}" "${RST}"
   printf '  %s2%s  GitHub — official pinned releases\n' "${ACC}" "${RST}"
@@ -336,6 +331,12 @@ choose_binary_source() {
     2)    BINARY_SOURCE="github" ;;
     3)    BINARY_SOURCE="manual" ;;
     *)    BINARY_SOURCE="mirror" ;;
+  esac
+  conf_set BINARY_SOURCE "${BINARY_SOURCE}"
+  case "${BINARY_SOURCE}" in
+    mirror) info "Selected: Iran mirror (then GitHub fallback on local + peer)." ;;
+    github) info "Selected: GitHub releases only (local + peer)." ;;
+    manual) info "Selected: manual files in ${MANUAL_DIR} (peer copies via scp after local install)." ;;
   esac
 }
 
@@ -3786,37 +3787,57 @@ layer_ssh_scp_to() {
   scp -q -P "${port}" "${scp_extra[@]}" "${local_path}" "${user}@${host}:${remote_path}"
 }
 
+layer_ssh_session_show_link() {
+  local host="$1" port="$2" user="$3" local_v4="$4" peer_v4="$5"
+  local local_name peer_name peer_seen
+  local_name="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo this-host)"
+  peer_name="$(layer_ssh_cmd "${host}" "${port}" "${user}" "hostname -s 2>/dev/null || hostname" 2>/dev/null | tr -d '\r' | head -n1)"
+  peer_seen="$(layer_ssh_cmd "${host}" "${port}" "${user}" "echo PHORMAL-LINK-OK" 2>/dev/null | tr -d '\r')"
+  rule
+  info "SSH link for paired tests (one connection — you do NOT need a second terminal on the peer):"
+  info "  This server : ${local_name}  (${local_v4:-?})  ← you ran phormal.sh here"
+  info "  Peer server : ${user}@${host}:${port}  (${peer_v4})  ← script SSHs here for you"
+  [[ -n "${peer_name}" ]] && info "  Peer hostname: ${peer_name} (confirmed over SSH)"
+  [[ "${peer_seen}" == *LINK-OK* ]] || warn "  Could not re-check peer over SSH control socket."
+  info "  Entering the peer password above opened this link; installs and paired probes use it."
+  rule
+}
+
 layer_ssh_session_open() {
   local host="$1" port="$2" user="$3"
   local ctrl="/tmp/phormal-ssh-${user}@${host}-${port}-$$"
   LAYER_SSH_CTRL_PATH="${ctrl}"
   LAYER_PEER_SSH_READY=0
+  LAYER_PEER_SSH_HOST="${host}"
+  LAYER_PEER_SSH_PORT="${port}"
+  LAYER_PEER_SSH_USER="${user}"
 
   if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
       -p "${port}" "${user}@${host}" "echo PHORMAL-SSH-OK" 2>/dev/null | grep -q OK; then
     ssh -o BatchMode=yes -o ControlMaster=yes -o "ControlPath=${ctrl}" -o ControlPersist=600 \
       -o StrictHostKeyChecking=accept-new -p "${port}" -fN "${user}@${host}" 2>/dev/null || true
     if layer_ssh_cmd "${host}" "${port}" "${user}" "echo PHORMAL-SSH-OK" 2>/dev/null | grep -q OK; then
-      good "SSH link OK (key auth)."
+      good "Outbound SSH OK (key): this host → ${user}@${host}:${port}"
     else
       LAYER_SSH_CTRL_PATH=""
       fail "SSH control socket failed after key auth."
       return 1
     fi
   else
-    info "SSH key not configured — enter peer password (once; reused for all paired tests)."
+    info "This script will SSH from THIS machine to the peer — you do not open SSH on the peer yourself."
+    info "Enter the peer password once below (reused for downloads, remote commands, paired pings)…"
     if ! ssh -o PreferredAuthentications=keyboard-interactive,password \
         -o ControlMaster=yes -o "ControlPath=${ctrl}" -o ControlPersist=600 \
         -o StrictHostKeyChecking=accept-new -p "${port}" \
         "${user}@${host}" "echo PHORMAL-SSH-OK"; then
       LAYER_SSH_CTRL_PATH=""
-      fail "SSH to ${user}@${host}:${port} failed."
+      fail "SSH from this host to ${user}@${host}:${port} failed — paired tests cannot run."
       return 1
     fi
-    good "SSH link OK."
+    good "Outbound SSH OK: this host → ${user}@${host}:${port} (password accepted)"
   fi
 
-  info "Waiting for peer SSH control connection before any tunnel test…"
+  info "Holding until SSH control socket to peer is stable…"
   local i ok=0
   for i in $(seq 1 25); do
     if layer_ssh_cmd "${host}" "${port}" "${user}" "echo PHORMAL-SSH-READY" 2>/dev/null | grep -q READY; then
@@ -3827,12 +3848,12 @@ layer_ssh_session_open() {
   done
   if [[ "${ok}" -ne 1 ]]; then
     LAYER_SSH_CTRL_PATH=""
-    fail "Peer SSH not ready on control socket — paired tests cannot run."
+    fail "SSH control socket to peer not ready — paired tests cannot run."
     return 1
   fi
 
   if [[ "${user}" != "root" ]]; then
-    info "Peer SSH user is not root — sudo required for paired probes (enter sudo password if prompted)…"
+    info "Peer SSH user is not root — sudo on peer may be required (enter sudo password if prompted)…"
     if ! layer_ssh_cmd "${host}" "${port}" "${user}" "sudo -n true" 2>/dev/null; then
       layer_ssh_cmd "${host}" "${port}" "${user}" "sudo -v" 2>/dev/null \
         || warn "Could not cache peer sudo — kernel/meta probes may fail on peer"
@@ -3840,12 +3861,11 @@ layer_ssh_session_open() {
     if ! layer_ssh_remote "${host}" "${port}" "${user}" "echo PHORMAL-SUDO-OK" 2>/dev/null | grep -q SUDO-OK; then
       warn "Peer sudo check failed — use root SSH or NOPASSWD sudo for full paired tests"
     else
-      good "Peer sudo OK for paired tests."
+      good "Peer sudo OK (remote commands will run as root on peer)."
     fi
   fi
 
   LAYER_PEER_SSH_READY=1
-  good "Peer SSH session ready — starting paired tests."
   return 0
 }
 
@@ -3914,7 +3934,7 @@ layer_ssh_ensure_binary_on_peer() {
         "mkdir -p '$(dirname "${dest}")'
          curl -fsSL --connect-timeout 20 --max-time 300 '${u}' -o '${dest}.dl'
          chmod +x '${dest}.dl'
-         '${dest}.dl' ${verify_flag}
+         '${dest}.dl' ${verify_flag} >/dev/null 2>&1
          mv -f '${dest}.dl' '${dest}'" 2>/dev/null; then
       good "  Peer ${label}: installed (peer download)"
       return 0
@@ -3927,7 +3947,7 @@ layer_ssh_ensure_binary_on_peer() {
       "mkdir -p '$(dirname "${dest}")'" 2>/dev/null || true
     if layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dest}" "${dest}.part" 2>/dev/null \
       && layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-        "mv -f '${dest}.part' '${dest}' && chmod +x '${dest}' && '${dest}' ${verify_flag}" 2>/dev/null; then
+        "mv -f '${dest}.part' '${dest}' && chmod +x '${dest}' && '${dest}' ${verify_flag} >/dev/null 2>&1" 2>/dev/null; then
       good "  Peer ${label}: installed (scp from this host)"
       return 0
     fi
@@ -3937,48 +3957,84 @@ layer_ssh_ensure_binary_on_peer() {
   return 1
 }
 
+layer_build_engine_urls() {
+  local kind="$1" arch="$2"
+  local mirror urls=()
+  [[ -n "${arch}" ]] || arch="$(machine_arch 2>/dev/null || echo amd64)"
+  case "${BINARY_SOURCE:-mirror}" in
+    manual) return 0 ;;
+    github)
+      case "${kind}" in
+        fwd)     urls+=("$(gost_upstream_tarball_url "${arch}")") ;;
+        relay)   urls+=("$(hysteria_upstream_url "${arch}")") ;;
+        reverse)
+          mirror="$(mirror_reverse_url "${arch}" 2>/dev/null || true)"
+          [[ -n "${mirror}" ]] && urls+=("${mirror}")
+          ;;
+      esac
+      ;;
+    *)
+      case "${kind}" in
+        fwd)
+          mirror="$(mirror_fwd_url "${arch}" 2>/dev/null || true)"
+          [[ -n "${mirror}" ]] && urls+=("${mirror}")
+          urls+=("$(gost_upstream_tarball_url "${arch}")")
+          ;;
+        relay)
+          mirror="$(mirror_relay_url "${arch}" 2>/dev/null || true)"
+          [[ -n "${mirror}" ]] && urls+=("${mirror}")
+          urls+=("$(hysteria_upstream_url "${arch}")")
+          ;;
+        reverse)
+          mirror="$(mirror_reverse_url "${arch}" 2>/dev/null || true)"
+          [[ -n "${mirror}" ]] && urls+=("${mirror}")
+          ;;
+      esac
+      ;;
+  esac
+  local u
+  for u in "${urls[@]}"; do
+    [[ -n "${u}" ]] && printf '%s\n' "${u}"
+  done
+}
+
 layer_autotest_prepare_hosts() {
   local only="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
-  local arch mirror urls=()
+  local arch peer_arch urls=() u
 
   layer_autotest_require_peer_ssh || return 1
-  PATH_TEST_AUTO_INSTALL=1
-  BINARY_SOURCE="$(conf_get BINARY_SOURCE)"
-  BINARY_SOURCE="${BINARY_SOURCE:-mirror}"
+  BINARY_SOURCE=""
+  choose_binary_source
 
   rule
-  info "Preparing this host and peer (auto-download missing engines before tests)…"
+  info "Preparing this host and peer (download missing engines before tests)…"
   rule
   apt_install_quiet python3 tcpdump iproute2 openssh-client netcat-openbsd dnsutils curl wget ca-certificates 2>/dev/null || true
   layer_ssh_peer_apt_probe_deps "${ssh_host}" "${ssh_port}" "${ssh_user}"
 
   arch="$(machine_arch 2>/dev/null || echo amd64)"
+  peer_arch="$(layer_ssh_peer_arch "${ssh_host}" "${ssh_port}" "${ssh_user}" 2>/dev/null || echo "${arch}")"
 
   if [[ "${only}" == "all" || "${only}" == *bridge* || "${only}" == *sit* ]]; then
-    install_engine 2>/dev/null || warn "Local gost (Bridge) download failed — continuing"
+    install_engine || warn "Local gost (Bridge) download failed — continuing"
     urls=()
-    mirror="$(mirror_fwd_url "${arch}" 2>/dev/null || true)"
-    [[ -n "${mirror}" ]] && urls+=("${mirror}")
-    urls+=("$(gost_upstream_tarball_url "${arch}")")
+    while IFS= read -r u; do [[ -n "${u}" ]] && urls+=("${u}"); done < <(layer_build_engine_urls fwd "${peer_arch}")
     layer_ssh_ensure_binary_on_peer "${ssh_host}" "${ssh_port}" "${ssh_user}" \
       "${FWD_BIN}" "-V" "gost (Bridge publisher)" "${urls[@]}" 2>/dev/null || true
   fi
 
   if [[ "${only}" == "all" || "${only}" == *relay* || "${only}" == *udp* || "${only}" == *raw* ]]; then
-    install_relay_engine 2>/dev/null || warn "Local hysteria (Relay) download failed — continuing"
+    install_relay_engine || warn "Local hysteria (Relay) download failed — continuing"
     urls=()
-    mirror="$(mirror_relay_url "${arch}" 2>/dev/null || true)"
-    [[ -n "${mirror}" ]] && urls+=("${mirror}")
-    urls+=("$(hysteria_upstream_url "${arch}")")
+    while IFS= read -r u; do [[ -n "${u}" ]] && urls+=("${u}"); done < <(layer_build_engine_urls relay "${peer_arch}")
     layer_ssh_ensure_binary_on_peer "${ssh_host}" "${ssh_port}" "${ssh_user}" \
       "${RELAY_BIN}" "version" "hysteria (Relay)" "${urls[@]}" 2>/dev/null || true
   fi
 
   if [[ "${only}" == "all" || "${only}" == *reverse* || "${only}" == *tcp* || "${only}" == *stream* ]]; then
-    install_reverse_engine 2>/dev/null || warn "Local rathole (Reverse) download failed — continuing"
+    install_reverse_engine || warn "Local rathole (Reverse) download failed — continuing"
     urls=()
-    mirror="$(mirror_reverse_url "${arch}" 2>/dev/null || true)"
-    [[ -n "${mirror}" ]] && urls+=("${mirror}")
+    while IFS= read -r u; do [[ -n "${u}" ]] && urls+=("${u}"); done < <(layer_build_engine_urls reverse "${peer_arch}")
     layer_ssh_ensure_binary_on_peer "${ssh_host}" "${ssh_port}" "${ssh_user}" \
       "${REVERSE_BIN}" "--version" "rathole (Reverse)" "${urls[@]}" 2>/dev/null || true
   fi
@@ -4921,31 +4977,90 @@ layer_test_udp_sizes() {
   layer_test_udp_echo "${peer}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "${port}" $((port + 1)) "${size}" "${label}"
 }
 
-layer_test_tcp_bidir() {
-  local peer="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4" label="$5"
-  local port ok=FAIL conf=high note="" self_ip
-  layer_autotest_probe_begin "${label}"
-  self_ip="$(layer_detect_public_v4)"
-  port="$(layer_pick_probe_port)" || { layer_autotest_record "${label}" "inconclusive" "low" "no port"; return; }
-  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-    "timeout 15 bash -c 'printf OK-PROBE | nc -l -p ${port} -q 1'" 2>/dev/null &
-  sleep 1
-  if printf '\n' | timeout 5 nc -w 3 "${peer}" "${port}" 2>/dev/null | grep -q OK-PROBE; then
-    local port2=$((port + 10))
-    if layer_probe_port_free "${port2}"; then
-      timeout 15 nc -l -p "${port2}" -q 1 >/tmp/phormal-tcp-reply 2>/dev/null &
+layer_test_tcp_one_way() {
+  local dir="$1" local_v4="$2" peer_v4="$3" ssh_host="$4" ssh_port="$5" ssh_user="$6" port="$7"
+  local reply="/tmp/phormal-tcp-${dir}-$$"
+  rm -f "${reply}"
+  case "${dir}" in
+    forward)
+      layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+        "timeout 14 bash -c 'printf OK-FWD | nc -l -p ${port} -q 2'" 2>/dev/null &
       sleep 1
-      if layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-        "echo REV-PROBE | nc -w 3 ${self_ip} ${port2}" 2>/dev/null | grep -q REV-PROBE \
-        || grep -q REV-PROBE /tmp/phormal-tcp-reply 2>/dev/null; then
-        ok=PASS; note="bidirectional TCP nc on :${port}"
-      else
-        note="reverse TCP failed"
+      if printf '' | timeout 7 nc -w 5 "${peer_v4}" "${port}" 2>/dev/null | grep -q OK-FWD; then
+        rm -f "${reply}"
+        return 0
       fi
-      rm -f /tmp/phormal-tcp-reply
-    fi
+      ;;
+    reverse)
+      timeout 14 nc -l -p "${port}" >"${reply}" 2>/dev/null &
+      local lid=$!
+      sleep 1
+      layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+        "printf REV-REV | nc -w 5 ${local_v4} ${port}" >/dev/null 2>&1 &
+      wait "${lid}" 2>/dev/null || true
+      sleep 1
+      if grep -q REV-REV "${reply}" 2>/dev/null; then
+        rm -f "${reply}"
+        return 0
+      fi
+      ;;
+  esac
+  rm -f "${reply}"
+  return 1
+}
+
+layer_test_tcp_bidir() {
+  local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5" label="$6"
+  local port_fwd port_rev ok=FAIL conf=high note="" fwd_ok=0 rev_ok=0
+
+  layer_autotest_require_peer_ssh || {
+    layer_autotest_probe_begin "${label}"
+    layer_autotest_record "${label}" "inconclusive" "low" "peer SSH not ready for TCP probe"
+    return 0
+  }
+  [[ -n "${local_v4}" ]] || local_v4="$(layer_detect_public_v4 "${peer_v4}")"
+
+  layer_autotest_probe_begin "${label} (TCP both ways — always tests this host ↔ peer)"
+  info "  Endpoints: this host ${local_v4} ↔ peer ${peer_v4}"
+
+  port_fwd="$(layer_pick_probe_port)" || {
+    layer_autotest_record "${label}" "inconclusive" "low" "no free port for this→peer"
+    return 0
+  }
+  info "  [1/2] this→peer (${local_v4} → ${peer_v4}) on :${port_fwd}…"
+  if layer_test_tcp_one_way forward "${local_v4}" "${peer_v4}" \
+      "${ssh_host}" "${ssh_port}" "${ssh_user}" "${port_fwd}"; then
+    fwd_ok=1
+    good "  this→peer: OK"
   else
-    note="forward TCP failed"
+    fail "  this→peer: FAIL"
+  fi
+
+  port_rev="$(layer_pick_probe_port)" || {
+    layer_autotest_record "${label}" "inconclusive" "low" "no free port for peer→this"
+    return 0
+  }
+  while [[ "${port_rev}" == "${port_fwd}" ]]; do
+    port_rev="$(layer_pick_probe_port)" || break
+  done
+  info "  [2/2] peer→this (${peer_v4} → ${local_v4}) on :${port_rev}…"
+  if layer_test_tcp_one_way reverse "${local_v4}" "${peer_v4}" \
+      "${ssh_host}" "${ssh_port}" "${ssh_user}" "${port_rev}"; then
+    rev_ok=1
+    good "  peer→this: OK"
+  else
+    fail "  peer→this: FAIL"
+  fi
+
+  if [[ "${fwd_ok}" -eq 1 && "${rev_ok}" -eq 1 ]]; then
+    ok=PASS; conf=high
+    note="bidirectional TCP — this→peer OK, peer→this OK (:${port_fwd}/:${port_rev})"
+  elif [[ "${fwd_ok}" -eq 1 || "${rev_ok}" -eq 1 ]]; then
+    ok=PASS; conf=med
+    note="one-way TCP only — this→peer:${fwd_ok} peer→this:${rev_ok} (asymmetric path; Reverse may work one direction only)"
+  else
+    note="both TCP directions failed — this→peer and peer→this"
+    conf=med
   fi
   layer_autotest_record "${label}" "${ok}" "${conf}" "${note}"
 }
@@ -4957,8 +5072,8 @@ layer_autotest_main() {
   LAYER_SSH_CTRL_PATH=""
   rule
   info "Phormal Path Test — every product (Bridge, Relay, Reverse, GRE, Echo, Raw, Stream, Cloak, DNS, Edge)"
-  info "Each test prints its result live below, then a summary table and verdict."
-  info "Bridge/Relay/GRE need BOTH servers — tests wait for peer SSH, download engines, then run paired probes."
+  info "Run on ONE server only (Iran or kharej). You enter peer SSH here — no second terminal on the peer."
+  info "Paired tests use outbound SSH to run installs and probes on both sides."
   rule
   apt_install_quiet python3 tcpdump iproute2 openssh-client netcat-openbsd dnsutils 2>/dev/null || true
   have python3 || { fail "python3 required."; return 1; }
@@ -4981,6 +5096,8 @@ layer_autotest_main() {
   local_v4="$(layer_detect_public_v4 "${peer_v4}")"
   info "This host toward ${peer_v4} uses source IP ${local_v4:-?} — run from Iran or kharej where tunnels live."
   layer_ssh_session_open "${ssh_host}" "${ssh_port}" "${ssh_user}" || return 1
+  layer_ssh_session_show_link "${ssh_host}" "${ssh_port}" "${ssh_user}" "${local_v4}" "${peer_v4}"
+  good "Both sides reachable for paired tests (local + peer via SSH above)."
   conf_set PATH_TEST_SSH_HOST "${ssh_host}"
   conf_set PATH_TEST_SSH_PORT "${ssh_port}"
   conf_set PATH_TEST_SSH_USER "${ssh_user}"
@@ -5045,12 +5162,12 @@ layer_autotest_main() {
   fi
 
   if [[ "${only}" == "all" || "${only}" == *reverse* || "${only}" == *tcp* ]]; then
-    layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Reverse"
+    layer_test_tcp_bidir "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Reverse"
     if [[ "${only}" == "all" || "${only}" == *stream* ]]; then
       layer_autotest_mirror_row "Phormal Stream" " — same TCP path as Reverse/Backhaul"
     fi
   elif [[ "${only}" == *stream* ]]; then
-    layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Stream"
+    layer_test_tcp_bidir "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Stream"
   fi
 
   if [[ "${only}" == "all" || "${only}" == *cloak* || "${only}" == *tls* || "${only}" == *wss* ]]; then
@@ -5081,12 +5198,12 @@ layer_autotest_main() {
 
   if [[ "${only}" == "all" || "${only}" == *edge* ]]; then
     if [[ "${only}" == *edge* && "${only}" != "all" ]]; then
-      layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Edge"
+      layer_test_tcp_bidir "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Edge"
     elif [[ "$(layer_autotest_row_get "Phormal Reverse" result 2>/dev/null)" == "PASS" ]]; then
       layer_autotest_probe_begin "Phormal Edge"
       layer_autotest_copy_row "Phormal Reverse" "Phormal Edge" " — needs proxyforwarder; TCP path same as Reverse" "low"
     else
-      layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Edge"
+      layer_test_tcp_bidir "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Edge"
     fi
   fi
 
