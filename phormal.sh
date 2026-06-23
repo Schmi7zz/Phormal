@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.4.2"
+readonly PHORMAL_VERSION="5.4.3"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -4228,7 +4228,7 @@ layer_test_kernel_pair() {
 layer_test_bridge_configured() {
   local peer_v4="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
   local local_v4="$5"
-  local n remote peer_core self_core iface role st ok=FAIL conf=high note="no active Bridge link to ${peer_v4}"
+  local n remote peer_core self_core iface role link_local_v4 ok=FAIL conf=high note="no active Bridge link to ${peer_v4}"
   layer_autotest_probe_begin "Phormal Bridge (your configured links)"
   while read -r n; do
     [[ -n "${n}" ]] || continue
@@ -4238,15 +4238,16 @@ layer_test_bridge_configured() {
     self_core="$(bmeta_get "${n}" SELF_CORE)"
     iface="$(bmeta_get "${n}" IFACE)"
     role="$(bmeta_get "${n}" ROLE)"
+    link_local_v4="$(bmeta_get "${n}" LOCAL_V4)"
     [[ -n "${peer_core}" ]] || continue
     if ! bridge_core_running "${n}"; then
       note="link '${n}' (${role}) exists but core is $(bcore_state "${n}")"
-      bridge_iface_operational "${iface}" "${self_core}" && {
+      if bridge_iface_operational "${iface}" "${self_core}"; then
         ok=PASS; conf=med
         note="link '${n}' (${role}) — iface ${iface} UP with ${self_core} (core not systemd-active)"
         layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
         return 0
-      }
+      fi
       continue
     fi
     if bridge_iface_operational "${iface}" "${self_core}"; then
@@ -4264,7 +4265,7 @@ layer_test_bridge_configured() {
         layer_autotest_record "Phormal Bridge" "${ok}" "${conf}" "${note}"
         return 0
       fi
-      if layer_peer_bridge_active "$(bmeta_get "${n}" LOCAL_V4")" "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      if layer_peer_bridge_active "${link_local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" \
         || layer_peer_bridge_active "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"; then
         ok=PASS
         note="link '${n}' (${role}) — SIT ${iface} UP, peer bridge to ${local_v4} also UP"
