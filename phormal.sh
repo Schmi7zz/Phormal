@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.4.7"
+readonly PHORMAL_VERSION="5.4.8"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -318,6 +318,11 @@ reset_binary_source() { BINARY_SOURCE=""; }
 
 choose_binary_source() {
   [[ -n "${BINARY_SOURCE}" ]] && return 0
+  if [[ -n "${PATH_TEST_AUTO_INSTALL:-}" ]]; then
+    BINARY_SOURCE="$(conf_get BINARY_SOURCE)"
+    BINARY_SOURCE="${BINARY_SOURCE:-mirror}"
+    return 0
+  fi
   rule
   info "Binary download source (gost + hysteria)"
   rule
@@ -3785,6 +3790,7 @@ layer_ssh_session_open() {
   local host="$1" port="$2" user="$3"
   local ctrl="/tmp/phormal-ssh-${user}@${host}-${port}-$$"
   LAYER_SSH_CTRL_PATH="${ctrl}"
+  LAYER_PEER_SSH_READY=0
 
   if ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
       -p "${port}" "${user}@${host}" "echo PHORMAL-SSH-OK" 2>/dev/null | grep -q OK; then
@@ -3792,20 +3798,54 @@ layer_ssh_session_open() {
       -o StrictHostKeyChecking=accept-new -p "${port}" -fN "${user}@${host}" 2>/dev/null || true
     if layer_ssh_cmd "${host}" "${port}" "${user}" "echo PHORMAL-SSH-OK" 2>/dev/null | grep -q OK; then
       good "SSH link OK (key auth)."
-      return 0
+    else
+      LAYER_SSH_CTRL_PATH=""
+      fail "SSH control socket failed after key auth."
+      return 1
+    fi
+  else
+    info "SSH key not configured — enter peer password (once; reused for all paired tests)."
+    if ! ssh -o PreferredAuthentications=keyboard-interactive,password \
+        -o ControlMaster=yes -o "ControlPath=${ctrl}" -o ControlPersist=600 \
+        -o StrictHostKeyChecking=accept-new -p "${port}" \
+        "${user}@${host}" "echo PHORMAL-SSH-OK"; then
+      LAYER_SSH_CTRL_PATH=""
+      fail "SSH to ${user}@${host}:${port} failed."
+      return 1
+    fi
+    good "SSH link OK."
+  fi
+
+  info "Waiting for peer SSH control connection before any tunnel test…"
+  local i ok=0
+  for i in $(seq 1 25); do
+    if layer_ssh_cmd "${host}" "${port}" "${user}" "echo PHORMAL-SSH-READY" 2>/dev/null | grep -q READY; then
+      ok=1
+      break
+    fi
+    sleep 1
+  done
+  if [[ "${ok}" -ne 1 ]]; then
+    LAYER_SSH_CTRL_PATH=""
+    fail "Peer SSH not ready on control socket — paired tests cannot run."
+    return 1
+  fi
+
+  if [[ "${user}" != "root" ]]; then
+    info "Peer SSH user is not root — sudo required for paired probes (enter sudo password if prompted)…"
+    if ! layer_ssh_cmd "${host}" "${port}" "${user}" "sudo -n true" 2>/dev/null; then
+      layer_ssh_cmd "${host}" "${port}" "${user}" "sudo -v" 2>/dev/null \
+        || warn "Could not cache peer sudo — kernel/meta probes may fail on peer"
+    fi
+    if ! layer_ssh_remote "${host}" "${port}" "${user}" "echo PHORMAL-SUDO-OK" 2>/dev/null | grep -q SUDO-OK; then
+      warn "Peer sudo check failed — use root SSH or NOPASSWD sudo for full paired tests"
+    else
+      good "Peer sudo OK for paired tests."
     fi
   fi
 
-  info "SSH key not configured — you will be prompted for the peer password (once per test)."
-  if ! ssh -o PreferredAuthentications=keyboard-interactive,password \
-      -o ControlMaster=yes -o "ControlPath=${ctrl}" -o ControlPersist=600 \
-      -o StrictHostKeyChecking=accept-new -p "${port}" \
-      "${user}@${host}" "echo PHORMAL-SSH-OK"; then
-    LAYER_SSH_CTRL_PATH=""
-    fail "SSH to ${user}@${host}:${port} failed."
-    return 1
-  fi
-  good "SSH link OK."
+  LAYER_PEER_SSH_READY=1
+  good "Peer SSH session ready — starting paired tests."
   return 0
 }
 
@@ -3825,6 +3865,125 @@ layer_ssh_remote() {
     layer_ssh_cmd "${host}" "${port}" "${user}" "sudo -n bash -c $(printf '%q' "${cmd}")" 2>/dev/null \
       || layer_ssh_cmd "${host}" "${port}" "${user}" "sudo bash -c $(printf '%q' "${cmd}")"
   fi
+}
+
+layer_autotest_require_peer_ssh() {
+  [[ "${LAYER_PEER_SSH_READY:-0}" -eq 1 ]] || {
+    fail "Blocked: peer SSH session not ready — fix SSH before testing."
+    return 1
+  }
+}
+
+layer_ssh_peer_arch() {
+  local host="$1" port="$2" user="$3" m
+  m="$(layer_ssh_cmd "${host}" "${port}" "${user}" "uname -m" 2>/dev/null | tr -d '\r')"
+  case "${m}" in
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    *) return 1 ;;
+  esac
+}
+
+layer_ssh_peer_apt_probe_deps() {
+  local host="$1" port="$2" user="$3"
+  layer_ssh_remote "${host}" "${port}" "${user}" \
+    "export DEBIAN_FRONTEND=noninteractive
+     apt-get update -qq 2>/dev/null || true
+     apt-get install -y -qq python3 iproute2 netcat-openbsd curl ca-certificates tcpdump 2>/dev/null || true" \
+    >/dev/null 2>&1 || true
+}
+
+layer_ssh_ensure_binary_on_peer() {
+  local ssh_host="$1" ssh_port="$2" ssh_user="$3"
+  local dest="$4" verify_flag="$5" label="$6"
+  shift 6
+  local u peer_arch urls=("$@")
+
+  if layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "test -x '${dest}' && '${dest}' ${verify_flag}" >/dev/null 2>&1; then
+    info "  Peer ${label}: already installed"
+    return 0
+  fi
+
+  info "  Peer ${label}: downloading on peer…"
+  layer_ssh_peer_apt_probe_deps "${ssh_host}" "${ssh_port}" "${ssh_user}"
+
+  for u in "${urls[@]}"; do
+    [[ -n "${u}" ]] || continue
+    if layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+        "mkdir -p '$(dirname "${dest}")'
+         curl -fsSL --connect-timeout 20 --max-time 300 '${u}' -o '${dest}.dl'
+         chmod +x '${dest}.dl'
+         '${dest}.dl' ${verify_flag}
+         mv -f '${dest}.dl' '${dest}'" 2>/dev/null; then
+      good "  Peer ${label}: installed (peer download)"
+      return 0
+    fi
+  done
+
+  if [[ -x "${dest}" ]] && "${dest}" ${verify_flag} >/dev/null 2>&1; then
+    info "  Peer ${label}: copying from this host via scp…"
+    layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "mkdir -p '$(dirname "${dest}")'" 2>/dev/null || true
+    if layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${dest}" "${dest}.part" 2>/dev/null \
+      && layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+        "mv -f '${dest}.part' '${dest}' && chmod +x '${dest}' && '${dest}' ${verify_flag}" 2>/dev/null; then
+      good "  Peer ${label}: installed (scp from this host)"
+      return 0
+    fi
+  fi
+
+  warn "  Peer ${label}: install failed"
+  return 1
+}
+
+layer_autotest_prepare_hosts() {
+  local only="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
+  local arch mirror urls=()
+
+  layer_autotest_require_peer_ssh || return 1
+  PATH_TEST_AUTO_INSTALL=1
+  BINARY_SOURCE="$(conf_get BINARY_SOURCE)"
+  BINARY_SOURCE="${BINARY_SOURCE:-mirror}"
+
+  rule
+  info "Preparing this host and peer (auto-download missing engines before tests)…"
+  rule
+  apt_install_quiet python3 tcpdump iproute2 openssh-client netcat-openbsd dnsutils curl wget ca-certificates 2>/dev/null || true
+  layer_ssh_peer_apt_probe_deps "${ssh_host}" "${ssh_port}" "${ssh_user}"
+
+  arch="$(machine_arch 2>/dev/null || echo amd64)"
+
+  if [[ "${only}" == "all" || "${only}" == *bridge* || "${only}" == *sit* ]]; then
+    install_engine 2>/dev/null || warn "Local gost (Bridge) download failed — continuing"
+    urls=()
+    mirror="$(mirror_fwd_url "${arch}" 2>/dev/null || true)"
+    [[ -n "${mirror}" ]] && urls+=("${mirror}")
+    urls+=("$(gost_upstream_tarball_url "${arch}")")
+    layer_ssh_ensure_binary_on_peer "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "${FWD_BIN}" "-V" "gost (Bridge publisher)" "${urls[@]}" 2>/dev/null || true
+  fi
+
+  if [[ "${only}" == "all" || "${only}" == *relay* || "${only}" == *udp* || "${only}" == *raw* ]]; then
+    install_relay_engine 2>/dev/null || warn "Local hysteria (Relay) download failed — continuing"
+    urls=()
+    mirror="$(mirror_relay_url "${arch}" 2>/dev/null || true)"
+    [[ -n "${mirror}" ]] && urls+=("${mirror}")
+    urls+=("$(hysteria_upstream_url "${arch}")")
+    layer_ssh_ensure_binary_on_peer "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "${RELAY_BIN}" "version" "hysteria (Relay)" "${urls[@]}" 2>/dev/null || true
+  fi
+
+  if [[ "${only}" == "all" || "${only}" == *reverse* || "${only}" == *tcp* || "${only}" == *stream* ]]; then
+    install_reverse_engine 2>/dev/null || warn "Local rathole (Reverse) download failed — continuing"
+    urls=()
+    mirror="$(mirror_reverse_url "${arch}" 2>/dev/null || true)"
+    [[ -n "${mirror}" ]] && urls+=("${mirror}")
+    layer_ssh_ensure_binary_on_peer "${ssh_host}" "${ssh_port}" "${ssh_user}" \
+      "${REVERSE_BIN}" "--version" "rathole (Reverse)" "${urls[@]}" 2>/dev/null || true
+  fi
+
+  printf '\n'
 }
 
 layer_probe_py() {
@@ -4039,7 +4198,7 @@ layer_ssh_peer_bridge_lookup() {
   layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "toward='${toward_v4}'
      found_stop=
-     for f in ${BRIDGE_DIR}/*/meta.conf; do
+     while IFS= read -r f; do
        [[ -f \"\${f}\" ]] || continue
        r=\$(grep -E '^REMOTE_V4=' \"\${f}\" | head -n1 | cut -d= -f2-)
        [[ \"\${r}\" == \"\${toward}\" ]] || continue
@@ -4051,7 +4210,7 @@ layer_ssh_peer_bridge_lookup() {
          exit 0
        fi
        found_stop=\"STOP:\${name}:\${role}:\${i}\"
-     done
+     done < <(find ${BRIDGE_DIR} -mindepth 2 -maxdepth 2 -name meta.conf 2>/dev/null)
      ip -o link show type sit 2>/dev/null | while read -r _ _ iface _; do
        iface=\${iface%%@*}
        ip -d link show \"\${iface}\" 2>/dev/null | grep -q \"remote \${toward}\" \
@@ -4067,7 +4226,7 @@ layer_ssh_peer_relay_lookup() {
   layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "toward='${toward_v4}'
      found_stop=
-     for f in ${RELAY_DIR}/*/meta.conf; do
+     while IFS= read -r f; do
        [[ -f \"\${f}\" ]] || continue
        name=\$(basename \"\$(dirname \"\${f}\")\")
        role=\$(grep -E '^ROLE=' \"\${f}\" | head -n1 | cut -d= -f2-)
@@ -4089,7 +4248,7 @@ layer_ssh_peer_relay_lookup() {
        if [[ \"\${role}\" == exit ]]; then
          found_stop=\"STOP:exit:\${name}:\${listen}\"
        fi
-     done
+     done < <(find ${RELAY_DIR} -mindepth 2 -maxdepth 2 -name meta.conf 2>/dev/null)
      [[ -n \"\${found_stop}\" ]] && echo \"\${found_stop}\" && exit 0
      echo NONE" 2>/dev/null | tr -d '\r' | head -n1
 }
@@ -4108,7 +4267,7 @@ layer_ssh_peer_bridge_meta() {
   [[ -n "${toward_v4}" ]] || { printf 'NONE'; return 0; }
   layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "toward='${toward_v4}'
-     for f in ${BRIDGE_DIR}/*/meta.conf; do
+     while IFS= read -r f; do
        [[ -f \"\${f}\" ]] || continue
        r=\$(grep -E '^REMOTE_V4=' \"\${f}\" | head -n1 | cut -d= -f2-)
        [[ \"\${r}\" == \"\${toward}\" ]] || continue
@@ -4124,7 +4283,7 @@ layer_ssh_peer_bridge_meta() {
        fi
        echo \"\${name}|\${role}|\${iface}|\${st}|\${self_core}|\${peer_core}\"
        exit 0
-     done
+     done < <(find ${BRIDGE_DIR} -mindepth 2 -maxdepth 2 -name meta.conf 2>/dev/null)
      echo NONE" 2>/dev/null | tr -d '\r' | head -n1
 }
 
@@ -4132,7 +4291,7 @@ layer_ssh_peer_relay_meta() {
   local toward_v4="$1" ssh_host="$2" ssh_port="$3" ssh_user="$4"
   layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "toward='${toward_v4}'
-     for f in ${RELAY_DIR}/*/meta.conf; do
+     while IFS= read -r f; do
        [[ -f \"\${f}\" ]] || continue
        name=\$(basename \"\$(dirname \"\${f}\")\")
        role=\$(grep -E '^ROLE=' \"\${f}\" | head -n1 | cut -d= -f2-)
@@ -4149,7 +4308,7 @@ layer_ssh_peer_relay_meta() {
          echo \"\${name}|\${role}|\${st}||\${listen}\"
          exit 0
        fi
-     done
+     done < <(find ${RELAY_DIR} -mindepth 2 -maxdepth 2 -name meta.conf 2>/dev/null)
      echo NONE" 2>/dev/null | tr -d '\r' | head -n1
 }
 
@@ -4199,10 +4358,12 @@ layer_bridge_bidir_ping6() {
 
 layer_autotest_verify_peer_pairing() {
   local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5"
-  local peer_bridge peer_relay local_relay n remote role
+  local peer_bridge peer_relay n remote role peer_err=0
+  layer_autotest_require_peer_ssh || return 1
   peer_bridge="$(layer_ssh_peer_bridge_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
+  [[ -z "${peer_bridge}" ]] && peer_err=1
   peer_relay="$(layer_ssh_peer_relay_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
-  info "Peer pairing check (this host ${local_v4} ↔ peer ${peer_v4}):"
+  info "Peer pairing check (this host ${local_v4} ↔ peer ${peer_v4}) — after peer SSH is ready:"
   if layer_local_bridge_meta_to_peer "${peer_v4}" >/dev/null 2>&1; then
     info "  Bridge: this host has meta toward ${peer_v4}"
   else
@@ -4210,7 +4371,11 @@ layer_autotest_verify_peer_pairing() {
   fi
   case "${peer_bridge}" in
     NONE|'')
-      warn "  Bridge: peer has no meta toward ${local_v4} — paired Bridge test needs both sides configured"
+      if [[ "${peer_err}" -eq 1 ]]; then
+        warn "  Bridge: could not read peer config (SSH/sudo?) — use root SSH or NOPASSWD sudo on peer"
+      else
+        warn "  Bridge: peer has no meta toward ${local_v4} — menu 3 on kharej / menu 4 on Iran"
+      fi
       ;;
     *)
       info "  Bridge: peer has link '${peer_bridge%%|*}' toward ${local_v4}"
@@ -4425,6 +4590,11 @@ layer_test_kernel_pair() {
   local mode="$1" label="$2" local_v4="$3" remote_v4="$4" ssh_host ssh_port ssh_user
   local iface="pht${mode}$$" lip rip lpriv rpriv ok=FAIL conf=high note="" rerr=""
   ssh_host="$5"; ssh_port="$6"; ssh_user="$7"
+  layer_autotest_require_peer_ssh || {
+    layer_autotest_probe_begin "${label} (kernel ${mode} probe)"
+    layer_autotest_record "${label}" "inconclusive" "low" "peer SSH not ready for paired ${mode} probe"
+    return 0
+  }
   layer_autotest_probe_begin "${label} (kernel ${mode} probe)"
   lip="${local_v4}"; rip="${remote_v4}"
   lpriv="10.99.1.1"; rpriv="10.99.1.2"
@@ -4495,9 +4665,12 @@ layer_test_bridge_configured() {
   local info peer_meta ok=FAIL conf=high note hint started_any=0
   local n role iface lst peer_n peer_role peer_iface pst peer_self peer_peer
   local self_core peer_core local_ok peer_ok ping_res
-  local note_fail="Bridge not installed toward ${peer_v4} — menu 3 (exit) on kharej, menu 4 (entry) on Iran"
 
   layer_autotest_probe_begin "Phormal Bridge (paired — both servers)"
+  layer_autotest_require_peer_ssh || {
+    layer_autotest_record "Phormal Bridge" "inconclusive" "low" "peer SSH not ready"
+    return 0
+  }
   info="$(layer_local_bridge_meta_to_peer "${peer_v4}" 2>/dev/null || true)"
   peer_meta="$(layer_ssh_peer_bridge_meta "${local_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}")"
 
@@ -4507,7 +4680,9 @@ layer_test_bridge_configured() {
         "kernel SIT UP toward ${peer_v4} (no phormal meta on either side)"
       return 0
     fi
-    layer_autotest_record "Phormal Bridge" "FAIL" "high" "${note_fail}"
+    info "  No Bridge on either host — paired kernel SIT probe (both servers, peer SSH required)…"
+    layer_test_kernel_pair sit "Phormal Bridge" "${local_v4}" "${peer_v4}" \
+      "${ssh_host}" "${ssh_port}" "${ssh_user}"
     return 0
   fi
 
@@ -4627,6 +4802,10 @@ layer_test_relay_path() {
   local peer_n peer_role peer_st peer_listen started_any=0 local_st
 
   layer_autotest_probe_begin "Phormal Relay (paired Hysteria — both servers)"
+  layer_autotest_require_peer_ssh || {
+    layer_autotest_record "Phormal Relay" "inconclusive" "low" "peer SSH not ready"
+    return 0
+  }
   while read -r n; do
     [[ -n "${n}" ]] || continue
     role="$(imeta_get "${n}" ROLE)"
@@ -4779,7 +4958,7 @@ layer_autotest_main() {
   rule
   info "Phormal Path Test — every product (Bridge, Relay, Reverse, GRE, Echo, Raw, Stream, Cloak, DNS, Edge)"
   info "Each test prints its result live below, then a summary table and verdict."
-  info "Bridge/Relay/GRE need BOTH servers — SSH to peer verifies pairing and runs bidirectional probes."
+  info "Bridge/Relay/GRE need BOTH servers — tests wait for peer SSH, download engines, then run paired probes."
   rule
   apt_install_quiet python3 tcpdump iproute2 openssh-client netcat-openbsd dnsutils 2>/dev/null || true
   have python3 || { fail "python3 required."; return 1; }
@@ -4808,6 +4987,7 @@ layer_autotest_main() {
   sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
   layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0" >/dev/null 2>&1 || true
+  layer_autotest_prepare_hosts "${only}" "${ssh_host}" "${ssh_port}" "${ssh_user}" || return 1
   printf '\n'
   layer_autotest_verify_peer_pairing "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}"
   printf '\n'
