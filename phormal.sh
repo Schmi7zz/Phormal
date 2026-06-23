@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.3.2"
+readonly PHORMAL_VERSION="5.4.0"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -39,7 +39,7 @@ readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 # /etc/phormal/phormal.conf with  MIRROR_BASE=http://your-server:8880/phormal
 # Files expected on the mirror host (served at MIRROR_BASE):
 #   gost-linux-{amd64,arm64}  hysteria-linux-{amd64,arm64}
-#   rathole-linux-{amd64,arm64}  phormal-spoof-linux-{amd64,arm64}
+#   rathole-linux-{amd64,arm64}  backhaul-linux-{amd64,arm64}
 #   backhaul-linux-{amd64,arm64}  icmp_tun-linux-{amd64,arm64}  udp2raw-linux-{amd64,arm64}
 #   iodine-linux-{amd64,arm64}  iodined-linux-{amd64,arm64}  proxyforwarder-linux-{amd64,arm64}
 # phormal.sh itself is installed from GitHub, not the mirror.
@@ -58,13 +58,6 @@ readonly RATHOLE_RELEASE_TAG="v0.5.0"
 readonly BACKHAUL_RELEASE_REPO="Musixal/Backhaul"
 readonly BACKHAUL_RELEASE_TAG="v0.7.2"
 
-# ---- Phormal Spoof (Backhaul engine, IPX / TUN) ----
-readonly SPOOF_DIR="${PHORMAL_HOME}/spoof"
-readonly SPOOF_BIN="/usr/local/bin/phormal-spoof"
-readonly SPOOF_RUN="/usr/local/bin/phormal-spoof-run"
-readonly SPOOF_TMPL="/etc/systemd/system/phormal-spoof@.service"
-readonly SPOOF_SYSCTL="/etc/sysctl.d/96-phormal-spoof.conf"
-readonly SPOOF_DEFAULT_LINK_PORT=3080
 
 # Set once per phormal invocation when a binary must be downloaded (mirror/github/manual).
 BINARY_SOURCE=""
@@ -285,42 +278,6 @@ mirror_reverse_url() {
   printf '%s/rathole-linux-%s' "${base%/}" "${arch}"
 }
 
-mirror_spoof_url() {
-  local arch="$1" base
-  base="$(mirror_base)"
-  [[ -z "${base}" ]] && return 1
-  printf '%s/phormal-spoof-linux-%s' "${base%/}" "${arch}"
-}
-
-verify_fwd_tmp()     { [[ -x "$1" ]] && "$1" -V >/dev/null 2>&1; }
-verify_relay_tmp()   { [[ -x "$1" ]] && "$1" version >/dev/null 2>&1; }
-verify_reverse_tmp() { [[ -x "$1" ]] && "$1" --help >/dev/null 2>&1; }
-spoof_engine_is_wrong_tunnel() {
-  local bin="$1" out
-  [[ -x "${bin}" ]] || return 1
-  out="$("${bin}" -c /dev/null 2>&1 || "${bin}" --help 2>&1 || "${bin}" -h 2>&1 || true)"
-  [[ "${out}" == *"Run in local (client) mode"* ]] && return 0
-  [[ "${out}" == *"spoofed packets to server"* ]] && return 0
-  [[ "${out}" == *'Use "spoof [command]'* ]] && return 0
-  return 1
-}
-
-verify_spoof_tmp() {
-  local bin="$1" out
-  [[ -x "${bin}" ]] || return 1
-  if spoof_engine_is_wrong_tunnel "${bin}"; then
-    return 1
-  fi
-  out="$("${bin}" -c /dev/null 2>&1 || true)"
-  if [[ "${out}" == *"Run in local (client) mode"* ]]; then
-    return 1
-  fi
-  if [[ -n "${out}" ]]; then
-    return 0
-  fi
-  "${bin}" -h >/dev/null 2>&1 || "${bin}" --help >/dev/null 2>&1
-}
-
 fetch_binary() {
   local dest="$1" verify_fn="$2" label="$3"; shift 3
   local url tmp
@@ -487,149 +444,6 @@ install_reverse_engine() {
   install_local_binary "${REVERSE_BIN}" || return 1
   verify_reverse_tmp "${REVERSE_BIN}" || { fail "Binary is not runnable."; return 1; }
   good "Phormal Reverse engine installed."
-}
-
-spoof_gen_token() {
-  if have openssl; then
-    openssl rand -hex 16 2>/dev/null && return 0
-  fi
-  head -c 16 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n'
-}
-
-install_spoof_from_bundle() {
-  local arch src script_dir
-  arch="$(machine_arch)" || return 1
-  script_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")")" && pwd)"
-  for src in \
-    "${MANUAL_DIR}/phormal-spoof-linux-${arch}" \
-    "${MANUAL_DIR}/backhaul-linux-${arch}" \
-    "${script_dir}/phormal-spoof-linux-${arch}"; do
-    [[ -f "${src}" ]] || continue
-    cp -f "${src}" "${SPOOF_BIN}"
-    chmod +x "${SPOOF_BIN}"
-    if verify_spoof_tmp "${SPOOF_BIN}"; then
-      setcap cap_net_raw,cap_net_admin,cap_net_bind_service=+ep "${SPOOF_BIN}" 2>/dev/null || true
-      good "Phormal Spoof engine installed from ${src}."
-      return 0
-    fi
-  done
-  return 1
-}
-
-backhaul_release_tgz_url() {
-  local arch="$1"
-  printf 'https://github.com/%s/releases/download/%s/backhaul_linux_%s.tar.gz' \
-    "${BACKHAUL_RELEASE_REPO}" "${BACKHAUL_RELEASE_TAG}" "${arch}"
-}
-
-install_spoof_from_github_release() {
-  local arch tgz tmpdir bin
-  arch="$(machine_arch)" || return 1
-  apt_install_quiet curl wget tar
-  tgz="$(mktemp)"
-  tmpdir="$(mktemp -d)"
-  if ! fetch_url "$(backhaul_release_tgz_url "${arch}")" "${tgz}"; then
-    rm -rf "${tmpdir}"
-    rm -f "${tgz}"
-    return 1
-  fi
-  tar xzf "${tgz}" -C "${tmpdir}"
-  if [[ -f "${tmpdir}/backhaul" ]]; then
-    bin="${tmpdir}/backhaul"
-  else
-    bin="$(find "${tmpdir}" -maxdepth 2 -name backhaul -type f 2>/dev/null | head -n1)"
-  fi
-  if [[ -z "${bin}" || ! -f "${bin}" ]]; then
-    rm -rf "${tmpdir}"
-    rm -f "${tgz}"
-    return 1
-  fi
-  mv -f "${bin}" "${SPOOF_BIN}"
-  chmod +x "${SPOOF_BIN}"
-  rm -rf "${tmpdir}"
-  rm -f "${tgz}"
-  setcap cap_net_raw,cap_net_admin,cap_net_bind_service=+ep "${SPOOF_BIN}" 2>/dev/null || true
-  verify_spoof_tmp "${SPOOF_BIN}"
-}
-
-install_manual_spoof() {
-  local arch src
-  arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
-  for src in \
-    "${MANUAL_DIR}/phormal-spoof-linux-${arch}" \
-    "${MANUAL_DIR}/backhaul-linux-${arch}"; do
-    [[ -f "${src}" ]] || continue
-    break
-  done
-  if [[ ! -f "${src}" ]]; then
-    fail "Place the Phormal Spoof engine at ${MANUAL_DIR}/phormal-spoof-linux-${arch}"
-    return 1
-  fi
-  cp -f "${src}" "${SPOOF_BIN}"
-  chmod +x "${SPOOF_BIN}"
-  if ! verify_spoof_tmp "${SPOOF_BIN}"; then
-    fail "Binary at ${src} failed verification."
-    return 1
-  fi
-  setcap cap_net_raw,cap_net_admin,cap_net_bind_service=+ep "${SPOOF_BIN}" 2>/dev/null || true
-  good "Phormal Spoof engine installed (manual)."
-}
-
-install_spoof_engine() {
-  if [[ -x "${SPOOF_BIN}" ]]; then
-    if spoof_engine_is_wrong_tunnel "${SPOOF_BIN}"; then
-      warn "Wrong engine at ${SPOOF_BIN} (old UDP spoof-tunnel) — replacing with Backhaul…"
-      rm -f "${SPOOF_BIN}"
-    elif verify_spoof_tmp "${SPOOF_BIN}"; then
-      good "Phormal Spoof engine present."
-      return 0
-    else
-      warn "Phormal Spoof engine failed verification — reinstalling…"
-      rm -f "${SPOOF_BIN}"
-    fi
-  fi
-  choose_binary_source || true
-  info "Installing Phormal Spoof engine…"
-
-  if install_spoof_from_bundle; then
-    return 0
-  fi
-
-  if [[ "${BINARY_SOURCE}" == "manual" ]]; then
-    install_manual_spoof || return 1
-    return 0
-  fi
-
-  apt_install_quiet curl wget libpcap0.8 iproute2 iptables libcap2-bin
-
-  local arch urls=()
-  arch="$(machine_arch)" || { fail "Unsupported architecture: $(uname -m)"; return 1; }
-
-  if [[ "${BINARY_SOURCE}" == "mirror" ]]; then
-    local mirror
-    if mirror="$(mirror_spoof_url "${arch}" 2>/dev/null || true)" && [[ -n "${mirror}" ]]; then
-      urls+=("${mirror}")
-    fi
-    if fetch_binary "${SPOOF_BIN}" verify_spoof_tmp \
-        "Phormal Spoof engine" "${urls[@]}"; then
-      setcap cap_net_raw,cap_net_admin,cap_net_bind_service=+ep "${SPOOF_BIN}" 2>/dev/null || true
-      return 0
-    fi
-    fail "Phormal Spoof engine not found on mirror — run mirror-host-setup.sh on the mirror host."
-    return 1
-  elif [[ "${BINARY_SOURCE}" == "github" ]]; then
-    if install_spoof_from_github_release; then
-      good "Phormal Spoof engine installed."
-      return 0
-    fi
-    fail "Could not download Phormal Spoof engine."
-    return 1
-  fi
-
-  install_local_binary "${SPOOF_BIN}" || return 1
-  setcap cap_net_raw,cap_net_admin,cap_net_bind_service=+ep "${SPOOF_BIN}" 2>/dev/null || true
-  verify_spoof_tmp "${SPOOF_BIN}" || { fail "Binary is not runnable."; return 1; }
-  good "Phormal Spoof engine installed."
 }
 
 random_core_prefix() {
@@ -2886,929 +2700,6 @@ manage_reverse_menu() {
 }
 
 # ==============================================================================
-#  Phormal Spoof — multi-instance (IPX / TUN carrier, entry=server exit=client)
-# ==============================================================================
-
-sp_idir() { printf '%s/%s' "${SPOOF_DIR}" "$1"; }
-
-spoof_instances() {
-  local d
-  for d in "${SPOOF_DIR}"/*/; do
-    [[ -f "${d}meta.conf" ]] || continue
-    basename "${d}"
-  done
-}
-
-smeta_get() {
-  local name="$1" key="$2" f
-  f="$(sp_idir "${name}")/meta.conf"
-  [[ -f "${f}" ]] && grep -E "^${key}=" "${f}" | head -n1 | cut -d= -f2- || true
-}
-
-smeta_set() {
-  local name="$1" key="$2" val="$3" f
-  f="$(sp_idir "${name}")/meta.conf"
-  mkdir -p "$(dirname "${f}")"; touch "${f}"
-  if grep -qE "^${key}=" "${f}" 2>/dev/null; then
-    sed -i "s|^${key}=.*|${key}=${val}|" "${f}"
-  else
-    echo "${key}=${val}" >> "${f}"
-  fi
-}
-
-sp_svc()       { printf 'phormal-spoof@%s.service' "$1"; }
-sp_svc_state() {
-  local st
-  st="$(systemctl is-active "$(sp_svc "$1")" 2>/dev/null || true)"
-  st="${st//$'\n'/}"
-  [[ -n "${st}" && "${st}" != "unknown" ]] && printf '%s' "${st}" || printf 'inactive'
-}
-
-spoof_pick_name() {
-  local raw name
-  raw="$(ask 'Tunnel name (e.g. iran1, kharej-de)')"
-  name="$(relay_sanitize_name "${raw}")"
-  if [[ -f "$(sp_idir "${name}")/meta.conf" ]]; then
-    warn "A tunnel named '${name}' already exists." >&2
-    printf '%s' ""
-    return 1
-  fi
-  printf '%s' "${name}"
-}
-
-spoof_enable_raw() {
-  info "Preparing kernel for Phormal Spoof…"
-  cat > "${SPOOF_SYSCTL}" <<'EOF'
-# Phormal Spoof — IPX / ICMP carrier
-net.ipv4.conf.all.rp_filter = 0
-net.ipv4.conf.default.rp_filter = 0
-net.ipv4.ip_forward = 1
-net.ipv4.icmp_echo_ignore_all = 0
-EOF
-  sysctl --system >/dev/null 2>&1 || true
-  local iface; iface="$(primary_iface)"
-  [[ -n "${iface}" ]] && sysctl -w "net.ipv4.conf.${iface}.rp_filter=0" >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 || true
-  enable_relay_buffers
-  good "Phormal Spoof kernel tuning applied."
-}
-
-# ------------------------------------------------------------------------------
-#  Spoof preflight — isolated egress / peer reachability probes (no tunnel)
-# ------------------------------------------------------------------------------
-readonly SPOOF_PROBE_ID=0x7048
-readonly SPOOF_PROBE_PAYLOAD='PHORMAL-SPOOF-TEST'
-
-spoof_iface_ipv4() {
-  ip -4 -o addr show dev "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1
-}
-
-spoof_probe_tools_ready() {
-  have tcpdump && { have python3 || have hping3; }
-}
-
-spoof_send_probe() {
-  local src="$1" dst="$2" cnt="${3:-5}"
-  if have python3; then
-    python3 - "$src" "$dst" "$cnt" <<'PY'
-import socket, struct, sys, time
-src, dst, cnt = sys.argv[1], sys.argv[2], int(sys.argv[3])
-def csum(b):
-    if len(b) % 2:
-        b += b'\x00'
-    s = sum((b[i] << 8) | b[i + 1] for i in range(0, len(b), 2))
-    s = (s >> 16) + (s & 0xffff)
-    s += s >> 16
-    return (~s) & 0xffff
-payload = b'PHORMAL-SPOOF-TEST'
-icmp_id = 0x7048
-def icmp(seq):
-    h = struct.pack('!BBHHH', 8, 0, 0, icmp_id, seq)
-    c = csum(h + payload)
-    h = struct.pack('!BBHHH', 8, 0, c, icmp_id, seq)
-    return h + payload
-def ip_hdr(src, dst, plen):
-    th = 20 + plen
-    hdr = struct.pack(
-        '!BBHHHBBH4s4s', 0x45, 0, th, 0x4242, 0, 64, 1, 0,
-        socket.inet_aton(src), socket.inet_aton(dst),
-    )
-    c = csum(hdr)
-    return struct.pack(
-        '!BBHHHBBH4s4s', 0x45, 0, th, 0x4242, 0, 64, 1, c,
-        socket.inet_aton(src), socket.inet_aton(dst),
-    )
-s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-for seq in range(cnt):
-    pkt_icmp = icmp(seq)
-    pkt = ip_hdr(src, dst, len(pkt_icmp)) + pkt_icmp
-    s.sendto(pkt, (dst, 0))
-    time.sleep(0.2)
-print("sent", cnt)
-PY
-    return $?
-  fi
-  if have hping3; then
-    hping3 -1 -a "${src}" -c "${cnt}" -i u200 --icmp-id 0x7048 "${dst}" >/dev/null 2>&1 || return 1
-    printf 'sent %s\n' "${cnt}"
-    return 0
-  fi
-  fail "Need python3 or hping3 to craft spoof probes."
-  return 1
-}
-
-spoof_print_egress_report() {
-  local verdict="$1" iface="$2" real_ip="$3" src_ip="$4" dst_ip="$5"
-  local sent="$6" captured="$7" rp_all="$8" rp_def="$9" rp_if="${10}" fw_note="${11}"
-  rule
-  info "Spoof preflight — Layer 1 local egress"
-  rule
-  if [[ "${verdict}" == "PASS" ]]; then
-    good "PASS — spoofed-source packets left ${iface}."
-  else
-    fail "FAIL — no spoofed packets observed leaving ${iface}."
-  fi
-  info "  Egress interface : ${iface}"
-  info "  Interface real IP: ${real_ip:-unknown}"
-  info "  Spoofed source   : ${src_ip}"
-  info "  Probe destination: ${dst_ip}"
-  info "  Packets sent     : ${sent}"
-  info "  Captured on NIC  : ${captured}"
-  info "  rp_filter all    : ${rp_all}"
-  info "  rp_filter default: ${rp_def}"
-  info "  rp_filter ${iface}: ${rp_if}"
-  info "  Firewall note    : ${fw_note}"
-  if [[ "${verdict}" == "FAIL" ]]; then
-    if [[ "${rp_all}" != "0" || "${rp_def}" != "0" || "${rp_if}" != "0" ]]; then
-      warn "Strict reverse-path filtering (rp_filter) may be dropping spoofed egress."
-      warn "Run Spoof kernel prep (rp_filter=0) before retrying."
-    else
-      warn "tcpdump may miss same-host spoofed egress — not proof spoof is blocked."
-      warn "Use menu 6 (listener on peer) + 7 (sender here) for a reliable path test."
-    fi
-  elif [[ "${verdict}" == "PASS" ]]; then
-    warn "PASS proves host/kernel egress only — ISP uRPF/BCP38 is still unknown."
-  fi
-  rule
-}
-
-spoof_count_captured_probes() {
-  local pcap="$1" src_ip="$2" dst_ip="$3" n
-  n="$(tcpdump -r "${pcap}" -nn 2>/dev/null \
-    | grep -cE "${src_ip//./\\.} > ${dst_ip//./\\.}.*ICMP echo request" || true)"
-  [[ "${n}" -gt 0 ]] && { printf '%s' "${n}"; return 0; }
-  n="$(tcpdump -r "${pcap}" -nn \
-    "src host ${src_ip} and dst host ${dst_ip} and icmp" 2>/dev/null \
-    | wc -l | tr -d ' ')"
-  printf '%s' "${n:-0}"
-}
-
-# Layer 1 — mandatory isolated egress test. Optional args: spoof_src, dest, offer_peer (1/0).
-spoof_test_egress() {
-  local default_src="${1:-}" default_dst="${2:-}" offer_peer="${3:-1}"
-  local iface real_ip src_ip dst_ip sent=8 captured=0
-  local rp_all rp_def rp_if fw_note pcap pcap2 tdp tdp2 cap_iface n
-
-  apt_install_quiet tcpdump python3
-
-  if ! spoof_probe_tools_ready; then
-    fail "Preflight needs tcpdump plus python3 (or hping3)."
-    return 1
-  fi
-
-  iface="$(primary_iface)"
-  [[ -n "${iface}" ]] || { fail "Could not detect egress interface."; return 1; }
-  real_ip="$(spoof_iface_ipv4 "${iface}")"
-  sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
-  sysctl -w "net.ipv4.conf.${iface}.rp_filter=0" >/dev/null 2>&1 || true
-
-  rule
-  info "Spoof preflight — testing local egress on ${iface}"
-  info "No tunnel or Phormal service will be started."
-  rule
-
-  while :; do
-    if [[ -n "${default_src}" ]]; then
-      src_ip="${default_src}"
-    else
-      src_ip="$(ask 'Spoof source IP to test [62.60.212.199]')"
-      src_ip="${src_ip:-62.60.212.199}"
-    fi
-    valid_ipv4 "${src_ip}" || { fail "Invalid IPv4."; return 1; }
-    if [[ -n "${real_ip}" && "${src_ip}" == "${real_ip}" ]]; then
-      warn "Spoof source must differ from this interface's real IP (${real_ip})."
-      default_src=""
-      continue
-    fi
-    break
-  done
-
-  if [[ -n "${default_dst}" ]]; then
-    dst_ip="${default_dst}"
-  else
-    dst_ip="$(ask 'Probe destination IP [1.1.1.1]')"
-    dst_ip="${dst_ip:-1.1.1.1}"
-  fi
-  valid_ipv4 "${dst_ip}" || { fail "Invalid IPv4."; return 1; }
-
-  rp_all="$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo '?')"
-  rp_def="$(sysctl -n net.ipv4.conf.default.rp_filter 2>/dev/null || echo '?')"
-  rp_if="$(sysctl -n "net.ipv4.conf.${iface}.rp_filter" 2>/dev/null || echo '?')"
-
-  fw_note="none noted"
-  if have ufw && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-    fw_note="ufw active — verify outbound rules allow raw ICMP egress"
-  elif have iptables && iptables -L OUTPUT -n 2>/dev/null | grep -qE 'DROP|REJECT'; then
-    fw_note="iptables OUTPUT has DROP/REJECT rules — may block spoofed egress"
-  fi
-
-  pcap="$(mktemp)"
-  pcap2="$(mktemp)"
-  timeout 15 tcpdump -ni any -s 160 -w "${pcap}" \
-    "icmp and dst host ${dst_ip}" >/dev/null 2>&1 &
-  tdp=$!
-  timeout 15 tcpdump -ni "${iface}" -s 160 -w "${pcap2}" \
-    "icmp and dst host ${dst_ip}" >/dev/null 2>&1 &
-  tdp2=$!
-  sleep 1
-
-  if ! spoof_send_probe "${src_ip}" "${dst_ip}" "${sent}"; then
-    kill "${tdp}" "${tdp2}" 2>/dev/null || true
-    wait "${tdp}" "${tdp2}" 2>/dev/null || true
-    rm -f "${pcap}" "${pcap2}"
-    return 1
-  fi
-
-  sleep 3
-  kill "${tdp}" "${tdp2}" 2>/dev/null || true
-  wait "${tdp}" "${tdp2}" 2>/dev/null || true
-  for cap_iface in "${pcap}" "${pcap2}"; do
-    [[ -f "${cap_iface}" && -s "${cap_iface}" ]] || continue
-    n="$(spoof_count_captured_probes "${cap_iface}" "${src_ip}" "${dst_ip}")"
-    [[ "${n}" -gt "${captured}" ]] && captured="${n}"
-  done
-  rm -f "${pcap}" "${pcap2}"
-  captured="${captured:-0}"
-
-  local verdict="FAIL"
-  [[ "${captured}" -ge 1 ]] && verdict="PASS"
-
-  spoof_print_egress_report "${verdict}" "${iface}" "${real_ip}" "${src_ip}" "${dst_ip}" \
-    "${sent}" "${captured}" "${rp_all}" "${rp_def}" "${rp_if}" "${fw_note}"
-
-  if [[ "${verdict}" == "PASS" && "${offer_peer}" == "1" ]]; then
-    local peer_ans; peer_ans="$(ask 'Also test reachability to the peer (needs a listener on the other server)? (y/n) [n]')"
-    peer_ans="${peer_ans:-n}"
-    if [[ "${peer_ans}" =~ ^[Yy] ]]; then
-      warn "Start menu option 6 (peer listener) on the other server first."
-      spoof_test_sender "${dst_ip}" "${src_ip}"
-    fi
-  fi
-
-  [[ "${verdict}" == "PASS" ]]
-}
-
-# Layer 2 — passive listener on the receiving server.
-spoof_test_listener() {
-  local expect_src iface logf received verdict
-  apt_install_quiet tcpdump
-
-  if ! have tcpdump; then
-    fail "tcpdump is required for the peer listener."
-    return 1
-  fi
-
-  iface="$(primary_iface)"
-  [[ -n "${iface}" ]] || { fail "Could not detect interface."; return 1; }
-
-  expect_src="$(ask 'Expected forged source IP [62.60.212.199]')"
-  expect_src="${expect_src:-62.60.212.199}"
-  valid_ipv4 "${expect_src}" || { fail "Invalid IPv4."; return 1; }
-
-  rule
-  info "Spoof preflight — Layer 2 peer listener"
-  info "Listening on ${iface} for 60s… (run the sender on the other server now)"
-  rule
-
-  logf="$(mktemp)"
-  timeout 60 tcpdump -ni "${iface}" -vv \
-    "icmp and src host ${expect_src} and icmp[icmptype]=icmp-echo" >"${logf}" 2>&1 || true
-
-  received="$(grep -cE 'id 28744|PHORMAL-SPOOF-TEST' "${logf}" 2>/dev/null || true)"
-  received="${received:-0}"
-  rm -f "${logf}"
-
-  verdict="FAIL"
-  [[ "${received}" -ge 1 ]] && verdict="PASS"
-
-  rule
-  if [[ "${verdict}" == "PASS" ]]; then
-    good "PASS — packets with forged source ${expect_src} arrived on ${iface}."
-    info "The path likely allows spoofed traffic (uRPF/BCP38 not blocking this source)."
-  else
-    fail "FAIL — no matching probes received on ${iface}."
-    warn "Nothing arrived — sender ISP/uRPF may drop spoofed packets, or the listener filter/iface is wrong."
-  fi
-  info "  Interface      : ${iface}"
-  info "  Expected source: ${expect_src}"
-  info "  Probes received: ${received}"
-  rule
-
-  [[ "${verdict}" == "PASS" ]]
-}
-
-# Layer 2 — sender toward a peer (read PASS/FAIL on the listener box).
-spoof_test_sender() {
-  local default_dst="${1:-}" default_src="${2:-}"
-  local src_ip dst_ip sent=10
-
-  apt_install_quiet python3
-
-  if ! { have python3 || have hping3; }; then
-    fail "Need python3 or hping3 to send probes."
-    return 1
-  fi
-
-  if [[ -n "${default_dst}" ]]; then
-    dst_ip="${default_dst}"
-  else
-    dst_ip="$(ask 'Peer real IPv4 (probe destination)')"
-  fi
-  valid_ipv4 "${dst_ip}" || { fail "Invalid IPv4."; return 1; }
-
-  if [[ -n "${default_src}" ]]; then
-    src_ip="${default_src}"
-  else
-    src_ip="$(ask 'Forged source IP (white IP) [62.60.212.199]')"
-    src_ip="${src_ip:-62.60.212.199}"
-  fi
-  valid_ipv4 "${src_ip}" || { fail "Invalid IPv4."; return 1; }
-
-  rule
-  info "Spoof preflight — Layer 2 sender"
-  warn "Ensure the peer listener (menu option 6) is running on ${dst_ip}."
-  rule
-
-  if ! spoof_send_probe "${src_ip}" "${dst_ip}" "${sent}"; then
-    return 1
-  fi
-
-  good "Sent ${sent} probes: forged src ${src_ip} → ${dst_ip}"
-  info "Read PASS/FAIL on the listener server — this box does not score Layer 2."
-  rule
-}
-
-# Advisory preflight during tunnel create (non-blocking on missing tools).
-spoof_create_preflight_advisory() {
-  local spoof_ip="$1" peer_ip="$2"
-
-  rule
-  info "Spoof preflight — advisory local egress check"
-  rule
-
-  apt_install_quiet tcpdump python3 2>/dev/null || true
-
-  if ! spoof_probe_tools_ready; then
-    warn "Preflight tools unavailable (tcpdump + python3 or hping3) — skipping egress test."
-    return 0
-  fi
-
-  if spoof_test_egress "${spoof_ip}" "${peer_ip}" 0; then
-    return 0
-  fi
-
-  warn "Preflight egress check FAILED — this server may not emit spoofed packets."
-  warn "This test often false-negatives; the tunnel may still work."
-  local cont; cont="$(ask 'Continue anyway? (y/n) [y]')"
-  cont="${cont:-y}"
-  [[ "${cont}" =~ ^[Yy] ]]
-}
-
-spoof_install_runtime() {
-  cat > "${SPOOF_RUN}" <<EOF
-#!/usr/bin/env bash
-set -e
-name="\$1"
-dir="${SPOOF_DIR}/\${name}"
-[[ -f "\${dir}/meta.conf" ]] || { echo "no such Phormal Spoof tunnel: \${name}" >&2; exit 1; }
-exec ${SPOOF_BIN} -c "\${dir}/config.toml"
-EOF
-  chmod +x "${SPOOF_RUN}"
-
-  cat > "${SPOOF_TMPL}" <<EOF
-[Unit]
-Description=Phormal Spoof tunnel (%i)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStartPre=/bin/sleep 2
-ExecStart=${SPOOF_RUN} %i
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-}
-
-spoof_write_ipx_block() {
-  # $1 = spoof SOURCE ip, $2 = spoof DESTINATION (white) ip. dst defaults to src when empty.
-  local src_ip="$1" dst_ip="${2:-$1}"
-  echo '[ipx]'
-  echo 'profile = "icmp"'
-  echo 'icmp_type = 8'
-  echo 'icmp_code = 0'
-  echo "spoof_src_ip = \"${src_ip}\""
-  echo "spoof_dst_ip = \"${dst_ip}\""
-  echo 'custom_packet = true'
-}
-
-spoof_write_ports_block() {
-  local ports="$1"
-  local p spec first=1
-  echo 'ports = ['
-  IFS=',' read -ra parr <<< "${ports}"
-  for p in "${parr[@]}"; do
-    [[ -n "${p}" ]] || continue
-    if [[ "${p}" == *"="* ]]; then
-      spec="${p}"
-    else
-      spec="${p}=127.0.0.1:${p}"
-    fi
-    if [[ ${first} -eq 1 ]]; then
-      printf '  "%s"' "${spec}"
-      first=0
-    else
-      printf ',\n  "%s"' "${spec}"
-    fi
-  done
-  echo ']'
-}
-
-# [ipx] is a separate table alongside transport = "tcp". On deploy, confirm via:
-# journalctl -u 'phormal-spoof@*' -f  →  "spoofing enabled, srcIP: … dstIP: …"
-write_spoof_entry_config() {
-  local name="$1" dir token link_port ports spoof_ip spoof_dst
-  dir="$(sp_idir "${name}")"
-  mkdir -p "${dir}"
-  token="$(smeta_get "${name}" TOKEN)"
-  link_port="$(smeta_get "${name}" LINK_PORT)"; link_port="${link_port:-${SPOOF_DEFAULT_LINK_PORT}}"
-  ports="$(smeta_get "${name}" PORTS)"
-  spoof_ip="$(smeta_get "${name}" SPOOF_IP)"
-  spoof_dst="$(smeta_get "${name}" SPOOF_DST_IP)"; spoof_dst="${spoof_dst:-${spoof_ip}}"
-
-  {
-    echo '[server]'
-    echo "bind_addr = \"0.0.0.0:${link_port}\""
-    echo 'transport = "tcp"'
-    echo "token = \"${token}\""
-    echo 'heartbeat = 40'
-    echo 'channel_size = 2048'
-    echo 'accept_udp = true'
-    [[ -n "${ports}" ]] && spoof_write_ports_block "${ports}"
-    echo ''
-    spoof_write_ipx_block "${spoof_ip}" "${spoof_dst}"
-  } > "${dir}/config.toml"
-}
-
-write_spoof_exit_config() {
-  local name="$1" dir token link_port remote spoof_ip spoof_dst
-  dir="$(sp_idir "${name}")"
-  mkdir -p "${dir}"
-  token="$(smeta_get "${name}" TOKEN)"
-  link_port="$(smeta_get "${name}" LINK_PORT)"; link_port="${link_port:-${SPOOF_DEFAULT_LINK_PORT}}"
-  remote="$(smeta_get "${name}" REMOTE_V4)"
-  spoof_ip="$(smeta_get "${name}" SPOOF_IP)"
-  spoof_dst="$(smeta_get "${name}" SPOOF_DST_IP)"; spoof_dst="${spoof_dst:-${spoof_ip}}"
-
-  {
-    echo '[client]'
-    echo "remote_addr = \"${remote}:${link_port}\""
-    echo 'transport = "tcp"'
-    echo "token = \"${token}\""
-    echo 'heartbeat = 40'
-    echo 'connection_pool = 8'
-    echo ''
-    spoof_write_ipx_block "${spoof_ip}" "${spoof_dst}"
-  } > "${dir}/config.toml"
-}
-
-spoof_rebuild_instance() {
-  local name="$1" role; role="$(smeta_get "${name}" ROLE)"
-  if [[ "${role}" == "exit" ]]; then
-    write_spoof_exit_config "${name}"
-  else
-    write_spoof_entry_config "${name}"
-  fi
-  spoof_start_instance "${name}"
-}
-
-spoof_start_instance() {
-  local name="$1" svc; svc="$(sp_svc "${name}")"
-  spoof_rebuild_config_only "${name}"
-  systemctl daemon-reload
-  systemctl enable "${svc}" >/dev/null 2>&1
-  systemctl restart "${svc}"
-  sleep 2
-  if systemctl is-active "${svc}" >/dev/null 2>&1; then
-    good "Tunnel '${name}' is active."
-    return 0
-  fi
-  fail "Tunnel '${name}' failed to start. Recent log:"
-  journalctl -u "${svc}" -n 12 --no-pager 2>/dev/null | sed 's/^/    /'
-  return 1
-}
-
-spoof_rebuild_config_only() {
-  local name="$1" role; role="$(smeta_get "${name}" ROLE)"
-  if [[ "${role}" == "exit" ]]; then
-    write_spoof_exit_config "${name}"
-  else
-    write_spoof_entry_config "${name}"
-  fi
-}
-
-spoof_prompt_white_ip() {
-  local name="$1" w d
-  w="$(ask 'Spoof SOURCE IP (white IP, same on both nodes, e.g. 62.60.212.199)')"
-  valid_ipv4 "${w}" || { fail "Invalid IPv4."; return 1; }
-  smeta_set "${name}" SPOOF_IP "${w}"
-  d="$(ask "Spoof DESTINATION (white) IP [${w}] — press enter to reuse the source")"
-  d="${d:-${w}}"
-  valid_ipv4 "${d}" || { fail "Invalid IPv4."; return 1; }
-  smeta_set "${name}" SPOOF_DST_IP "${d}"
-  return 0
-}
-
-create_spoof_entry() {
-  rule
-  info "Phormal Spoof — new ENTRY tunnel (this server = iran)"
-  info "IPX / TUN / ICMP carrier — publish TCP/UDP ports on this node."
-  rule
-
-  install_spoof_engine || return 1
-  spoof_enable_raw
-  apply_tuning fq
-  spoof_install_runtime
-
-  local name token link_port ports remote
-  name="$(spoof_pick_name)" || return 1
-  [[ -z "${name}" ]] && { fail "Invalid name."; return 1; }
-  mkdir -p "$(sp_idir "${name}")"
-  smeta_set "${name}" ROLE entry
-
-  link_port="$(ask "Link port (bind on this server) [${SPOOF_DEFAULT_LINK_PORT}]")"
-  link_port="${link_port:-${SPOOF_DEFAULT_LINK_PORT}}"
-  [[ "${link_port}" =~ ^[0-9]+$ ]] || { fail "Invalid port."; rm -rf "$(sp_idir "${name}")"; return 1; }
-  smeta_set "${name}" LINK_PORT "${link_port}"
-
-  token="$(ask 'Tunnel token [leave empty to auto-generate]')"
-  if [[ -z "${token}" ]]; then
-    token="$(spoof_gen_token)"
-  fi
-  smeta_set "${name}" TOKEN "${token}"
-  rule
-  good "Entry token — copy this to kharej exit (menu 12):"
-  info "  ${token}"
-  rule
-
-  ports="$(ask 'Published user ports (comma-separated, e.g. 8081 or 8081=127.0.0.1:8081)')"
-  [[ -n "${ports}" ]] || { fail "At least one port required."; rm -rf "$(sp_idir "${name}")"; return 1; }
-  smeta_set "${name}" PORTS "${ports}"
-
-  remote="$(ask 'Kharej (exit) node real IPv4 (for preflight only)')"
-  valid_ipv4 "${remote}" || { fail "Invalid IPv4."; rm -rf "$(sp_idir "${name}")"; return 1; }
-  smeta_set "${name}" REMOTE_V4 "${remote}"
-
-  spoof_prompt_white_ip "${name}" || { rm -rf "$(sp_idir "${name}")"; return 1; }
-
-  spoof_create_preflight_advisory "$(smeta_get "${name}" SPOOF_IP)" "${remote}" || {
-    warn "Setup cancelled. Token was: ${token}"
-    rm -rf "$(sp_idir "${name}")"
-    return 1
-  }
-
-  spoof_start_instance "${name}" || return 1
-
-  echo
-  good "Entry tunnel '${name}' live — link :${link_port}"
-  good "Token (for kharej exit): ${token}"
-  info "  Ports : ${ports}"
-  info "  Spoof : profile=icmp src=$(smeta_get "${name}" SPOOF_IP) dst=$(smeta_get "${name}" SPOOF_DST_IP)"
-  good "Point users at THIS server's IP and the published port(s)."
-  warn "Create the matching Phormal Spoof EXIT on kharej with the SAME token, link port, and white IP."
-}
-
-create_spoof_exit() {
-  rule
-  info "Phormal Spoof — new EXIT tunnel (this server = kharej)"
-  info "Connects to Iran entry; local services receive forwarded traffic."
-  rule
-
-  install_spoof_engine || return 1
-  spoof_enable_raw
-  apply_tuning fq
-  spoof_install_runtime
-
-  local name token link_port remote
-  name="$(spoof_pick_name)" || return 1
-  [[ -z "${name}" ]] && { fail "Invalid name."; return 1; }
-  mkdir -p "$(sp_idir "${name}")"
-  smeta_set "${name}" ROLE exit
-
-  remote="$(ask 'Iran (entry) node real IPv4')"
-  valid_ipv4 "${remote}" || { fail "Invalid IPv4."; rm -rf "$(sp_idir "${name}")"; return 1; }
-  smeta_set "${name}" REMOTE_V4 "${remote}"
-
-  link_port="$(ask "Iran link port [${SPOOF_DEFAULT_LINK_PORT}]")"
-  link_port="${link_port:-${SPOOF_DEFAULT_LINK_PORT}}"
-  smeta_set "${name}" LINK_PORT "${link_port}"
-
-  token="$(ask 'Tunnel token (must match entry)')"
-  [[ -n "${token}" ]] || { fail "Token required."; rm -rf "$(sp_idir "${name}")"; return 1; }
-  smeta_set "${name}" TOKEN "${token}"
-
-  spoof_prompt_white_ip "${name}" || { rm -rf "$(sp_idir "${name}")"; return 1; }
-
-  spoof_create_preflight_advisory "$(smeta_get "${name}" SPOOF_IP)" "${remote}" || {
-    rm -rf "$(sp_idir "${name}")"; return 1
-  }
-
-  spoof_start_instance "${name}" || return 1
-
-  echo
-  good "Exit tunnel '${name}' live."
-  info "  Remote : ${remote}:${link_port}"
-  info "  Spoof  : profile=icmp src=$(smeta_get "${name}" SPOOF_IP) dst=$(smeta_get "${name}" SPOOF_DST_IP)"
-  warn "Run your local service (e.g. VLESS on 127.0.0.1:8081) — port map is defined on the entry."
-}
-
-spoof_list() {
-  rule
-  info "Phormal Spoof — tunnels"
-  rule
-  local n any=0
-  printf '    %-16s %-6s %-32s %-10s\n' "NAME" "ROLE" "TARGET" "STATE"
-  while read -r n; do
-    [[ -n "${n}" ]] || continue
-    any=1
-    local role state tgt link ports remote
-    role="$(smeta_get "${n}" ROLE)"
-    state="$(sp_svc_state "${n}")"
-    link="$(smeta_get "${n}" LINK_PORT)"; link="${link:-${SPOOF_DEFAULT_LINK_PORT}}"
-    if [[ "${role}" == "entry" ]]; then
-      ports="$(smeta_get "${n}" PORTS)"
-      tgt=":${link} ports ${ports}"
-    else
-      remote="$(smeta_get "${n}" REMOTE_V4)"
-      tgt="${remote}:${link}"
-    fi
-    printf '    %-16s %-6s %-32s %-10s\n' "${n}" "${role}" "${tgt}" "${state}"
-  done < <(spoof_instances)
-  [[ ${any} -eq 0 ]] && warn "no tunnels configured yet"
-  rule
-}
-
-spoof_choose_instance() {
-  local names=() n i
-  while read -r n; do [[ -n "${n}" ]] && names+=("${n}"); done < <(spoof_instances)
-  if [[ ${#names[@]} -eq 0 ]]; then warn "No tunnels configured." >&2; printf '%s' ""; return 1; fi
-  {
-    for i in "${!names[@]}"; do
-      printf '  %s%s%s  %s (%s, %s)\n' "${ACC}" "$((i+1))" "${RST}" \
-        "${names[i]}" "$(smeta_get "${names[i]}" ROLE)" "$(sp_svc_state "${names[i]}")"
-    done
-  } >&2
-  local sel; sel="$(ask 'Tunnel number')"
-  [[ "${sel}" =~ ^[0-9]+$ ]] || { printf '%s' ""; return 1; }
-  local idx=$((sel-1))
-  [[ ${idx} -ge 0 && ${idx} -lt ${#names[@]} ]] || { printf '%s' ""; return 1; }
-  printf '%s' "${names[idx]}"
-}
-
-diagnose_spoof_instance() {
-  local name="$1" role svc link ports p remote dir
-  role="$(smeta_get "${name}" ROLE)"
-  svc="$(sp_svc "${name}")"
-  link="$(smeta_get "${name}" LINK_PORT)"; link="${link:-${SPOOF_DEFAULT_LINK_PORT}}"
-  dir="$(sp_idir "${name}")"
-  rule
-  info "Diagnostics — Phormal Spoof tunnel '${name}' (${role})"
-  rule
-  if systemctl is-active "${svc}" >/dev/null 2>&1; then good "service active"; else fail "service not active"; fi
-  if [[ -f "${dir}/config.toml" ]]; then
-    good "config.toml present"
-  else
-    fail "config.toml missing — restart to rebuild from meta.conf"
-  fi
-  info "Token    : $(smeta_get "${name}" TOKEN)"
-  info "Spoof src: $(smeta_get "${name}" SPOOF_IP)"
-  info "Spoof dst: $(smeta_get "${name}" SPOOF_DST_IP)"
-  if [[ -f "${dir}/config.toml" ]]; then
-    if grep -q 'transport = "tcp"' "${dir}/config.toml" 2>/dev/null; then
-      good 'config transport = "tcp"'
-    else
-      warn 'config transport is not "tcp" — restart tunnel to rebuild'
-    fi
-    if grep -q 'profile = "icmp"' "${dir}/config.toml" 2>/dev/null; then
-      good '[ipx] profile = "icmp" present'
-    else
-      warn '[ipx] block missing or old — restart tunnel to rebuild'
-    fi
-  fi
-  if journalctl -u "${svc}" --since '5 min ago' 2>/dev/null | grep -qi 'spoofing enabled'; then
-    good "engine reports spoofing enabled (see log below)"
-  else
-    warn "no 'spoofing enabled' in recent log — tunnel may not be spoofing yet"
-  fi
-  if [[ "${role}" == "entry" ]]; then
-    if port_open_tcp "${link}"; then good "TCP link :${link} listening"; else warn "TCP link :${link} not confirmed"; fi
-    ports="$(smeta_get "${name}" PORTS)"
-    info "Ports    : ${ports}"
-    IFS=',' read -ra parr <<< "${ports}"
-    for p in "${parr[@]}"; do
-      [[ -n "${p}" ]] || continue
-      p="${p%%=*}"
-      if port_open_tcp "${p}"; then good "TCP :${p} listening (users)"; else warn "TCP :${p} not confirmed"; fi
-    done
-    info "Peer ref : $(smeta_get "${name}" REMOTE_V4) (preflight only)"
-  else
-    remote="$(smeta_get "${name}" REMOTE_V4)"
-    info "Remote   : ${remote}:${link}"
-  fi
-  echo
-  info "Recent log:"
-  journalctl -u "${svc}" -n 8 --no-pager 2>/dev/null | sed 's/^/    /' || true
-  rule
-}
-
-spoof_change_peer_ip() {
-  local name="$1" role ip
-  role="$(smeta_get "${name}" ROLE)"
-  if [[ "${role}" == "entry" ]]; then
-    ip="$(ask "Kharej IP (reference) [$(smeta_get "${name}" REMOTE_V4)]")"
-    [[ -z "${ip}" ]] && return 0
-    valid_ipv4 "${ip}" || { fail "Invalid IPv4."; return 1; }
-    smeta_set "${name}" REMOTE_V4 "${ip}"
-    good "Peer reference IP updated (meta only on entry)."
-    return 0
-  fi
-  ip="$(ask "Iran entry IP [$(smeta_get "${name}" REMOTE_V4)]")"
-  [[ -z "${ip}" ]] && return 0
-  valid_ipv4 "${ip}" || { fail "Invalid IPv4."; return 1; }
-  smeta_set "${name}" REMOTE_V4 "${ip}"
-  spoof_rebuild_instance "${name}"
-  good "Remote entry IP updated."
-}
-
-spoof_change_white_ip() {
-  local name="$1" w
-  w="$(ask "White / spoof IP [$(smeta_get "${name}" SPOOF_IP)]")"
-  [[ -z "${w}" ]] && return 0
-  valid_ipv4 "${w}" || { fail "Invalid IPv4."; return 1; }
-  smeta_set "${name}" SPOOF_IP "${w}"
-  spoof_rebuild_instance "${name}"
-  good "White IP updated (ipx spoof_src/dst + custom_packet)."
-  warn "Must match on the other node."
-}
-
-spoof_change_link_port() {
-  local name="$1" lp
-  lp="$(ask "Link port [$(smeta_get "${name}" LINK_PORT)]")"
-  [[ -z "${lp}" ]] && return 0
-  [[ "${lp}" =~ ^[0-9]+$ ]] || { fail "Invalid port."; return 1; }
-  smeta_set "${name}" LINK_PORT "${lp}"
-  spoof_rebuild_instance "${name}"
-  good "Link port updated."
-  warn "Must match on the other node."
-}
-
-spoof_change_ports() {
-  local name="$1" role ports
-  role="$(smeta_get "${name}" ROLE)"
-  if [[ "${role}" != "entry" ]]; then
-    warn "Published ports are defined on the entry node only."
-    return 0
-  fi
-  ports="$(ask "Published ports [$(smeta_get "${name}" PORTS)]")"
-  [[ -z "${ports}" ]] && return 0
-  smeta_set "${name}" PORTS "${ports}"
-  spoof_rebuild_instance "${name}"
-  good "Published ports updated."
-}
-
-spoof_change_token() {
-  local name="$1" tok
-  tok="$(ask "Tunnel token [$(smeta_get "${name}" TOKEN)]")"
-  [[ -z "${tok}" ]] && return 0
-  smeta_set "${name}" TOKEN "${tok}"
-  spoof_rebuild_instance "${name}"
-  good "Token updated."
-  warn "Must match on the other node."
-}
-
-spoof_edit_raw() {
-  local name="$1" dir; dir="$(sp_idir "${name}")"
-  info "  ${dir}/meta.conf"
-  info "  ${dir}/config.toml"
-  local c; c="$(ask 'Edit meta.conf (m) or config.toml (c)? (m/c/n)')"
-  case "${c}" in
-    m|M) ${EDITOR:-nano} "${dir}/meta.conf" ;;
-    c|C) ${EDITOR:-nano} "${dir}/config.toml" ;;
-    *) return 0 ;;
-  esac
-  local r; r="$(ask 'Rebuild config from meta and restart? (y/n)')"
-  [[ "${r}" == "y" ]] && spoof_start_instance "${name}"
-}
-
-spoof_delete_instance() {
-  local name="$1" svc; svc="$(sp_svc "${name}")"
-  local c; c="$(ask "Delete tunnel '${name}' permanently? (y/n)")"
-  [[ "${c}" != "y" ]] && { info "Cancelled."; return 0; }
-  systemctl stop "${svc}" 2>/dev/null || true
-  systemctl disable "${svc}" 2>/dev/null || true
-  rm -rf "$(sp_idir "${name}")"
-  systemctl daemon-reload
-  good "Tunnel '${name}' deleted."
-}
-
-manage_spoof_instance_menu() {
-  local name="$1"
-  while :; do
-    rule
-    info "Manage spoof tunnel '${name}'  (${MUT}$(smeta_get "${name}" ROLE) • $(sp_svc_state "${name}")${RST})"
-    rule
-    printf '  %s1%s  Restart\n'                 "${ACC}" "${RST}"
-    printf '  %s2%s  Stop\n'                    "${ACC}" "${RST}"
-    printf '  %s3%s  Start\n'                   "${ACC}" "${RST}"
-    printf '  %s4%s  Diagnostics\n'             "${ACC}" "${RST}"
-    printf '  %s5%s  Live log (Ctrl-C to exit)\n' "${ACC}" "${RST}"
-    printf '  %s6%s  Change peer / remote IP\n'   "${ACC}" "${RST}"
-    printf '  %s7%s  Change white / spoof IP\n'   "${ACC}" "${RST}"
-    printf '  %s8%s  Change link port\n'        "${ACC}" "${RST}"
-    printf '  %s9%s  Change published ports\n'  "${ACC}" "${RST}"
-    printf ' %s10%s  Change token\n'             "${ACC}" "${RST}"
-    printf ' %s11%s  Edit raw config\n'          "${ACC}" "${RST}"
-    printf ' %s12%s  Delete tunnel\n'           "${ACC}" "${RST}"
-    printf '  %s0%s  Back\n\n'                  "${ACC}" "${RST}"
-    local c; c="$(ask 'Select')"; echo
-    case "${c}" in
-      1) spoof_start_instance "${name}" || true ;;
-      2) systemctl stop "$(sp_svc "${name}")" 2>/dev/null && good "Stopped." || fail "Could not stop." ;;
-      3) systemctl start "$(sp_svc "${name}")" 2>/dev/null && good "Started." || fail "Could not start." ;;
-      4) diagnose_spoof_instance "${name}" ;;
-      5) journalctl -u "$(sp_svc "${name}")" -f --no-pager 2>/dev/null || true ;;
-      6) spoof_change_peer_ip "${name}" || true ;;
-      7) spoof_change_white_ip "${name}" || true ;;
-      8) spoof_change_link_port "${name}" || true ;;
-      9) spoof_change_ports "${name}" || true ;;
-      10) spoof_change_token "${name}" || true ;;
-      11) spoof_edit_raw "${name}" || true ;;
-      12) spoof_delete_instance "${name}"; break ;;
-      0) break ;;
-      *) fail "Invalid selection." ;;
-    esac
-    echo
-  done
-}
-
-manage_spoof_menu() {
-  while :; do
-    spoof_list
-    printf '  %s1%s  Manage a tunnel\n'     "${ACC}" "${RST}"
-    printf '  %s2%s  Add exit tunnel\n'     "${ACC}" "${RST}"
-    printf '  %s3%s  Add entry tunnel\n'    "${ACC}" "${RST}"
-    printf '  %s4%s  Restart ALL tunnels\n' "${ACC}" "${RST}"
-    printf '  %s5%s  Preflight: test this server (local egress)\n' "${ACC}" "${RST}"
-    printf '  %s6%s  Preflight: start peer listener (other server)\n' "${ACC}" "${RST}"
-    printf '  %s7%s  Preflight: send probe to peer (this server)\n' "${ACC}" "${RST}"
-    printf '  %s0%s  Back\n\n'              "${ACC}" "${RST}"
-    local c; c="$(ask 'Select')"; echo
-    case "${c}" in
-      1) local n; n="$(spoof_choose_instance)"; [[ -n "${n}" ]] && manage_spoof_instance_menu "${n}" ;;
-      2) create_spoof_exit || true ;;
-      3) create_spoof_entry || true ;;
-      4) local n; while read -r n; do [[ -n "${n}" ]] && spoof_start_instance "${n}" || true; done < <(spoof_instances) ;;
-      5) spoof_test_egress || true ;;
-      6) spoof_test_listener || true ;;
-      7) spoof_test_sender || true ;;
-      0) break ;;
-      *) fail "Invalid selection." ;;
-    esac
-    echo
-  done
-}
-
-# ------------------------------------------------------------------------------
 #  OPS
 # ------------------------------------------------------------------------------
 schedule_refresh() {
@@ -3823,7 +2714,6 @@ systemctl restart 'phormal-guard@*.service' 2>/dev/null || true
 systemctl restart 'phormal-bfwd@*.service'  2>/dev/null || true
 systemctl restart 'phormal-relay@*.service' 2>/dev/null || true
 systemctl restart 'phormal-reverse@*.service' 2>/dev/null || true
-systemctl restart 'phormal-spoof@*.service'   2>/dev/null || true
 systemctl restart 'phormal-gre@*.service'    2>/dev/null || true
 systemctl restart 'phormal-icmp@*.service'   2>/dev/null || true
 systemctl restart 'phormal-udp2raw@*.service' 2>/dev/null || true
@@ -3880,24 +2770,6 @@ status() {
     printf '    %-16s %-6s %-22s %s\n' "${rn}" "${role}" "${tgt}" "$(rev_svc_state "${rn}")"
   done < <(reverse_instances)
   [[ ${rany} -eq 0 ]] && warn "no reverse tunnels configured"
-  echo
-  info "SPOOF TUNNELS"
-  local sany=0 sn link ports remote
-  while read -r sn; do
-    [[ -n "${sn}" ]] || continue
-    sany=1
-    role="$(smeta_get "${sn}" ROLE)"
-    link="$(smeta_get "${sn}" LINK_PORT)"; link="${link:-${SPOOF_DEFAULT_LINK_PORT}}"
-    if [[ "${role}" == "entry" ]]; then
-      ports="$(smeta_get "${sn}" PORTS)"
-      tgt=":${link} ${ports}"
-    else
-      remote="$(smeta_get "${sn}" REMOTE_V4)"
-      tgt="${remote}:${link}"
-    fi
-    printf '    %-16s %-6s %-28s %s\n' "${sn}" "${role}" "${tgt}" "$(sp_svc_state "${sn}")"
-  done < <(spoof_instances)
-  [[ ${sany} -eq 0 ]] && warn "no spoof tunnels configured"
   echo
   info "PHORMAL GRE / ECHO / RAW / STREAM / CLOAK / DNS / EDGE"
   local lany=0 lk ln pname
@@ -3968,12 +2840,11 @@ purge() {
     systemctl disable "$(rev_svc "${n}")" 2>/dev/null || true
   done < <(reverse_instances)
   rm -f "${REVERSE_TMPL}" "${REVERSE_RUN}" "${REVERSE_BIN}"
-  while read -r n; do
-    [[ -n "${n}" ]] || continue
-    systemctl stop "$(sp_svc "${n}")" 2>/dev/null || true
-    systemctl disable "$(sp_svc "${n}")" 2>/dev/null || true
-  done < <(spoof_instances)
-  rm -f "${SPOOF_TMPL}" "${SPOOF_RUN}" "${SPOOF_BIN}" "${SPOOF_SYSCTL}"
+  systemctl stop 'phormal-spoof@*.service' 2>/dev/null || true
+  systemctl disable 'phormal-spoof@*.service' 2>/dev/null || true
+  rm -f /etc/systemd/system/phormal-spoof@.service \
+    /usr/local/bin/phormal-spoof /usr/local/bin/phormal-spoof-run \
+    /etc/sysctl.d/96-phormal-spoof.conf
   rm -f /usr/bin/phormal-refresh.sh
   crontab -l 2>/dev/null | grep -v 'phormal-refresh' | crontab - 2>/dev/null || true
   local lk ln
@@ -4226,7 +3097,11 @@ udp2raw_upstream_tgz_url() {
     "${UDP2RAW_RELEASE_REPO}" "${UDP2RAW_RELEASE_TAG}"
 }
 
-verify_backhaul_layer_tmp() { verify_spoof_tmp "$1"; }
+verify_backhaul_layer_tmp() {
+  local bin="$1"
+  [[ -x "${bin}" ]] || return 1
+  "${bin}" -h >/dev/null 2>&1 || "${bin}" --help >/dev/null 2>&1
+}
 verify_icmp_tun_tmp() {
   local b="$1" out
   [[ -x "${b}" ]] || return 1
@@ -4253,7 +3128,6 @@ install_layer_backhaul() {
   choose_binary_source || true
   if [[ "${BINARY_SOURCE}" == "manual" ]]; then
     manual="${MANUAL_DIR}/backhaul-linux-${arch}"
-    [[ -f "${manual}" ]] || manual="${MANUAL_DIR}/phormal-spoof-linux-${arch}"
     [[ -f "${manual}" ]] || { fail "Place backhaul at ${MANUAL_DIR}/backhaul-linux-${arch}"; return 1; }
     cp -f "${manual}" "${dest}" && chmod +x "${dest}"
     verify_backhaul_layer_tmp "${dest}" && { good "Backhaul engine installed (manual)."; return 0; }
@@ -4261,8 +3135,6 @@ install_layer_backhaul() {
   fi
   if [[ "${BINARY_SOURCE}" == "mirror" ]]; then
     mirror="$(mirror_backhaul_url "${arch}" 2>/dev/null || true)"
-    [[ -n "${mirror}" ]] && urls+=("${mirror}")
-    mirror="$(mirror_spoof_url "${arch}" 2>/dev/null || true)"
     [[ -n "${mirror}" ]] && urls+=("${mirror}")
   fi
   urls+=("$(backhaul_layer_tgz_url "${arch}")")
@@ -4481,6 +3353,18 @@ EOF
   systemctl daemon-reload
 }
 
+layer_write_ports_block() {
+  local ports="$1" p
+  IFS=',' read -ra parr <<< "${ports}"
+  for p in "${parr[@]}"; do
+    p="${p// /}"
+    [[ -n "${p}" && "${p}" =~ ^[0-9]+$ ]] || continue
+    echo '[[ports]]'
+    echo "local = \"127.0.0.1:${p}\""
+    echo "remote = \"${p}\""
+  done
+}
+
 layer_write_backhaul_entry() {
   local key="$1" name="$2" transport dir token link_port ports
   dir="$(layer_idir "${key}" "${name}")"
@@ -4496,7 +3380,7 @@ layer_write_backhaul_entry() {
     echo 'channel_size = 2048'
     echo 'accept_udp = true'
     if [[ -n "${ports}" ]]; then
-      spoof_write_ports_block "${ports}"
+      layer_write_ports_block "${ports}"
     fi
   } > "${dir}/config.toml"
 }
@@ -5033,82 +3917,20 @@ layer_autotest_recommendation() {
       "Phormal Bridge")       menu_hint="options 2–5 (Bridge)" ;;
       "Phormal Relay"*)       menu_hint="options 6–9 (Relay)" ;;
       "Phormal Reverse")      menu_hint="options 10–12 (Reverse)" ;;
-      "Phormal Spoof")        menu_hint="options 13–15 (Spoof)" ;;
-      "Phormal GRE")          menu_hint="options 16–18 (GRE)" ;;
-      "Phormal GRE (IPIP)")   menu_hint="options 16–18 (GRE, IPIP mode)" ;;
-      "Phormal Echo")         menu_hint="options 19–21 (Echo)" ;;
-      "Phormal Raw")          menu_hint="options 22–24 (Raw)" ;;
-      "Phormal Stream")       menu_hint="options 25–27 (Stream)" ;;
-      "Phormal Cloak")        menu_hint="options 28–30 (Cloak)" ;;
-      "Phormal DNS")          menu_hint="options 31–33 (DNS)" ;;
-      "Phormal Edge")         menu_hint="options 34–36 (Edge)" ;;
+      "Phormal GRE")          menu_hint="options 13–15 (GRE)" ;;
+      "Phormal GRE (IPIP)")   menu_hint="options 13–15 (GRE, IPIP mode)" ;;
+      "Phormal Echo")         menu_hint="options 16–18 (Echo)" ;;
+      "Phormal Raw")          menu_hint="options 19–21 (Raw)" ;;
+      "Phormal Stream")       menu_hint="options 22–24 (Stream)" ;;
+      "Phormal Cloak")        menu_hint="options 25–27 (Cloak)" ;;
+      "Phormal DNS")          menu_hint="options 28–30 (DNS)" ;;
+      "Phormal Edge")         menu_hint="options 31–33 (Edge)" ;;
       *)                      menu_hint="see menu" ;;
     esac
     printf '  %-28s → %s\n' "${product}" "${menu_hint}"
   done
   [[ ${any} -eq 0 ]] && warn "No product passed — review FAIL rows or try another peer path."
   rule
-}
-
-layer_test_spoof_autotest() {
-  local local_v4="$1" peer_v4="$2" ssh_host="$3" ssh_port="$4" ssh_user="$5" spoof_src="$6"
-  local iface real_ip ok=FAIL conf=high note="" probe pcap pcap2 tdp tdp2 captured=0 n sent=6
-  apt_install_quiet tcpdump python3 2>/dev/null || true
-  iface="$(primary_iface)"
-  real_ip="$(spoof_iface_ipv4 "${iface}")"
-  [[ -n "${iface}" ]] || { layer_autotest_record "Phormal Spoof" "inconclusive" "low" "no iface"; return; }
-  if [[ -n "${real_ip}" && "${spoof_src}" == "${real_ip}" ]]; then
-    layer_autotest_record "Phormal Spoof" "inconclusive" "low" "spoof src equals real IP"
-    return
-  fi
-  sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
-  sysctl -w "net.ipv4.conf.${iface}.rp_filter=0" >/dev/null 2>&1 || true
-  layer_write_probe_py "${probe:=/tmp/phormal-probe-$$.py}"
-  layer_ssh_scp_to "${ssh_port}" "${ssh_user}" "${ssh_host}" "${probe}" "/tmp/phormal-probe.py" 2>/dev/null || true
-
-  # Local egress: forged ICMP leaves this host
-  pcap="$(mktemp)"; pcap2="$(mktemp)"
-  timeout 15 tcpdump -ni any -s 160 -w "${pcap}" "icmp and dst host ${peer_v4}" >/dev/null 2>&1 &
-  tdp=$!
-  timeout 15 tcpdump -ni "${iface}" -s 160 -w "${pcap2}" "icmp and dst host ${peer_v4}" >/dev/null 2>&1 &
-  tdp2=$!
-  sleep 1
-  if spoof_send_probe "${spoof_src}" "${peer_v4}" "${sent}" 2>/dev/null \
-    || python3 "${probe}" icmp_send "${spoof_src}" "${peer_v4}" >/dev/null 2>&1; then
-    sleep 2
-  fi
-  kill "${tdp}" "${tdp2}" 2>/dev/null || true
-  wait "${tdp}" "${tdp2}" 2>/dev/null || true
-  for capf in "${pcap}" "${pcap2}"; do
-    [[ -f "${capf}" && -s "${capf}" ]] || continue
-    n="$(spoof_count_captured_probes "${capf}" "${spoof_src}" "${peer_v4}" 2>/dev/null || echo 0)"
-    [[ "${n}" -gt "${captured}" ]] && captured="${n}"
-  done
-  rm -f "${pcap}" "${pcap2}"
-
-  # Peer ingress: peer sends forged ICMP toward us
-  local peer_ok=0 peer_pcap="/tmp/phormal-spoof-in-$$"
-  timeout 18 tcpdump -ni any -c 6 "icmp and src host ${spoof_src}" >"${peer_pcap}" 2>&1 &
-  tdp=$!
-  sleep 1
-  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
-    "python3 /tmp/phormal-probe.py icmp_send ${spoof_src} ${local_v4}" 2>/dev/null || true
-  wait "${tdp}" 2>/dev/null || true
-  grep -q "ICMP echo request" "${peer_pcap}" 2>/dev/null && peer_ok=1
-  rm -f "${peer_pcap}" "${probe}"
-  layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" "rm -f /tmp/phormal-probe.py" 2>/dev/null || true
-
-  if [[ "${captured}" -ge 1 && "${peer_ok}" -eq 1 ]]; then
-    ok=PASS; note="egress ${captured}/${sent} + peer forged ingress"
-  elif [[ "${captured}" -ge 1 ]]; then
-    ok=PASS; conf=med; note="local egress OK; peer→local spoof inconclusive"
-  elif [[ "${peer_ok}" -eq 1 ]]; then
-    ok=PASS; conf=med; note="peer→local OK; local egress inconclusive"
-  else
-    note="no spoof path (src ${spoof_src})"
-    conf=med
-  fi
-  layer_autotest_record "Phormal Spoof" "${ok}" "${conf}" "${note}"
 }
 
 layer_test_kernel_pair() {
@@ -5213,12 +4035,12 @@ layer_test_tcp_bidir() {
 }
 
 layer_autotest_main() {
-  local only="${1:-all}" ssh_host ssh_port ssh_user local_v4 peer_v4 spoof_src
+  local only="${1:-all}" ssh_host ssh_port ssh_user local_v4 peer_v4
   local def_host def_port def_user saved_host saved_port saved_user
   LAYER_TEST_ROWS=()
   LAYER_SSH_CTRL_PATH=""
   rule
-  info "Phormal Path Test — every product (Bridge, Relay, Reverse, Spoof, GRE, Echo, Raw, Stream, Cloak, DNS)"
+  info "Phormal Path Test — every product (Bridge, Relay, Reverse, GRE, Echo, Raw, Stream, Cloak, DNS, Edge)"
   info "Probes real bidirectional traffic via SSH coordination with the peer."
   rule
   apt_install_quiet python3 tcpdump iproute2 openssh-client netcat-openbsd dnsutils 2>/dev/null || true
@@ -5246,8 +4068,6 @@ layer_autotest_main() {
   conf_set PATH_TEST_SSH_HOST "${ssh_host}"
   conf_set PATH_TEST_SSH_PORT "${ssh_port}"
   conf_set PATH_TEST_SSH_USER "${ssh_user}"
-  spoof_src="$(ask 'White/spoof source IP for Phormal Spoof test [62.60.212.199]')"
-  spoof_src="${spoof_src:-62.60.212.199}"
   sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true
   layer_ssh_cmd "${ssh_host}" "${ssh_port}" "${ssh_user}" \
     "sysctl -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0" >/dev/null 2>&1 || true
@@ -5303,10 +4123,6 @@ layer_autotest_main() {
     layer_test_tcp_bidir "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "Phormal Stream"
   fi
 
-  if [[ "${only}" == "all" || "${only}" == *spoof* ]]; then
-    layer_test_spoof_autotest "${local_v4}" "${peer_v4}" "${ssh_host}" "${ssh_port}" "${ssh_user}" "${spoof_src}"
-  fi
-
   if [[ "${only}" == "all" || "${only}" == *cloak* || "${only}" == *tls* || "${only}" == *wss* ]]; then
     local ok=FAIL note="not probed"
     if have openssl; then
@@ -5359,7 +4175,7 @@ layer_autotest_cli() {
 phormal_path_test_menu() {
   rule
   info "Phormal Path Test — option 1"
-  info "Tests Bridge, Relay, Reverse, Spoof, GRE, Echo, Raw, Stream, Cloak, DNS, Edge."
+  info "Tests Bridge, Relay, Reverse, GRE, Echo, Raw, Stream, Cloak, DNS, Edge."
   rule
   layer_autotest_cli
 }
@@ -5386,43 +4202,39 @@ menu() {
     printf '   %s10%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s11%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s12%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL SPOOF%s  %s(Backhaul + IPX)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '\n  %sPHORMAL GRE%s  %s(kernel GRE / IPIP)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
     printf '   %s13%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s14%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s15%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL GRE%s  %s(kernel GRE / IPIP)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '\n  %sPHORMAL ECHO%s  %s(ICMP icmp_tun)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
     printf '   %s16%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s17%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s18%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL ECHO%s  %s(ICMP icmp_tun)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '\n  %sPHORMAL RAW%s  %s(udp2raw faketcp)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
     printf '   %s19%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s20%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s21%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL RAW%s  %s(udp2raw faketcp)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '\n  %sPHORMAL STREAM%s  %s(Backhaul TCP)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
     printf '   %s22%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s23%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s24%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL STREAM%s  %s(Backhaul TCP)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '\n  %sPHORMAL CLOAK%s  %s(Backhaul WSS / TLS)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
     printf '   %s25%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s26%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s27%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL CLOAK%s  %s(Backhaul WSS / TLS)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '\n  %sPHORMAL DNS%s  %s(iodine)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
     printf '   %s28%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s29%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s30%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL DNS%s  %s(iodine)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
+    printf '\n  %sPHORMAL EDGE%s  %s(proxyforwarder)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
     printf '   %s31%s  Add exit tunnel\n' "${ACC}" "${RST}"
     printf '   %s32%s  Add entry tunnel\n' "${ACC}" "${RST}"
     printf '   %s33%s  Manage tunnels\n' "${ACC}" "${RST}"
-    printf '\n  %sPHORMAL EDGE%s  %s(proxyforwarder)%s\n' "${BOLD}" "${RST}" "${MUT}" "${RST}"
-    printf '   %s34%s  Add exit tunnel\n' "${ACC}" "${RST}"
-    printf '   %s35%s  Add entry tunnel\n' "${ACC}" "${RST}"
-    printf '   %s36%s  Manage tunnels\n' "${ACC}" "${RST}"
     printf '\n  %sMANAGE%s\n' "${BOLD}" "${RST}"
-    printf '   %s37%s  Status\n' "${ACC}" "${RST}"
-    printf '   %s38%s  Phormal tuning\n' "${ACC}" "${RST}"
-    printf '   %s39%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
-    printf '   %s40%s  Uninstall\n' "${ACC}" "${RST}"
+    printf '   %s34%s  Status\n' "${ACC}" "${RST}"
+    printf '   %s35%s  Phormal tuning\n' "${ACC}" "${RST}"
+    printf '   %s36%s  Auto-refresh schedule\n' "${ACC}" "${RST}"
+    printf '   %s37%s  Uninstall\n' "${ACC}" "${RST}"
     printf '    %s0%s  Exit\n\n' "${ACC}" "${RST}"
 
     local choice; choice="$(ask 'Select')"
@@ -5440,34 +4252,31 @@ menu() {
       10) create_reverse_exit || true ;;
       11) create_reverse_entry || true ;;
       12) manage_reverse_menu || true ;;
-      13) create_spoof_exit || true ;;
-      14) create_spoof_entry || true ;;
-      15) manage_spoof_menu || true ;;
-      16) create_layer_gre_exit || true ;;
-      17) create_layer_gre_entry || true ;;
-      18) manage_gre_menu || true ;;
-      19) create_layer_icmp_exit || true ;;
-      20) create_layer_icmp_entry || true ;;
-      21) manage_echo_menu || true ;;
-      22) create_layer_udp2raw_exit || true ;;
-      23) create_layer_udp2raw_entry || true ;;
-      24) manage_raw_menu || true ;;
-      25) create_layer_backhaul_exit btcp tcp || true ;;
-      26) create_layer_backhaul_entry btcp tcp || true ;;
-      27) manage_stream_menu || true ;;
-      28) create_layer_backhaul_exit bwss wss || true ;;
-      29) create_layer_backhaul_entry bwss wss || true ;;
-      30) manage_cloak_menu || true ;;
-      31) create_layer_dns_exit || true ;;
-      32) create_layer_dns_entry || true ;;
-      33) manage_dns_layer_menu || true ;;
-      34) create_layer_edge_exit || true ;;
-      35) create_layer_edge_entry || true ;;
-      36) manage_edge_menu || true ;;
-      37) status || true ;;
-      38) tune_menu || true ;;
-      39) schedule_refresh || true ;;
-      40) purge || true ;;
+      13) create_layer_gre_exit || true ;;
+      14) create_layer_gre_entry || true ;;
+      15) manage_gre_menu || true ;;
+      16) create_layer_icmp_exit || true ;;
+      17) create_layer_icmp_entry || true ;;
+      18) manage_echo_menu || true ;;
+      19) create_layer_udp2raw_exit || true ;;
+      20) create_layer_udp2raw_entry || true ;;
+      21) manage_raw_menu || true ;;
+      22) create_layer_backhaul_exit btcp tcp || true ;;
+      23) create_layer_backhaul_entry btcp tcp || true ;;
+      24) manage_stream_menu || true ;;
+      25) create_layer_backhaul_exit bwss wss || true ;;
+      26) create_layer_backhaul_entry bwss wss || true ;;
+      27) manage_cloak_menu || true ;;
+      28) create_layer_dns_exit || true ;;
+      29) create_layer_dns_entry || true ;;
+      30) manage_dns_layer_menu || true ;;
+      31) create_layer_edge_exit || true ;;
+      32) create_layer_edge_entry || true ;;
+      33) manage_edge_menu || true ;;
+      34) status || true ;;
+      35) tune_menu || true ;;
+      36) schedule_refresh || true ;;
+      37) purge || true ;;
       0)  good "Goodbye — @SchmitzWS"; exit 0 ;;
       *)  fail "Invalid selection." ;;
     esac
