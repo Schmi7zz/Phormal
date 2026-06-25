@@ -74,8 +74,7 @@ phormal
 
 ### Mirror (Iran — fast binary downloads)
 
-Entry nodes can pull engine binaries from an in-country mirror before falling back to the public source. Set `MIRROR_BASE=http://YOUR_MIRROR:8880/phormal` in `/etc/phormal/phormal.conf` (seeded automatically on first run).
-
+Entry nodes can pull engine binaries from an in-country mirror before falling back to the public source. 
 ---
 
 ## 🧪 Phormal Path Test (menu **1**)
