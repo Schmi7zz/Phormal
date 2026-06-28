@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="6.2.2"
+readonly PHORMAL_VERSION="5.6.7"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -42,7 +42,7 @@ readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 #   rathole-linux-{amd64,arm64}
 #   icmp_tun-linux-{amd64,arm64}  udp2raw-linux-{amd64,arm64}
 # phormal.sh itself is installed from GitHub, not the mirror.
-readonly DEFAULT_MIRROR_BASE="http://85.198.16.108:8880/phormal"
+readonly DEFAULT_MIRROR_BASE="https://mirror.delitech.ir:8880/phormal"
 readonly GOST_RELEASE_VERSION="3.2.6"
 readonly HYSTERIA_RELEASE_TAG="app/v2.9.2"
 readonly MANUAL_DIR="/root/phormal"
@@ -122,7 +122,7 @@ ensure_dirs() {
 
 # Seed / upgrade MIRROR_BASE so binary downloads use the Iran mirror on port 8880.
 ensure_mirror_conf() {
-  local cur legacy="http://85.198.16.108/phormal"
+  local cur legacy="https://mirror.delitech.ir/phormal"
   cur="$(conf_get MIRROR_BASE)"
   if [[ -n "${cur}" ]]; then
     [[ "${cur}" == "${legacy}" ]] && conf_set MIRROR_BASE "${DEFAULT_MIRROR_BASE}"
