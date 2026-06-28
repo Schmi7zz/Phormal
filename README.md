@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-6.2.2-7aa2f7?style=flat-square">
+  <img alt="version" src="https://img.shields.io/badge/version-6.2.3-7aa2f7?style=flat-square">
   <img alt="platform" src="https://img.shields.io/badge/platform-Linux-78dba9?style=flat-square">
   <img alt="shell" src="https://img.shields.io/badge/made%20with-Bash-f7768e?style=flat-square">
   <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-c0caf5?style=flat-square">
@@ -92,7 +92,7 @@ Peer SSH host / port / user are remembered in `/etc/phormal/phormal.conf`.
 
 ---
 
-## 🧭 Menu reference (v6.2.2)
+## 🧭 Menu reference (v6.2.3)
 
 ### Path test
 
