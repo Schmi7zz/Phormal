@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="6.2.2"
+readonly PHORMAL_VERSION="5.6.7"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -245,6 +245,9 @@ install_gost_from_release() {
 install_local_binary() {
   local dest="$1"
   warn "Automatic download failed on this network."
+  if [[ "${BINARY_SOURCE:-}" == "github" ]]; then
+    info "GitHub is often blocked from Iran — choose option 1 (Iran mirror) when the installer asks."
+  fi
   info "Upload the binary to this server first, then enter its path."
   local path; path="$(ask 'Local binary path [blank to abort]')"
   [[ -z "${path}" ]] && return 1
@@ -1486,7 +1489,31 @@ EOF
   good "Network buffer tuning applied."
 }
 
-port_open_tcp() { ss -H -tln 2>/dev/null | grep -qE ":${1}([^0-9]|$)"; }
+port_open_tcp() {
+  local p="$1"
+  ss -H -tln 2>/dev/null | grep -qE ":${p}([^0-9]|$)" && return 0
+  ss -H -tln 2>/dev/null | grep -qE "\\]:${p}([^0-9]|$)" && return 0
+  return 1
+}
+reverse_tunnel_link_up() {
+  local name="$1" svc
+  svc="$(rev_svc "${name}")"
+  systemctl is-active "${svc}" >/dev/null 2>&1 || return 1
+  journalctl -u "${svc}" -n 50 --no-pager 2>/dev/null \
+    | grep -qiE 'control channel|connected|established|start serving|listening|ready to serve|started'
+}
+
+reverse_entry_port_status() {
+  local name="$1" port="$2"
+  port_open_tcp "${port}" && { printf 'listen'; return 0; }
+  if reverse_tunnel_link_up "${name}"; then
+    printf 'tunnel'
+    return 0
+  fi
+  printf 'down'
+  return 1
+}
+
 port_open_udp() { ss -H -uln 2>/dev/null | grep -qE ":${1}([^0-9]|$)"; }
 
 relay_engine_block() {
@@ -2598,7 +2625,7 @@ reverse_choose_instance() {
 }
 
 diagnose_reverse_instance() {
-  local name="$1" role svc link ports p
+  local name="$1" role svc link ports p st
   role="$(rmeta_get "${name}" ROLE)"
   svc="$(rev_svc "${name}")"
   rule
@@ -2607,16 +2634,42 @@ diagnose_reverse_instance() {
   if systemctl is-active "${svc}" >/dev/null 2>&1; then good "service active"; else fail "service not active"; fi
   link="$(rmeta_get "${name}" LINK_PORT)"
   if [[ "${role}" == "entry" ]]; then
-    if port_open_tcp "${link}"; then good "TCP link :${link} listening"; else warn "TCP link :${link} not confirmed"; fi
+    if port_open_tcp "${link}"; then
+      good "TCP link :${link} listening"
+    elif reverse_tunnel_link_up "${name}"; then
+      good "TCP link :${link} active via Reverse tunnel"
+    else
+      warn "TCP link :${link} not confirmed"
+    fi
     ports="$(rmeta_get "${name}" PORTS)"
     IFS=',' read -ra parr <<< "${ports}"
     for p in "${parr[@]}"; do
       [[ -n "${p}" ]] || continue
-      if port_open_tcp "${p}"; then good "TCP :${p} listening (users connect here)"; else fail "TCP :${p} NOT listening"; fi
+      st="$(reverse_entry_port_status "${name}" "${p}")"
+      case "${st}" in
+        listen) good "TCP :${p} listening (users connect here)" ;;
+        tunnel) good "TCP :${p} forwarding via Reverse tunnel (exit connected — normal when tunnel is up)" ;;
+        *)      fail "TCP :${p} NOT listening" ;;
+      esac
     done
   else
     info "Peer (Iran): $(rmeta_get "${name}" REMOTE_V4):${link}"
     info "Local upstream: $(rmeta_get "${name}" LOCAL_HOST)"
+    if reverse_tunnel_link_up "${name}"; then
+      good "Reverse tunnel connected to entry"
+    else
+      warn "Reverse tunnel not confirmed in recent logs — check entry IP, link port, and token"
+    fi
+    ports="$(rmeta_get "${name}" PORTS)"
+    IFS=',' read -ra parr <<< "${ports}"
+    for p in "${parr[@]}"; do
+      [[ -n "${p}" ]] || continue
+      if ss -H -tln 2>/dev/null | grep -qE "127\.0\.0\.1:${p}([^0-9]|$)|\\[::1\\]:${p}([^0-9]|$)"; then
+        good "Local service :${p} reachable on $(rmeta_get "${name}" LOCAL_HOST)"
+      else
+        info "User port :${p} is on the exit side — traffic goes to $(rmeta_get "${name}" LOCAL_HOST):${p}, not a public listener here"
+      fi
+    done
   fi
   echo
   info "Recent log:"
@@ -2981,6 +3034,7 @@ manage_phormal_layer_menu() {
     printf '  %s2%s  Add exit tunnel\n'     "${ACC}" "${RST}"
     printf '  %s3%s  Add entry tunnel\n'    "${ACC}" "${RST}"
     printf '  %s4%s  Restart ALL tunnels\n' "${ACC}" "${RST}"
+    printf '  %s5%s  Delete a tunnel\n'     "${ACC}" "${RST}"
     printf '  %s0%s  Back\n\n'              "${ACC}" "${RST}"
     local c; c="$(ask 'Select')"; echo
     case "${c}" in
@@ -2988,6 +3042,7 @@ manage_phormal_layer_menu() {
       2) layer_create_exit "${key}" || true ;;
       3) layer_create_entry "${key}" || true ;;
       4) local n; while read -r n; do [[ -n "${n}" ]] && layer_start_instance "${key}" "${n}" || true; done < <(layer_instances "${key}") ;;
+      5) local dn; dn="$(layer_choose_instance "${key}")"; [[ -n "${dn}" ]] && layer_delete_instance "${key}" "${dn}" ;;
       0) break ;;
       *) fail "Invalid selection." ;;
     esac
@@ -3025,22 +3080,35 @@ layer_svc()  { printf 'phormal-%s@%s.service' "$1" "$2"; }
 layer_meta_file() { printf '%s/meta.conf' "$(layer_idir "$1" "$2")"; }
 
 layer_meta_get() {
-  local key="$1" name="$2" k="$3" f
+  local key="$1" name="$2" k="$3" f v
   f="$(layer_meta_file "${key}" "${name}")"
   [[ -f "${f}" ]] || return 1
-  grep -m1 "^${k}=" "${f}" 2>/dev/null | cut -d= -f2- | tr -d '\r'
+  v="$(grep -m1 "^${k}=" "${f}" 2>/dev/null | cut -d= -f2- | tr -d '\r')" || return 1
+  if [[ "${v}" == \"*\" ]]; then v="${v:1:${#v}-2}"; fi
+  if [[ "${v}" == \'*\' ]]; then v="${v:1:${#v}-2}"; fi
+  printf '%s' "${v}"
+}
+
+layer_meta_quote() {
+  local v="$1"
+  v="${v//\'/\'\\\'\'}"
+  printf "'%s'" "${v}"
 }
 
 layer_meta_set() {
-  local key="$1" name="$2" k="$3" v="$4" f dir
+  local key="$1" name="$2" k="$3" v="$4" f dir stored
   dir="$(layer_idir "${key}" "${name}")"
   mkdir -p "${dir}"
   f="$(layer_meta_file "${key}" "${name}")"
   touch "${f}"
+  stored="${v}"
+  if [[ "${v}" == *" "* || "${v}" == *$'\t'* || "${v}" == *"'"* ]]; then
+    stored="$(layer_meta_quote "${v}")"
+  fi
   if grep -q "^${k}=" "${f}" 2>/dev/null; then
-    sed -i "s|^${k}=.*|${k}=${v}|" "${f}"
+    sed -i "s|^${k}=.*|${k}=${stored}|" "${f}"
   else
-    printf '%s=%s\n' "${k}" "${v}" >>"${f}"
+    printf '%s=%s\n' "${k}" "${stored}" >>"${f}"
   fi
 }
 
@@ -3122,7 +3190,11 @@ install_layer_icmp_tun() {
     return 1
   fi
   local urls=()
-  [[ "${BINARY_SOURCE}" == "mirror" ]] && urls+=("$(mirror_icmp_tun_url "${arch}" 2>/dev/null || true)")
+  if [[ "${BINARY_SOURCE}" == "mirror" ]]; then
+    urls+=("$(mirror_icmp_tun_url "${arch}" 2>/dev/null || true)")
+  elif [[ "${BINARY_SOURCE}" == "github" ]]; then
+    urls+=("$(mirror_icmp_tun_url "${arch}" 2>/dev/null || true)")
+  fi
   fetch_binary "${dest}" verify_icmp_tun_tmp "Phormal Echo engine" "${urls[@]}" \
     || install_local_binary "${dest}" || return 1
   verify_icmp_tun_tmp "${dest}"
@@ -3143,7 +3215,11 @@ install_layer_udp2raw() {
     return 1
   fi
   local urls=()
-  [[ "${BINARY_SOURCE}" == "mirror" ]] && urls+=("$(mirror_udp2raw_url "${arch}" 2>/dev/null || true)")
+  if [[ "${BINARY_SOURCE}" == "mirror" ]]; then
+    urls+=("$(mirror_udp2raw_url "${arch}" 2>/dev/null || true)")
+  elif [[ "${BINARY_SOURCE}" == "github" ]]; then
+    urls+=("$(mirror_udp2raw_url "${arch}" 2>/dev/null || true)")
+  fi
   for mirror in "${urls[@]}"; do
     [[ -n "${mirror}" ]] && fetch_binary "${dest}" verify_udp2raw_tmp "Phormal Raw engine" "${mirror}" && return 0
   done
@@ -3172,16 +3248,19 @@ key="$1"; name="$2"
 dir="/etc/phormal/${key}/${name}"
 meta="${dir}/meta.conf"
 [[ -f "${meta}" ]] || { echo "missing ${meta}" >&2; exit 1; }
-# shellcheck disable=SC1090
-source "${meta}"
+get() { grep -m1 "^$1=" "${meta}" 2>/dev/null | cut -d= -f2- | tr -d '\r'; }
 case "${key}" in
   icmp)
+    ICMP_ARGS="$(get ICMP_ARGS)"
+    [[ -n "${ICMP_ARGS}" ]] || { echo "ICMP_ARGS empty in ${meta}" >&2; exit 1; }
     # shellcheck disable=SC2086
-    exec /usr/local/bin/phormal-icmp-tun ${ICMP_ARGS:-}
+    exec /usr/local/bin/phormal-icmp-tun ${ICMP_ARGS}
     ;;
   udp2raw)
+    UDP2RAW_ARGS="$(get UDP2RAW_ARGS)"
+    [[ -n "${UDP2RAW_ARGS}" ]] || { echo "UDP2RAW_ARGS empty in ${meta}" >&2; exit 1; }
     # shellcheck disable=SC2086
-    exec /usr/local/bin/phormal-udp2raw ${UDP2RAW_ARGS:-}
+    exec /usr/local/bin/phormal-udp2raw ${UDP2RAW_ARGS}
     ;;
   *)
     echo "unknown layer ${key}" >&2; exit 1
@@ -3253,6 +3332,7 @@ EOF
 
 layer_start_instance() {
   local key="$1" name="$2" svc
+  [[ "${key}" == icmp || "${key}" == udp2raw ]] && layer_install_runtime
   svc="$(layer_svc "${key}" "${name}")"
   systemctl daemon-reload
   systemctl enable "${svc}" >/dev/null 2>&1
@@ -3417,16 +3497,20 @@ create_layer_udp2raw_entry() {
 }
 
 layer_delete_instance() {
-  local key="$1" name="$2" svc iface pname
+  local key="$1" name="$2" svc iface pname c
   pname="$(layer_phormal_name "${key}")"
+  c="$(ask "Delete ${pname} tunnel '${name}' permanently? (y/n)")"
+  [[ "${c}" == "y" ]] || { info "Cancelled."; return 0; }
   svc="$(layer_svc "${key}" "${name}")"
   systemctl stop "${svc}" 2>/dev/null || true
   systemctl disable "${svc}" 2>/dev/null || true
+  systemctl reset-failed "${svc}" 2>/dev/null || true
   if [[ "${key}" == gre ]]; then
     iface="$(layer_meta_get gre "${name}" IFACE 2>/dev/null || true)"
     [[ -n "${iface}" ]] && ip link del "${iface}" 2>/dev/null || true
   fi
   rm -rf "$(layer_idir "${key}" "${name}")"
+  systemctl daemon-reload
   good "Deleted ${pname}/${name}."
 }
 
