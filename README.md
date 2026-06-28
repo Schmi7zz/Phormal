@@ -72,11 +72,6 @@ sudo phormal
 phormal
 ```
 
-### Mirror (Iran — fast binary downloads)
-
-Entry nodes can pull engine binaries from an in-country mirror before falling back to the public source. 
----
-
 ## 🧪 Phormal Path Test (menu **1**)
 
 **Always run this first** when pairing a new Iran ↔ Kharej set.
