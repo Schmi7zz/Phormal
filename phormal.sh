@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="5.6.7"
+readonly PHORMAL_VERSION="6.2.4"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -36,13 +36,15 @@ readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 
 # Iran-hosted mirror for gost / hysteria (optional).
 # Entry nodes try this base URL before GitHub. Override per-server in
-# /etc/phormal/phormal.conf with  MIRROR_BASE=http://your-server:8880/phormal
+# /etc/phormal/phormal.conf:  MIRROR_BASE=https://mirror.delitech.ir/phormal
+#   (CDN HTTPS on 443 — do NOT use :8880 with https://)
+#   Direct IP fallback:      MIRROR_BASE=http://YOUR_IP:8880/phormal
 # Files expected on the mirror host (served at MIRROR_BASE):
 #   gost-linux-{amd64,arm64}  hysteria-linux-{amd64,arm64}
 #   rathole-linux-{amd64,arm64}
 #   icmp_tun-linux-{amd64,arm64}  udp2raw-linux-{amd64,arm64}
 # phormal.sh itself is installed from GitHub, not the mirror.
-readonly DEFAULT_MIRROR_BASE="https://mirror.delitech.ir:8880/phormal"
+readonly DEFAULT_MIRROR_BASE="https://mirror.delitech.ir/phormal"
 readonly GOST_RELEASE_VERSION="3.2.6"
 readonly HYSTERIA_RELEASE_TAG="app/v2.9.2"
 readonly MANUAL_DIR="/root/phormal"
@@ -120,15 +122,33 @@ ensure_dirs() {
   ensure_mirror_conf
 }
 
-# Seed / upgrade MIRROR_BASE so binary downloads use the Iran mirror on port 8880.
+# Seed / upgrade MIRROR_BASE for engine downloads (CDN or direct IP mirror).
+mirror_normalize_base() {
+  local b="$1"
+  [[ -n "${b}" ]] || return 0
+  b="${b%/}"
+  # https://host:8880 — TLS to plain-HTTP port (curl: wrong version number)
+  if [[ "${b}" =~ ^https://[^/:]+:8880(/|$) ]]; then
+    b="${b/:8880/}"
+  fi
+  printf '%s' "${b}"
+}
+
 ensure_mirror_conf() {
-  local cur legacy="https://mirror.delitech.ir/phormal"
+  local cur def fixed
+  def="$(mirror_normalize_base "${DEFAULT_MIRROR_BASE}")"
   cur="$(conf_get MIRROR_BASE)"
   if [[ -n "${cur}" ]]; then
-    [[ "${cur}" == "${legacy}" ]] && conf_set MIRROR_BASE "${DEFAULT_MIRROR_BASE}"
+    fixed="$(mirror_normalize_base "${cur}")"
+    case "${cur}" in
+      http://85.198.16.108/phormal|http://85.198.16.108:8880/phormal)
+        fixed="${def}"
+        ;;
+    esac
+    [[ "${fixed}" != "${cur}" ]] && conf_set MIRROR_BASE "${fixed}"
     return 0
   fi
-  [[ -n "${DEFAULT_MIRROR_BASE}" ]] && conf_set MIRROR_BASE "${DEFAULT_MIRROR_BASE}"
+  [[ -n "${def}" ]] && conf_set MIRROR_BASE "${def}"
 }
 
 have()        { command -v "$1" >/dev/null 2>&1; }
@@ -245,8 +265,10 @@ install_gost_from_release() {
 install_local_binary() {
   local dest="$1"
   warn "Automatic download failed on this network."
-  if [[ "${BINARY_SOURCE:-}" == "github" ]]; then
+  if [[ "${BINARY_SOURCE}" == "github" ]]; then
     info "GitHub is often blocked from Iran — choose option 1 (Iran mirror) when the installer asks."
+  elif [[ "${BINARY_SOURCE:-}" == "mirror" ]]; then
+    info "If download fails with SSL/TLS errors, check MIRROR_BASE in ${PHORMAL_CONF} — use https://your-domain/phormal (no :8880)."
   fi
   info "Upload the binary to this server first, then enter its path."
   local path; path="$(ask 'Local binary path [blank to abort]')"
@@ -260,8 +282,8 @@ install_local_binary() {
 mirror_base() {
   local b
   b="$(conf_get MIRROR_BASE)"
-  [[ -n "${b}" ]] && { printf '%s' "${b%/}"; return 0; }
-  [[ -n "${DEFAULT_MIRROR_BASE}" ]] && printf '%s' "${DEFAULT_MIRROR_BASE%/}"
+  [[ -n "${b}" ]] || b="${DEFAULT_MIRROR_BASE}"
+  mirror_normalize_base "${b}"
 }
 
 mirror_fwd_url() {
