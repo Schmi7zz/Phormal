@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="6.2.7"
+readonly PHORMAL_VERSION="6.2.9"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -3283,6 +3283,9 @@ case "${key}" in
   icmp)
     ICMP_ARGS="$(get ICMP_ARGS)"
     [[ -n "${ICMP_ARGS}" ]] || { echo "ICMP_ARGS empty in ${meta}" >&2; exit 1; }
+    RTUN="$(printf '%s\n' "${ICMP_ARGS}" | awk '{print $(NF-4)}')"
+    RPEER="$(printf '%s\n' "${ICMP_ARGS}" | awk '{print $(NF)}')"
+    [[ -n "${RTUN}" && -n "${RPEER}" ]] && ip route add "${RPEER}/32" dev "${RTUN}" 2>/dev/null || true
     # shellcheck disable=SC2086
     exec /usr/local/bin/phormal-icmp-tun ${ICMP_ARGS}
     ;;
@@ -3365,7 +3368,7 @@ layer_start_instance() {
   [[ "${key}" == icmp || "${key}" == udp2raw ]] && layer_install_runtime
   if [[ "${key}" == icmp ]]; then
     layer_icmp_migrate_args "${name}"
-    layer_icmp_sysctl
+    layer_icmp_sync_host_sysctl
   fi
   svc="$(layer_svc "${key}" "${name}")"
   systemctl daemon-reload
@@ -3485,11 +3488,21 @@ layer_icmp_migrate_args() {
   fi
 }
 
-layer_icmp_sysctl() {
-  local f="/etc/sysctl.d/99-phormal-echo.conf"
-  sysctl -w net.ipv4.icmp_echo_ignore_all=1 >/dev/null 2>&1 || true
-  if [[ ! -f "${f}" ]] || ! grep -q 'icmp_echo_ignore_all' "${f}" 2>/dev/null; then
+layer_icmp_sync_host_sysctl() {
+  # icmp_echo_ignore_all=1 only on hosts running Echo EXIT (server mode).
+  # On entry (client) hosts it breaks normal ping — must stay 0.
+  local n role has_exit=0 f="/etc/sysctl.d/99-phormal-echo.conf"
+  while read -r n; do
+    [[ -n "${n}" ]] || continue
+    role="$(layer_meta_get icmp "${n}" ROLE 2>/dev/null || true)"
+    [[ "${role}" == "exit" ]] && has_exit=1
+  done < <(layer_instances icmp 2>/dev/null || true)
+  if [[ ${has_exit} -eq 1 ]]; then
+    sysctl -w net.ipv4.icmp_echo_ignore_all=1 >/dev/null 2>&1 || true
     printf 'net.ipv4.icmp_echo_ignore_all = 1\n' >"${f}" 2>/dev/null || true
+  else
+    sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 || true
+    rm -f "${f}" 2>/dev/null || true
     sysctl --system >/dev/null 2>&1 || true
   fi
 }
@@ -3543,37 +3556,70 @@ layer_icmp_pairing_hint() {
       info "Entry is on THIS server. Kharej exit (menu 16) must already be active with:"
       info "  • Iran entry public IPv4 as peer"
       info "  • Same tunnel id and matching TUN IPs"
+      info "Echo gives a private 10.88.x link — it does not publish a port on your public IP."
+      info "Route traffic via the TUN device, or use Bridge/Relay on top of Echo."
       ;;
   esac
 }
 
 layer_icmp_link_check() {
-  local name="$1" role args svc st tun
+  local name="$1" role args svc st ifdev tid
   role="$(layer_meta_get icmp "${name}" ROLE 2>/dev/null || echo '?')"
   args="$(layer_meta_get icmp "${name}" ICMP_ARGS 2>/dev/null || true)"
   svc="$(layer_svc icmp "${name}")"
   st="$(layer_svc_state "${svc}")"
+  tid="$(layer_meta_get icmp "${name}" TUN_ID 2>/dev/null || echo '0x7048')"
   rule
   info "Phormal Echo link check — ${name} (${role})"
   rule
   [[ -n "${args}" ]] || { fail "ICMP_ARGS missing in meta.conf"; return 1; }
   layer_icmp_load_endpoints "${name}" || { fail "Could not read tunnel endpoints."; return 1; }
-  info "TUN ${icmp_tun:-tun${name}}  ${icmp_local_priv:-?} ↔ ${icmp_remote_priv:-?}"
+  ifdev="${icmp_tun:-tun${name}}"
+  info "TUN ${ifdev}  ${icmp_local_priv:-?} ↔ ${icmp_remote_priv:-?}"
   info "Public ${icmp_local_v4:-?} → peer ${icmp_remote_v4:-?}"
   info "Service: ${st}"
-  if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo 0)" != "1" ]]; then
-    warn "net.ipv4.icmp_echo_ignore_all is not 1 (required on both servers)."
-    layer_icmp_sysctl
+  if [[ "${role}" == "exit" ]]; then
+    if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo 0)" != "1" ]]; then
+      warn "Exit server needs net.ipv4.icmp_echo_ignore_all=1 — applying now."
+      layer_icmp_sync_host_sysctl
+    fi
+    info "Exit ignores kernel ping replies (normal — use TUN ping below)."
+  elif [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo 0)" == "1" ]]; then
+    warn "Entry host has icmp_echo_ignore_all=1 — this breaks normal ping. Restoring…"
+    layer_icmp_sync_host_sysctl
   fi
   if [[ "${st}" != "active" ]]; then
     warn "Service is not active — use Start/restart first."
     layer_icmp_pairing_hint "${role}"
     return 1
   fi
+  if ! ip link show "${ifdev}" >/dev/null 2>&1; then
+    warn "TUN device ${ifdev} not found — restart the tunnel."
+    return 1
+  fi
+  if [[ "${role}" == "entry" ]]; then
+    info "Peer exit may not answer normal ping (Echo server ignores kernel replies)."
+    if ping -c 2 -W 2 "${icmp_local_priv}" >/dev/null 2>&1; then
+      good "Local TUN ${icmp_local_priv} on ${ifdev} is up."
+    else
+      warn "Local TUN ${icmp_local_priv} not responding — restart the tunnel."
+      return 1
+    fi
+    info "Ping to exit TUN ${icmp_remote_priv} often fails by design (Kharej ignores ICMP)."
+    if ping -c 3 -W 2 -I "${icmp_local_priv}" "${icmp_remote_priv}" >/dev/null 2>&1 \
+       || ping -c 3 -W 2 "${icmp_remote_priv}" >/dev/null 2>&1; then
+      good "TUN ping ${icmp_local_priv} → ${icmp_remote_priv} OK."
+    else
+      good "Entry client is active — verify from Kharej exit → Link check (TUN ping there is authoritative)."
+      info "If Kharej shows TUN ping OK, this tunnel is working; Iran-side ping to ${icmp_remote_priv} is expected to fail."
+    fi
+    info "Echo is a private 10.88.x link — route traffic through ${ifdev} or use with Bridge/Relay."
+    return 0
+  fi
   if ping -c 2 -W 2 "${icmp_remote_v4}" >/dev/null 2>&1; then
     good "Public ICMP to peer ${icmp_remote_v4} OK."
   else
-    warn "Cannot ping peer ${icmp_remote_v4} — ICMP may be blocked by firewall or provider."
+    warn "Cannot ping peer ${icmp_remote_v4} — check firewall if unexpected."
   fi
   if ping -c 3 -W 2 -I "${icmp_local_priv}" "${icmp_remote_priv}" >/dev/null 2>&1; then
     good "TUN ping ${icmp_local_priv} → ${icmp_remote_priv} OK."
@@ -3585,7 +3631,7 @@ layer_icmp_link_check() {
   fi
   warn "No TUN ping yet — peer tunnel may be down or mismatched."
   layer_icmp_pairing_hint "${role}"
-  info "On both servers: ping -c 2 ${icmp_remote_v4}  (ICMP between public IPs must work)"
+  info "Ensure Iran entry (menu 17) is active with peer ${icmp_local_v4} and id ${tid}."
   return 1
 }
 
@@ -3699,6 +3745,7 @@ layer_delete_instance() {
   fi
   rm -rf "$(layer_idir "${key}" "${name}")"
   systemctl daemon-reload
+  [[ "${key}" == icmp ]] && layer_icmp_sync_host_sysctl
   good "Deleted ${pname}/${name}."
 }
 
