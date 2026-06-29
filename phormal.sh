@@ -133,7 +133,7 @@ ensure_mirror_conf() {
   if [[ -n "${cur}" ]]; then
     fixed="$(mirror_normalize_base "${cur}")"
     case "${cur}" in
-      http://85.198.16.108/phormal|http://85.198.16.108:8880/phormal)
+      http://mirror.delitech.ir/phormal|http://mirror.delitech.ir:8880/phormal)
         fixed="${def}"
         ;;
     esac
