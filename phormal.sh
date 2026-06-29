@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="6.2.4"
+readonly PHORMAL_VERSION="6.2.5"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -34,7 +34,14 @@ readonly RELAY_BIN="/usr/local/bin/phormal-relay"
 readonly RELAY_UNIT="/etc/systemd/system/phormal-relay.service"
 readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 
-
+# Iran-hosted mirror for gost / hysteria (optional).
+# Entry nodes try this base URL before GitHub. Override per-server in
+# /etc/phormal/phormal.conf:  MIRROR_BASE=https://mirror.delitech.ir/phormal
+#   (CDN HTTPS on 443 — do NOT use :8880 with https://)
+# Files expected on the mirror host (served at MIRROR_BASE):
+#   gost-linux-{amd64,arm64}  hysteria-linux-{amd64,arm64}
+#   rathole-linux-{amd64,arm64}
+#   icmp_tun-linux-{amd64,arm64}  udp2raw-linux-{amd64,arm64}
 # phormal.sh itself is installed from GitHub, not the mirror.
 readonly DEFAULT_MIRROR_BASE="https://mirror.delitech.ir/phormal"
 readonly GOST_RELEASE_VERSION="3.2.6"
@@ -3261,7 +3268,13 @@ key="$1"; name="$2"
 dir="/etc/phormal/${key}/${name}"
 meta="${dir}/meta.conf"
 [[ -f "${meta}" ]] || { echo "missing ${meta}" >&2; exit 1; }
-get() { grep -m1 "^$1=" "${meta}" 2>/dev/null | cut -d= -f2- | tr -d '\r'; }
+get() {
+  local v
+  v="$(grep -m1 "^$1=" "${meta}" 2>/dev/null | cut -d= -f2- | tr -d '\r')" || return 1
+  if [[ "${v}" == \"*\" ]]; then v="${v:1:${#v}-2}"; fi
+  if [[ "${v}" == \'*\' ]]; then v="${v:1:${#v}-2}"; fi
+  printf '%s' "${v}"
+}
 case "${key}" in
   icmp)
     ICMP_ARGS="$(get ICMP_ARGS)"
@@ -3346,6 +3359,10 @@ EOF
 layer_start_instance() {
   local key="$1" name="$2" svc
   [[ "${key}" == icmp || "${key}" == udp2raw ]] && layer_install_runtime
+  if [[ "${key}" == icmp ]]; then
+    layer_icmp_migrate_args "${name}"
+    layer_icmp_sysctl
+  fi
   svc="$(layer_svc "${key}" "${name}")"
   systemctl daemon-reload
   systemctl enable "${svc}" >/dev/null 2>&1
@@ -3416,6 +3433,58 @@ _create_layer_gre_tunnel() {
 create_layer_gre_entry() { _create_layer_gre_tunnel entry; }
 create_layer_gre_exit()  { _create_layer_gre_tunnel exit; }
 
+layer_icmp_build_args() {
+  local role="$1" name="$2" tid="$3" local_v4="$4" remote_v4="$5" local_priv="$6" remote_priv="$7"
+  local tun="tun${name}"
+  case "${role}" in
+    entry)
+      printf '%s' "--mode client -i ${tid} --poll-ms 8 --pack 1 ${tun} ${local_v4} ${remote_v4} ${local_priv} ${remote_priv}"
+      ;;
+    exit)
+      printf '%s' "--mode server -i ${tid} --burst 4 --pack 1 ${tun} ${local_v4} ${remote_v4} ${local_priv} ${remote_priv}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+layer_icmp_migrate_args() {
+  local name="$1" role args new
+  role="$(layer_meta_get icmp "${name}" ROLE 2>/dev/null || true)"
+  args="$(layer_meta_get icmp "${name}" ICMP_ARGS 2>/dev/null || true)"
+  [[ -n "${role}" && -n "${args}" ]] || return 0
+  new="${args}"
+  case "${role}" in
+    entry)
+      [[ "${args}" == *"--mode client"* ]] && return 0
+      if [[ "${args}" == *"--mode server"* ]]; then
+        new="${args/--mode server/--mode client}"
+        new="${new/--burst 4 --pack 1/--poll-ms 8 --pack 1}"
+        new="${new/--burst 4/--poll-ms 8}"
+      fi
+      ;;
+    exit)
+      [[ "${args}" == *"--mode server"* ]] && return 0
+      if [[ "${args}" == *"--mode client"* ]]; then
+        new="${args/--mode client/--mode server}"
+        new="${new/--poll-ms 8 --pack 1/--burst 4 --pack 1}"
+        new="${new/--poll-ms 8/--burst 4}"
+      fi
+      ;;
+    *) return 0 ;;
+  esac
+  new="${new//--id /-i }"
+  if [[ "${new}" != "${args}" ]]; then
+    warn "Updated Phormal Echo args for '${name}' (${role})."
+    layer_meta_set icmp "${name}" ICMP_ARGS "${new}"
+  fi
+}
+
+layer_icmp_sysctl() {
+  sysctl -w net.ipv4.icmp_echo_ignore_all=1 >/dev/null 2>&1 || true
+}
+
 create_layer_icmp_entry() {
   rule
   info "Phormal Echo — add entry tunnel"
@@ -3432,7 +3501,7 @@ create_layer_icmp_entry() {
   local_priv="$(ask 'Local TUN IP [10.88.0.1]')"; local_priv="${local_priv:-10.88.0.1}"
   remote_priv="$(ask 'Remote TUN IP [10.88.0.2]')"; remote_priv="${remote_priv:-10.88.0.2}"
   tid="$(ask 'Phormal Echo tunnel id hex [0x7048]')"; tid="${tid:-0x7048}"
-  args="--mode server --id ${tid} --burst 4 --pack 1 tun${name} ${local_v4} ${remote_v4} ${local_priv} ${remote_priv}"
+  args="$(layer_icmp_build_args entry "${name}" "${tid}" "${local_v4}" "${remote_v4}" "${local_priv}" "${remote_priv}")"
   layer_meta_set icmp "${name}" ICMP_ARGS "${args}"
   layer_start_instance icmp "${name}"
 }
@@ -3453,7 +3522,7 @@ create_layer_icmp_exit() {
   local_priv="$(ask 'Local TUN IP [10.88.0.2]')"; local_priv="${local_priv:-10.88.0.2}"
   remote_priv="$(ask 'Remote TUN IP [10.88.0.1]')"; remote_priv="${remote_priv:-10.88.0.1}"
   tid="$(ask 'Phormal Echo tunnel id hex (match entry) [0x7048]')"; tid="${tid:-0x7048}"
-  args="--mode client --id ${tid} --poll-ms 8 --pack 1 tun${name} ${local_v4} ${remote_v4} ${local_priv} ${remote_priv}"
+  args="$(layer_icmp_build_args exit "${name}" "${tid}" "${local_v4}" "${remote_v4}" "${local_priv}" "${remote_priv}")"
   layer_meta_set icmp "${name}" ICMP_ARGS "${args}"
   layer_start_instance icmp "${name}"
 }
