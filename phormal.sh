@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="6.2.9"
+readonly PHORMAL_VERSION="6.3.2"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -51,6 +51,31 @@ readonly RATHOLE_RELEASE_TAG="v0.5.0"
 
 # Set once per phormal invocation when a binary must be downloaded (mirror/github/manual).
 BINARY_SOURCE=""
+PHORMAL_CURL_PID=""
+
+phormal_tty_sane() {
+  [[ -t 0 ]] && stty sane 2>/dev/null || true
+  [[ -t 1 ]] && stty sane 2>/dev/null || true
+}
+
+phormal_on_interrupt() {
+  phormal_tty_sane
+  if [[ -n "${PHORMAL_CURL_PID}" ]]; then
+    kill -INT "${PHORMAL_CURL_PID}" 2>/dev/null || kill -TERM "${PHORMAL_CURL_PID}" 2>/dev/null || true
+    wait "${PHORMAL_CURL_PID}" 2>/dev/null || true
+    PHORMAL_CURL_PID=""
+  fi
+  printf '\n' >&2
+  warn "Cancelled — download aborted."
+  exit 130
+}
+
+phormal_press_any_key() {
+  local msg="${1:-Press any key…}"
+  read -n1 -s -r -p "  ${MUT}${msg}${RST}" || true
+  echo
+  phormal_tty_sane
+}
 
 # ------------------------------------------------------------------------------
 #  Presentation
@@ -89,6 +114,7 @@ EOF
 }
 
 trap 'fail "Aborted on line ${LINENO} (exit ${?})."' ERR
+trap phormal_on_interrupt INT TERM
 
 # ------------------------------------------------------------------------------
 #  Guards & utilities
@@ -187,24 +213,41 @@ pkg_cmd_for() {
   esac
 }
 
+apt_dpkg_busy() {
+  fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+    || fuser /var/lib/dpkg/lock >/dev/null 2>&1 \
+    || fuser /var/lib/apt/lists/lock >/dev/null 2>&1
+}
+
 apt_install_quiet() {
-  local missing=() install_pkgs=() p mapped cmd
+  local missing=() install_pkgs=() p mapped cmd waited=0
   for p in "$@"; do
     cmd="$(pkg_cmd_for "${p}")"
     have "${cmd}" || missing+=("${p}")
   done
   [[ ${#missing[@]} -eq 0 ]] && return 0
+  if apt_dpkg_busy; then
+    warn "apt/dpkg is busy (another install running) — waiting up to 45s…"
+    while apt_dpkg_busy && [[ ${waited} -lt 45 ]]; do
+      sleep 3
+      waited=$((waited + 3))
+    done
+    if apt_dpkg_busy; then
+      warn "apt still locked — skipping package install. Install manually if needed: ${missing[*]}"
+      return 1
+    fi
+  fi
   info "Installing packages: ${missing[*]}…"
   if have apt-get; then
-    timeout 45 apt-get update -y >/dev/null 2>&1 || true
-    timeout 120 apt-get install -y "${missing[@]}" >/dev/null 2>&1 || true
+    timeout 45 env DEBIAN_FRONTEND=noninteractive apt-get update -y >/dev/null 2>&1 || true
+    timeout 120 env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" >/dev/null 2>&1 || true
   elif have dnf || have yum; then
     local pm; pm="dnf"; have dnf || pm="yum"
     for p in "${missing[@]}"; do
       mapped="$(pkg_install_name "${p}")"
       install_pkgs+=("${mapped}")
     done
-    timeout 180 "${pm}" install -y "${install_pkgs[@]}" >/dev/null 2>&1 || true
+    timeout 180 env DEBIAN_FRONTEND=noninteractive "${pm}" install -y "${install_pkgs[@]}" >/dev/null 2>&1 || true
   else
     warn "No supported package manager (apt/dnf/yum) — install manually: ${missing[*]}"
     return 1
@@ -212,7 +255,31 @@ apt_install_quiet() {
 }
 
 fetch_url() {
-  curl -fsSL --connect-timeout 20 --max-time 180 "$1" -o "$2"
+  local url="$1" dest="$2" tmp rc=0
+  tmp="${dest}.part.$$"
+  rm -f "${tmp}"
+  local -a curl_cmd=( curl -fsSL
+    --connect-timeout 15
+    --max-time 180
+    --speed-limit 300
+    --speed-time 45
+    --retry 2 --retry-delay 2 --retry-max-time 60
+    -o "${tmp}" "${url}"
+  )
+  if have timeout; then
+    timeout --foreground 200 "${curl_cmd[@]}" </dev/null &
+  else
+    "${curl_cmd[@]}" </dev/null &
+  fi
+  PHORMAL_CURL_PID=$!
+  wait "${PHORMAL_CURL_PID}" || rc=$?
+  PHORMAL_CURL_PID=""
+  if [[ ${rc} -eq 0 && -s "${tmp}" ]]; then
+    mv -f "${tmp}" "${dest}"
+    return 0
+  fi
+  rm -f "${tmp}"
+  return 1
 }
 
 machine_arch() {
@@ -303,7 +370,7 @@ fetch_binary() {
   local url tmp
   for url in "$@"; do
     [[ -z "${url}" ]] && continue
-    info "Downloading ${label}…"
+    info "Downloading ${label}… (Ctrl+C cancels, stall timeout ~45s)"
     tmp="${dest}.tmp"
     rm -f "${tmp}"
     if fetch_url "${url}" "${tmp}"; then
@@ -666,15 +733,6 @@ install_engine() {
       good "Phormal Bridge engine installed."
       return 0
     fi
-  fi
-
-  info "Trying Bridge engine install script…"
-  if bash <(curl -fsSL --connect-timeout 20 --max-time 180 \
-      https://github.com/go-gost/gost/raw/master/install.sh) --install >/dev/null 2>&1 \
-     && have gost; then
-    ln -sf "$(command -v gost)" "${FWD_BIN}"
-    good "Phormal Bridge engine installed."
-    return 0
   fi
 
   install_local_binary "${FWD_BIN}" || { fail "Bridge engine install failed."; return 1; }
@@ -2828,6 +2886,7 @@ systemctl restart 'phormal-relay@*.service' 2>/dev/null || true
 systemctl restart 'phormal-reverse@*.service' 2>/dev/null || true
 systemctl restart 'phormal-gre@*.service'    2>/dev/null || true
 systemctl restart 'phormal-icmp@*.service'   2>/dev/null || true
+systemctl restart 'phormal-echo-fwd@*.service' 2>/dev/null || true
 systemctl restart 'phormal-udp2raw@*.service' 2>/dev/null || true
 EOF
     chmod +x /usr/bin/phormal-refresh.sh
@@ -2959,12 +3018,15 @@ purge() {
   for lk in gre icmp udp2raw btcp bwss; do
     while read -r ln; do
       [[ -n "${ln}" ]] || continue
+      [[ "${lk}" == icmp ]] && systemctl stop "phormal-echo-fwd@${ln}" 2>/dev/null || true
+      [[ "${lk}" == icmp ]] && systemctl disable "phormal-echo-fwd@${ln}" 2>/dev/null || true
       systemctl stop "phormal-${lk}@${ln}" 2>/dev/null || true
       systemctl disable "phormal-${lk}@${ln}" 2>/dev/null || true
       [[ "${lk}" == gre ]] && ip link del "$(layer_meta_get gre "${ln}" IFACE 2>/dev/null || true)" 2>/dev/null || true
     done < <(layer_instances "${lk}" 2>/dev/null || true)
     rm -f "/etc/systemd/system/phormal-${lk}@.service"
   done
+  rm -f "${ICMP_FWD_TMPL}" "${LAYER_ICMP_FWD_RUN}"
   rm -f "${LAYER_RUN}" "${LAYER_GRE_RUN}" "${LAYER_ICMP_BIN}" \
     "${LAYER_UDP2RAW_BIN}" \
     /usr/local/bin/phormal-backhaul \
@@ -2998,6 +3060,8 @@ readonly LAYER_ICMP_BIN="/usr/local/bin/phormal-icmp-tun"
 readonly LAYER_UDP2RAW_BIN="/usr/local/bin/phormal-udp2raw"
 readonly LAYER_RUN="/usr/local/bin/phormal-layer-run"
 readonly LAYER_GRE_RUN="/usr/local/bin/phormal-gre-run"
+readonly LAYER_ICMP_FWD_RUN="/usr/local/bin/phormal-echo-fwd-run"
+readonly ICMP_FWD_TMPL="/etc/systemd/system/phormal-echo-fwd@.service"
 readonly LAYER_KEYS=(gre icmp udp2raw)
 
 # Phormal product display names (internal key → user-facing brand)
@@ -3034,17 +3098,35 @@ layer_choose_instance() {
 }
 
 layer_list() {
-  local key="$1" n any=0
+  local key="$1" n any=0 role ports
   rule
   info "$(layer_phormal_name "${key}") — tunnels"
   rule
-  printf '    %-16s %-6s %s\n' "NAME" "ROLE" "STATE"
-  while read -r n; do
-    [[ -n "${n}" ]] || continue
-    any=1
-    printf '    %-16s %-6s %s\n' "${n}" "$(layer_meta_get "${key}" "${n}" ROLE 2>/dev/null || echo '?')" \
-      "$(layer_svc_state "$(layer_svc "${key}" "${n}")")"
-  done < <(layer_instances "${key}")
+  if [[ "${key}" == icmp ]]; then
+    printf '    %-16s %-6s %-16s %s\n' "NAME" "ROLE" "FORWARD" "STATE"
+    while read -r n; do
+      [[ -n "${n}" ]] || continue
+      any=1
+      role="$(layer_meta_get "${key}" "${n}" ROLE 2>/dev/null || echo '?')"
+      ports="$(layer_meta_get "${key}" "${n}" PORTS 2>/dev/null || true)"
+      proto="$(layer_meta_get "${key}" "${n}" PROTO 2>/dev/null || true)"
+      if [[ "${role}" == "entry" && -n "${ports}" ]]; then
+        ports="${ports}/${proto:-udp}"
+      else
+        ports="-"
+      fi
+      printf '    %-16s %-6s %-16s %s\n' "${n}" "${role}" "${ports}" \
+        "$(layer_svc_state "$(layer_svc "${key}" "${n}")")"
+    done < <(layer_instances "${key}")
+  else
+    printf '    %-16s %-6s %s\n' "NAME" "ROLE" "STATE"
+    while read -r n; do
+      [[ -n "${n}" ]] || continue
+      any=1
+      printf '    %-16s %-6s %s\n' "${n}" "$(layer_meta_get "${key}" "${n}" ROLE 2>/dev/null || echo '?')" \
+        "$(layer_svc_state "$(layer_svc "${key}" "${n}")")"
+    done < <(layer_instances "${key}")
+  fi
   [[ ${any} -eq 0 ]] && warn "no tunnels configured"
   rule
 }
@@ -3100,6 +3182,7 @@ manage_raw_menu()    { manage_phormal_layer_menu udp2raw; }
 
 layer_idir() { printf '%s/%s/%s' "${LAYER_HOME}" "$1" "$2"; }
 layer_svc()  { printf 'phormal-%s@%s.service' "$1" "$2"; }
+layer_icmp_fwd_svc() { printf 'phormal-echo-fwd@%s.service' "$1"; }
 
 layer_meta_file() { printf '%s/meta.conf' "$(layer_idir "$1" "$2")"; }
 
@@ -3377,6 +3460,9 @@ layer_start_instance() {
   sleep 2
   if systemctl is-active "${svc}" >/dev/null 2>&1; then
     good "Layer tunnel '${key}/${name}' is active."
+    if [[ "${key}" == icmp ]]; then
+      layer_icmp_start_fwd "${name}" || true
+    fi
     return 0
   fi
   fail "Layer tunnel '${key}/${name}' failed to start."
@@ -3507,6 +3593,177 @@ layer_icmp_sync_host_sysctl() {
   fi
 }
 
+layer_icmp_install_fwd_runtime() {
+  cat > "${LAYER_ICMP_FWD_RUN}" <<EOF
+#!/usr/bin/env bash
+# Phormal Echo data forward — lightweight socat, gost fallback (same engine as Bridge).
+set -euo pipefail
+name="\$1"
+dir="/etc/phormal/icmp/\${name}"
+meta="\${dir}/meta.conf"
+[[ -f "\${meta}" ]] || { echo "missing \${meta}" >&2; exit 1; }
+get() {
+  local v
+  v="\$(grep -m1 "^\$1=" "\${meta}" 2>/dev/null | cut -d= -f2- | tr -d '\r')" || return 1
+  if [[ "\${v}" == \\"*\\" ]]; then v="\${v:1:\${#v}-2}"; fi
+  if [[ "\${v}" == \\'*\\' ]]; then v="\${v:1:\${#v}-2}"; fi
+  printf '%s' "\${v}"
+}
+REMOTE_PRIV="\$(get REMOTE_PRIV)"
+PORTS="\$(get PORTS)"
+PROTO="\$(get PROTO)"
+PROTO="\${PROTO:-udp}"
+FWD_BIN="${FWD_BIN}"
+[[ -n "\${REMOTE_PRIV}" && -n "\${PORTS}" ]] || { echo "PORTS/REMOTE_PRIV missing in \${meta}" >&2; exit 1; }
+
+launch_socat() {
+  local p="\$1" pr="\$2"
+  case "\${pr}" in
+    udp) socat "UDP4-LISTEN:\${p},fork,reuseaddr,bind=0.0.0.0" "UDP4:\${REMOTE_PRIV}:\${p}" ;;
+    tcp) socat "TCP4-LISTEN:\${p},fork,reuseaddr,bind=0.0.0.0" "TCP4:\${REMOTE_PRIV}:\${p}" ;;
+    *) echo "bad protocol \${pr}" >&2; return 1 ;;
+  esac
+}
+
+if command -v socat >/dev/null 2>&1; then
+  pids=()
+  trap 'kill "\${pids[@]}" 2>/dev/null; wait 2>/dev/null || true' EXIT INT TERM
+  IFS=',' read -ra parr <<< "\${PORTS}"
+  for p in "\${parr[@]}"; do
+    p="\${p// /}"
+    [[ -n "\${p}" ]] || continue
+    case "\${PROTO}" in
+      both)
+        launch_socat "\${p}" udp & pids+=(\$!)
+        launch_socat "\${p}" tcp & pids+=(\$!)
+        ;;
+      udp|tcp)
+        launch_socat "\${p}" "\${PROTO}" & pids+=(\$!)
+        ;;
+      *)
+        echo "bad PROTO \${PROTO}" >&2; exit 1
+        ;;
+    esac
+  done
+  [[ \${#pids[@]} -gt 0 ]] || { echo "no ports in PORTS" >&2; exit 1; }
+  wait -n
+  exit 1
+fi
+
+[[ -x "\${FWD_BIN}" ]] || { echo "socat missing and \${FWD_BIN} not installed" >&2; exit 1; }
+args=()
+IFS=',' read -ra parr <<< "\${PORTS}"
+for p in "\${parr[@]}"; do
+  p="\${p// /}"
+  [[ -n "\${p}" ]] || continue
+  case "\${PROTO}" in
+    both)
+      args+=( "-L=udp://:\${p}/\${REMOTE_PRIV}:\${p}" "-L=tcp://:\${p}/\${REMOTE_PRIV}:\${p}" )
+      ;;
+    *)
+      args+=( "-L=\${PROTO}://:\${p}/\${REMOTE_PRIV}:\${p}" )
+      ;;
+  esac
+done
+[[ \${#args[@]} -gt 0 ]] || { echo "no ports configured" >&2; exit 1; }
+exec "\${FWD_BIN}" "\${args[@]}"
+EOF
+  chmod +x "${LAYER_ICMP_FWD_RUN}"
+
+  cat > "${ICMP_FWD_TMPL}" <<EOF
+[Unit]
+Description=Phormal Echo data forward (%i)
+After=phormal-icmp@%i.service network-online.target
+Wants=phormal-icmp@%i.service
+
+[Service]
+Type=simple
+Environment="GOST_LOGGER_LEVEL=fatal"
+ExecStart=${LAYER_ICMP_FWD_RUN} %i
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+layer_icmp_stop_fwd() {
+  local name="$1" svc
+  svc="$(layer_icmp_fwd_svc "${name}")"
+  systemctl stop "${svc}" 2>/dev/null || true
+  systemctl disable "${svc}" 2>/dev/null || true
+  systemctl reset-failed "${svc}" 2>/dev/null || true
+}
+
+layer_icmp_start_fwd() {
+  local name="$1" ports role svc
+  role="$(layer_meta_get icmp "${name}" ROLE 2>/dev/null || true)"
+  [[ "${role}" == "entry" ]] || return 0
+  ports="$(layer_meta_get icmp "${name}" PORTS 2>/dev/null || true)"
+  [[ -n "${ports}" ]] || return 0
+  apt_install_quiet socat 2>/dev/null || true
+  if ! command -v socat >/dev/null 2>&1; then
+    install_engine || { fail "Install socat (apt install socat) or Phormal Bridge engine for forwarder."; return 1; }
+  fi
+  layer_icmp_install_fwd_runtime
+  svc="$(layer_icmp_fwd_svc "${name}")"
+  systemctl daemon-reload
+  systemctl enable "${svc}" >/dev/null 2>&1
+  systemctl restart "${svc}"
+  sleep 1
+  if systemctl is-active "${svc}" >/dev/null 2>&1; then
+    proto="$(layer_meta_get icmp "${name}" PROTO 2>/dev/null || echo udp)"
+    good "Echo data forward active (${proto}) on port(s): ${ports}"
+    return 0
+  fi
+  warn "Echo forwarder failed to start."
+  journalctl -u "${svc}" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'
+  return 1
+}
+
+layer_icmp_prompt_fwd() {
+  local name="$1" proto ports remote_priv local_v4 ans pc cur_proto cur_ports
+  remote_priv="$(layer_meta_get icmp "${name}" REMOTE_PRIV 2>/dev/null || true)"
+  local_v4="$(layer_meta_get icmp "${name}" LOCAL_V4 2>/dev/null || true)"
+  cur_proto="$(layer_meta_get icmp "${name}" PROTO 2>/dev/null || true)"
+  cur_ports="$(layer_meta_get icmp "${name}" PORTS 2>/dev/null || true)"
+  rule
+  info "Phormal Echo data forward (entry → exit via TUN ${remote_priv})"
+  info "Lightweight socat — UDP for gaming, TCP for VLESS/panel."
+  [[ -n "${cur_ports}" ]] && info "Current: ${cur_proto:-udp} on ${cur_ports}"
+  ans="$(ask 'Set up / update port forward? (y/n) [y]')"; ans="${ans:-y}"
+  [[ "${ans}" =~ ^[Yy] ]] || { info "Skip — manage → Data forward."; return 0; }
+  printf '  %s1%s  udp   (gaming)\n' "${ACC}" "${RST}"
+  printf '  %s2%s  tcp   (VLESS / panel / TCP games)\n' "${ACC}" "${RST}"
+  printf '  %s3%s  both  (udp+tcp — recommended if you need both)\n' "${ACC}" "${RST}"
+  pc="$(ask 'Transport [3]')"; pc="${pc:-3}"
+  case "${pc}" in
+    1|udp) proto=udp ;;
+    2|tcp) proto=tcp ;;
+    *) proto=both ;;
+  esac
+  ports="$(gather_ports)"
+  [[ -n "${ports}" ]] || { warn "No ports — configure later from manage menu."; return 1; }
+  layer_meta_set icmp "${name}" PROTO "${proto}"
+  layer_meta_set icmp "${name}" PORTS "${ports}"
+  layer_icmp_start_fwd "${name}" || return 1
+  good "Point clients at ${local_v4:-THIS_SERVER} on port(s): ${ports} (${proto})"
+  info "Exit must listen on 0.0.0.0:${ports} — TCP and/or UDP matching ${proto}."
+  return 0
+}
+
+layer_icmp_configure_fwd() {
+  local name="$1"
+  [[ "$(layer_meta_get icmp "${name}" ROLE 2>/dev/null || true)" == "entry" ]] || {
+    warn "Data forward is configured on the Iran entry node only."
+    return 1
+  }
+  layer_icmp_prompt_fwd "${name}"
+}
+
 layer_icmp_parse_args() {
   # Positional tail: <tun> <local_pub> <remote_pub> <local_priv> <remote_priv>
   local args="$1"
@@ -3551,13 +3808,13 @@ layer_icmp_pairing_hint() {
       info "Exit is running on THIS server. On Iran, add entry (menu 17) with:"
       info "  • Peer IP = this server's public IPv4"
       info "  • Same tunnel id and swapped TUN IPs (10.88.0.1 ↔ 10.88.0.2)"
+      info "  • Then set data forward ports on entry (socat → TUN 10.88.0.2)"
       ;;
     entry)
       info "Entry is on THIS server. Kharej exit (menu 16) must already be active with:"
       info "  • Iran entry public IPv4 as peer"
       info "  • Same tunnel id and matching TUN IPs"
-      info "Echo gives a private 10.88.x link — it does not publish a port on your public IP."
-      info "Route traffic via the TUN device, or use Bridge/Relay on top of Echo."
+      info "Then configure data forward ports (socat) — clients use THIS server's public IP."
       ;;
   esac
 }
@@ -3613,7 +3870,38 @@ layer_icmp_link_check() {
       good "Entry client is active — verify from Kharej exit → Link check (TUN ping there is authoritative)."
       info "If Kharej shows TUN ping OK, this tunnel is working; Iran-side ping to ${icmp_remote_priv} is expected to fail."
     fi
-    info "Echo is a private 10.88.x link — route traffic through ${ifdev} or use with Bridge/Relay."
+    info "Echo is a private 10.88.x link — data forward publishes ports on this entry node."
+    ports="$(layer_meta_get icmp "${name}" PORTS 2>/dev/null || true)"
+    if [[ -n "${ports}" ]]; then
+      proto="$(layer_meta_get icmp "${name}" PROTO 2>/dev/null || echo udp)"
+      if systemctl is-active "$(layer_icmp_fwd_svc "${name}")" >/dev/null 2>&1; then
+        good "Data forwarder active — ${ports} (${proto})"
+        local p
+        IFS=',' read -ra parr <<< "${ports}"
+        for p in "${parr[@]}"; do
+          p="${p// /}"
+          [[ -n "${p}" ]] || continue
+          case "${proto}" in
+            tcp|both)
+              ss -lnt "sport = :${p}" 2>/dev/null | grep -q ":${p}" \
+                && good "TCP listening on :${p}" \
+                || warn "TCP not listening on :${p} yet"
+              ;;
+          esac
+          case "${proto}" in
+            udp|both)
+              ss -lun "sport = :${p}" 2>/dev/null | grep -q ":${p}" \
+                && good "UDP listening on :${p}" \
+                || warn "UDP not listening on :${p} yet"
+              ;;
+          esac
+        done
+      else
+        warn "PORTS set (${ports}/${proto}) but forwarder not running — manage → Data forward."
+      fi
+    else
+      warn "No forward ports yet — manage → Data forward (tcp for VLESS, udp for gaming)."
+    fi
     return 0
   fi
   if ping -c 2 -W 2 "${icmp_remote_v4}" >/dev/null 2>&1; then
@@ -3654,14 +3942,15 @@ create_layer_icmp_entry() {
   args="$(layer_icmp_build_args entry "${name}" "${tid}" "${local_v4}" "${remote_v4}" "${local_priv}" "${remote_priv}")"
   layer_meta_set icmp "${name}" ICMP_ARGS "${args}"
   layer_icmp_save_endpoints "${name}" "${local_v4}" "${remote_v4}" "${local_priv}" "${remote_priv}" "${tid}"
-  layer_start_instance icmp "${name}" && layer_icmp_pairing_hint entry
+  layer_start_instance icmp "${name}" || return 1
+  layer_icmp_prompt_fwd "${name}" || true
 }
 
 create_layer_icmp_exit() {
   rule
   info "Phormal Echo — add exit tunnel"
   rule
-  local name local_v4 remote_v4 local_priv remote_priv tid args
+  local name local_v4 remote_v4 local_priv remote_priv tid args svc_ports
   install_layer_icmp_tun || return 1
   layer_install_runtime
   name="$(layer_pick_name icmp)" || return 1
@@ -3676,7 +3965,16 @@ create_layer_icmp_exit() {
   args="$(layer_icmp_build_args exit "${name}" "${tid}" "${local_v4}" "${remote_v4}" "${local_priv}" "${remote_priv}")"
   layer_meta_set icmp "${name}" ICMP_ARGS "${args}"
   layer_icmp_save_endpoints "${name}" "${local_v4}" "${remote_v4}" "${local_priv}" "${remote_priv}" "${tid}"
-  layer_start_instance icmp "${name}" && layer_icmp_pairing_hint exit
+  layer_start_instance icmp "${name}" || return 1
+  rule
+  info "Exit service — run game/panel on THIS server (same port(s) as Iran forward)"
+  svc_ports="$(ask 'Service port(s) on this exit [e.g. 22547]')"
+  [[ -n "${svc_ports}" ]] && layer_meta_set icmp "${name}" SVC_PORTS "${svc_ports}"
+  if [[ -n "${svc_ports}" ]]; then
+    good "Listen on 0.0.0.0:${svc_ports} here (Xray, game server, etc.)."
+    info "Iran entry forward must use the same port number(s)."
+  fi
+  layer_icmp_pairing_hint exit
 }
 
 create_layer_udp2raw_exit() {
@@ -3736,6 +4034,7 @@ layer_delete_instance() {
   c="$(ask "Delete ${pname} tunnel '${name}' permanently? (y/n)")"
   [[ "${c}" == "y" ]] || { info "Cancelled."; return 0; }
   svc="$(layer_svc "${key}" "${name}")"
+  [[ "${key}" == icmp ]] && layer_icmp_stop_fwd "${name}"
   systemctl stop "${svc}" 2>/dev/null || true
   systemctl disable "${svc}" 2>/dev/null || true
   systemctl reset-failed "${svc}" 2>/dev/null || true
@@ -3750,20 +4049,31 @@ layer_delete_instance() {
 }
 
 manage_layer_instance_menu() {
-  local key="$1" name="$2" c svc pname
+  local key="$1" name="$2" c svc pname role ports fwd_st
   pname="$(layer_phormal_name "${key}")"
   svc="$(layer_svc "${key}" "${name}")"
   while :; do
     banner
     rule
     info "${pname} / ${name}  [$(layer_svc_state "${svc}")]"
+    if [[ "${key}" == icmp ]]; then
+      role="$(layer_meta_get icmp "${name}" ROLE 2>/dev/null || true)"
+      ports="$(layer_meta_get icmp "${name}" PORTS 2>/dev/null || true)"
+      if [[ "${role}" == "entry" && -n "${ports}" ]]; then
+        fwd_st="$(layer_svc_state "$(layer_icmp_fwd_svc "${name}")")"
+        proto="$(layer_meta_get icmp "${name}" PROTO 2>/dev/null || echo udp)"
+        info "Forward ${ports} (${proto}) [${fwd_st}]"
+      fi
+    fi
     rule
     printf '    %s1%s  Start/restart\n' "${ACC}" "${RST}"
     printf '    %s2%s  Stop\n' "${ACC}" "${RST}"
     printf '    %s3%s  Logs\n' "${ACC}" "${RST}"
     if [[ "${key}" == icmp ]]; then
       printf '    %s4%s  Link check\n' "${ACC}" "${RST}"
-      printf '    %s5%s  Delete\n' "${ACC}" "${RST}"
+      role="$(layer_meta_get icmp "${name}" ROLE 2>/dev/null || true)"
+      [[ "${role}" == "entry" ]] && printf '    %s5%s  Data forward (ports)\n' "${ACC}" "${RST}"
+      printf '    %s6%s  Delete\n' "${ACC}" "${RST}"
     else
       printf '    %s4%s  Delete\n' "${ACC}" "${RST}"
     fi
@@ -3771,7 +4081,11 @@ manage_layer_instance_menu() {
     c="$(ask 'Select')"; echo
     case "${c}" in
       1) layer_start_instance "${key}" "${name}" || true ;;
-      2) systemctl stop "${svc}" && good "Stopped." ;;
+      2)
+        systemctl stop "${svc}" 2>/dev/null || true
+        [[ "${key}" == icmp ]] && layer_icmp_stop_fwd "${name}"
+        good "Stopped."
+        ;;
       3) journalctl -u "${svc}" -n 40 --no-pager ;;
       4)
         if [[ "${key}" == icmp ]]; then
@@ -3780,10 +4094,15 @@ manage_layer_instance_menu() {
           layer_delete_instance "${key}" "${name}"; break
         fi
         ;;
-      5) [[ "${key}" == icmp ]] && layer_delete_instance "${key}" "${name}" && break ;;
+      5)
+        if [[ "${key}" == icmp && "$(layer_meta_get icmp "${name}" ROLE 2>/dev/null || true)" == "entry" ]]; then
+          layer_icmp_configure_fwd "${name}" || true
+        fi
+        ;;
+      6) [[ "${key}" == icmp ]] && layer_delete_instance "${key}" "${name}" && break ;;
       0) break ;;
     esac
-    echo; read -n1 -s -r -p "  ${MUT}Press any key…${RST}"; echo
+    echo; phormal_press_any_key "Press any key…"
   done
 }
 
@@ -4013,7 +4332,8 @@ layer_ssh_ensure_binary_on_peer() {
     [[ -n "${u}" ]] || continue
     if layer_ssh_remote "${ssh_host}" "${ssh_port}" "${ssh_user}" \
         "mkdir -p '$(dirname "${dest}")'
-         curl -fsSL --connect-timeout 20 --max-time 300 '${u}' -o '${dest}.dl'
+         curl -fsSL --connect-timeout 15 --max-time 180 --speed-limit 300 --speed-time 45 \
+           '${u}' -o '${dest}.dl' </dev/null
          chmod +x '${dest}.dl'
          '${dest}.dl' ${verify_flag} >/dev/null 2>&1
          mv -f '${dest}.dl' '${dest}'" 2>/dev/null; then
@@ -6126,7 +6446,7 @@ menu() {
       0)  good "Goodbye — @SchmitzWS"; exit 0 ;;
       *)  fail "Invalid selection." ;;
     esac
-    echo; read -n1 -s -r -p "  ${MUT}Press any key to continue…${RST}"; echo
+    echo; phormal_press_any_key "Press any key to continue…"
   done
 }
 
