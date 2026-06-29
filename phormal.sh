@@ -34,15 +34,7 @@ readonly RELAY_BIN="/usr/local/bin/phormal-relay"
 readonly RELAY_UNIT="/etc/systemd/system/phormal-relay.service"
 readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 
-# Iran-hosted mirror for gost / hysteria (optional).
-# Entry nodes try this base URL before GitHub. Override per-server in
-# /etc/phormal/phormal.conf:  MIRROR_BASE=https://mirror.delitech.ir/phormal
-#   (CDN HTTPS on 443 — do NOT use :8880 with https://)
-#   Direct IP fallback:      MIRROR_BASE=http://YOUR_IP:8880/phormal
-# Files expected on the mirror host (served at MIRROR_BASE):
-#   gost-linux-{amd64,arm64}  hysteria-linux-{amd64,arm64}
-#   rathole-linux-{amd64,arm64}
-#   icmp_tun-linux-{amd64,arm64}  udp2raw-linux-{amd64,arm64}
+
 # phormal.sh itself is installed from GitHub, not the mirror.
 readonly DEFAULT_MIRROR_BASE="https://mirror.delitech.ir/phormal"
 readonly GOST_RELEASE_VERSION="3.2.6"
