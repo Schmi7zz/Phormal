@@ -15,7 +15,7 @@ set -Eeuo pipefail
 # ------------------------------------------------------------------------------
 #  Constants
 # ------------------------------------------------------------------------------
-readonly PHORMAL_VERSION="6.2.5"
+readonly PHORMAL_VERSION="6.2.7"
 readonly PHORMAL_SPEED_PORT=15987
 readonly PHORMAL_HOME="/etc/phormal"
 readonly PHORMAL_CONF="${PHORMAL_HOME}/phormal.conf"
@@ -34,14 +34,7 @@ readonly RELAY_BIN="/usr/local/bin/phormal-relay"
 readonly RELAY_UNIT="/etc/systemd/system/phormal-relay.service"
 readonly RELAY_SYSCTL="/etc/sysctl.d/97-phormal-relay.conf"
 
-# Iran-hosted mirror for gost / hysteria (optional).
-# Entry nodes try this base URL before GitHub. Override per-server in
-# /etc/phormal/phormal.conf:  MIRROR_BASE=https://mirror.delitech.ir/phormal
-#   (CDN HTTPS on 443 — do NOT use :8880 with https://)
-# Files expected on the mirror host (served at MIRROR_BASE):
-#   gost-linux-{amd64,arm64}  hysteria-linux-{amd64,arm64}
-#   rathole-linux-{amd64,arm64}
-#   icmp_tun-linux-{amd64,arm64}  udp2raw-linux-{amd64,arm64}
+
 # phormal.sh itself is installed from GitHub, not the mirror.
 readonly DEFAULT_MIRROR_BASE="https://mirror.delitech.ir/phormal"
 readonly GOST_RELEASE_VERSION="3.2.6"
@@ -3022,11 +3015,22 @@ layer_choose_instance() {
   while read -r n; do [[ -n "${n}" ]] && names+=("${n}"); done < <(layer_instances "${key}")
   [[ ${#names[@]} -gt 0 ]] || { warn "No $(layer_phormal_name "${key}") tunnels yet."; return 1; }
   if [[ ${#names[@]} -eq 1 ]]; then printf '%s' "${names[0]}"; return 0; fi
-  info "$(layer_phormal_name "${key}") tunnels:"
-  local i=1; for n in "${names[@]}"; do printf '    %s) %s [%s]\n' "${i}" "${n}" "$(layer_svc_state "$(layer_svc "${key}" "${n}")")"; i=$((i+1)); done
+  info "$(layer_phormal_name "${key}") tunnels:" >&2
+  local i=1
+  for n in "${names[@]}"; do
+    printf '    %s) %s [%s]\n' "${i}" "${n}" "$(layer_svc_state "$(layer_svc "${key}" "${n}")")" >&2
+    i=$((i + 1))
+  done
   pick="$(ask 'Name or number')"
-  [[ "${pick}" =~ ^[0-9]+$ && "${pick}" -ge 1 && "${pick}" -le ${#names[@]} ]] && printf '%s' "${names[$((pick-1))]}" && return 0
-  printf '%s' "${pick}"
+  if [[ "${pick}" =~ ^[0-9]+$ && "${pick}" -ge 1 && "${pick}" -le ${#names[@]} ]]; then
+    printf '%s' "${names[$((pick - 1))]}"
+    return 0
+  fi
+  for n in "${names[@]}"; do
+    [[ "${pick}" == "${n}" ]] && { printf '%s' "${n}"; return 0; }
+  done
+  fail "Unknown tunnel '${pick}'." >&2
+  return 1
 }
 
 layer_list() {
@@ -3482,7 +3486,107 @@ layer_icmp_migrate_args() {
 }
 
 layer_icmp_sysctl() {
+  local f="/etc/sysctl.d/99-phormal-echo.conf"
   sysctl -w net.ipv4.icmp_echo_ignore_all=1 >/dev/null 2>&1 || true
+  if [[ ! -f "${f}" ]] || ! grep -q 'icmp_echo_ignore_all' "${f}" 2>/dev/null; then
+    printf 'net.ipv4.icmp_echo_ignore_all = 1\n' >"${f}" 2>/dev/null || true
+    sysctl --system >/dev/null 2>&1 || true
+  fi
+}
+
+layer_icmp_parse_args() {
+  # Positional tail: <tun> <local_pub> <remote_pub> <local_priv> <remote_priv>
+  local args="$1"
+  icmp_tun="$(printf '%s\n' "${args}" | awk '{print $(NF-4)}')"
+  icmp_local_v4="$(printf '%s\n' "${args}" | awk '{print $(NF-3)}')"
+  icmp_remote_v4="$(printf '%s\n' "${args}" | awk '{print $(NF-2)}')"
+  icmp_local_priv="$(printf '%s\n' "${args}" | awk '{print $(NF-1)}')"
+  icmp_remote_priv="$(printf '%s\n' "${args}" | awk '{print $(NF)}')"
+}
+
+layer_icmp_save_endpoints() {
+  local name="$1" local_v4="$2" remote_v4="$3" local_priv="$4" remote_priv="$5" tid="$6"
+  layer_meta_set icmp "${name}" LOCAL_V4 "${local_v4}"
+  layer_meta_set icmp "${name}" REMOTE_V4 "${remote_v4}"
+  layer_meta_set icmp "${name}" LOCAL_PRIV "${local_priv}"
+  layer_meta_set icmp "${name}" REMOTE_PRIV "${remote_priv}"
+  layer_meta_set icmp "${name}" TUN_ID "${tid}"
+}
+
+layer_icmp_load_endpoints() {
+  local name="$1" args
+  icmp_local_v4="$(layer_meta_get icmp "${name}" LOCAL_V4 2>/dev/null || true)"
+  icmp_remote_v4="$(layer_meta_get icmp "${name}" REMOTE_V4 2>/dev/null || true)"
+  icmp_local_priv="$(layer_meta_get icmp "${name}" LOCAL_PRIV 2>/dev/null || true)"
+  icmp_remote_priv="$(layer_meta_get icmp "${name}" REMOTE_PRIV 2>/dev/null || true)"
+  icmp_tun=""
+  if [[ -n "${icmp_local_v4}" && -n "${icmp_remote_v4}" ]]; then
+    return 0
+  fi
+  args="$(layer_meta_get icmp "${name}" ICMP_ARGS 2>/dev/null || true)"
+  [[ -n "${args}" ]] || return 1
+  layer_icmp_parse_args "${args}"
+  layer_icmp_save_endpoints "${name}" "${icmp_local_v4}" "${icmp_remote_v4}" \
+    "${icmp_local_priv}" "${icmp_remote_priv}" \
+    "$(printf '%s\n' "${args}" | sed -n 's/.*-i \([^ ]*\).*/\1/p')"
+}
+
+layer_icmp_pairing_hint() {
+  local role="$1"
+  case "${role}" in
+    exit)
+      info "Exit is running on THIS server. On Iran, add entry (menu 17) with:"
+      info "  • Peer IP = this server's public IPv4"
+      info "  • Same tunnel id and swapped TUN IPs (10.88.0.1 ↔ 10.88.0.2)"
+      ;;
+    entry)
+      info "Entry is on THIS server. Kharej exit (menu 16) must already be active with:"
+      info "  • Iran entry public IPv4 as peer"
+      info "  • Same tunnel id and matching TUN IPs"
+      ;;
+  esac
+}
+
+layer_icmp_link_check() {
+  local name="$1" role args svc st tun
+  role="$(layer_meta_get icmp "${name}" ROLE 2>/dev/null || echo '?')"
+  args="$(layer_meta_get icmp "${name}" ICMP_ARGS 2>/dev/null || true)"
+  svc="$(layer_svc icmp "${name}")"
+  st="$(layer_svc_state "${svc}")"
+  rule
+  info "Phormal Echo link check — ${name} (${role})"
+  rule
+  [[ -n "${args}" ]] || { fail "ICMP_ARGS missing in meta.conf"; return 1; }
+  layer_icmp_load_endpoints "${name}" || { fail "Could not read tunnel endpoints."; return 1; }
+  info "TUN ${icmp_tun:-tun${name}}  ${icmp_local_priv:-?} ↔ ${icmp_remote_priv:-?}"
+  info "Public ${icmp_local_v4:-?} → peer ${icmp_remote_v4:-?}"
+  info "Service: ${st}"
+  if [[ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null || echo 0)" != "1" ]]; then
+    warn "net.ipv4.icmp_echo_ignore_all is not 1 (required on both servers)."
+    layer_icmp_sysctl
+  fi
+  if [[ "${st}" != "active" ]]; then
+    warn "Service is not active — use Start/restart first."
+    layer_icmp_pairing_hint "${role}"
+    return 1
+  fi
+  if ping -c 2 -W 2 "${icmp_remote_v4}" >/dev/null 2>&1; then
+    good "Public ICMP to peer ${icmp_remote_v4} OK."
+  else
+    warn "Cannot ping peer ${icmp_remote_v4} — ICMP may be blocked by firewall or provider."
+  fi
+  if ping -c 3 -W 2 -I "${icmp_local_priv}" "${icmp_remote_priv}" >/dev/null 2>&1; then
+    good "TUN ping ${icmp_local_priv} → ${icmp_remote_priv} OK."
+    return 0
+  fi
+  if ping -c 3 -W 2 "${icmp_remote_priv}" >/dev/null 2>&1; then
+    good "TUN ping ${icmp_remote_priv} OK."
+    return 0
+  fi
+  warn "No TUN ping yet — peer tunnel may be down or mismatched."
+  layer_icmp_pairing_hint "${role}"
+  info "On both servers: ping -c 2 ${icmp_remote_v4}  (ICMP between public IPs must work)"
+  return 1
 }
 
 create_layer_icmp_entry() {
@@ -3503,7 +3607,8 @@ create_layer_icmp_entry() {
   tid="$(ask 'Phormal Echo tunnel id hex [0x7048]')"; tid="${tid:-0x7048}"
   args="$(layer_icmp_build_args entry "${name}" "${tid}" "${local_v4}" "${remote_v4}" "${local_priv}" "${remote_priv}")"
   layer_meta_set icmp "${name}" ICMP_ARGS "${args}"
-  layer_start_instance icmp "${name}"
+  layer_icmp_save_endpoints "${name}" "${local_v4}" "${remote_v4}" "${local_priv}" "${remote_priv}" "${tid}"
+  layer_start_instance icmp "${name}" && layer_icmp_pairing_hint entry
 }
 
 create_layer_icmp_exit() {
@@ -3524,7 +3629,8 @@ create_layer_icmp_exit() {
   tid="$(ask 'Phormal Echo tunnel id hex (match entry) [0x7048]')"; tid="${tid:-0x7048}"
   args="$(layer_icmp_build_args exit "${name}" "${tid}" "${local_v4}" "${remote_v4}" "${local_priv}" "${remote_priv}")"
   layer_meta_set icmp "${name}" ICMP_ARGS "${args}"
-  layer_start_instance icmp "${name}"
+  layer_icmp_save_endpoints "${name}" "${local_v4}" "${remote_v4}" "${local_priv}" "${remote_priv}" "${tid}"
+  layer_start_instance icmp "${name}" && layer_icmp_pairing_hint exit
 }
 
 create_layer_udp2raw_exit() {
@@ -3608,14 +3714,26 @@ manage_layer_instance_menu() {
     printf '    %s1%s  Start/restart\n' "${ACC}" "${RST}"
     printf '    %s2%s  Stop\n' "${ACC}" "${RST}"
     printf '    %s3%s  Logs\n' "${ACC}" "${RST}"
-    printf '    %s4%s  Delete\n' "${ACC}" "${RST}"
+    if [[ "${key}" == icmp ]]; then
+      printf '    %s4%s  Link check\n' "${ACC}" "${RST}"
+      printf '    %s5%s  Delete\n' "${ACC}" "${RST}"
+    else
+      printf '    %s4%s  Delete\n' "${ACC}" "${RST}"
+    fi
     printf '    %s0%s  Back\n\n' "${ACC}" "${RST}"
     c="$(ask 'Select')"; echo
     case "${c}" in
       1) layer_start_instance "${key}" "${name}" || true ;;
       2) systemctl stop "${svc}" && good "Stopped." ;;
       3) journalctl -u "${svc}" -n 40 --no-pager ;;
-      4) layer_delete_instance "${key}" "${name}"; break ;;
+      4)
+        if [[ "${key}" == icmp ]]; then
+          layer_icmp_link_check "${name}" || true
+        else
+          layer_delete_instance "${key}" "${name}"; break
+        fi
+        ;;
+      5) [[ "${key}" == icmp ]] && layer_delete_instance "${key}" "${name}" && break ;;
       0) break ;;
     esac
     echo; read -n1 -s -r -p "  ${MUT}Press any key…${RST}"; echo
