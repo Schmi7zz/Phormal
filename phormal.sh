@@ -132,11 +132,10 @@ ensure_mirror_conf() {
   cur="$(conf_get MIRROR_BASE)"
   if [[ -n "${cur}" ]]; then
     fixed="$(mirror_normalize_base "${cur}")"
-    case "${cur}" in
-      http://mirror.delitech.ir/phormal|http://mirror.delitech.ir:8880/phormal)
-        fixed="${def}"
-        ;;
-    esac
+    # Legacy IP or :8880 mirror URLs → CDN domain only
+    if [[ "${cur}" =~ ^https?://[0-9]{1,3}(\.[0-9]{1,3}){3} ]] || [[ "${cur}" == *:8880* ]]; then
+      fixed="${def}"
+    fi
     [[ "${fixed}" != "${cur}" ]] && conf_set MIRROR_BASE "${fixed}"
     return 0
   fi
