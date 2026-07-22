@@ -228,9 +228,7 @@ curl -fsSL https://raw.githubusercontent.com/Schmi7zz/Phormal/main/phormal.sh -o
 
 ## 🙌 سازندگان
 
-- **نویسنده:** [Schmi7z](https://github.com/Schmi7zz)
-- **کانال:** [@SchmitzWS](https://t.me/SchmitzWS)
-- **ارتباط:** [@Schmi7zz](https://t.me/Schmi7zz)
+ **کانال:** [@SchmitzWS](https://t.me/SchmitzWS)
 
 ## 📄 لایسنس
 
