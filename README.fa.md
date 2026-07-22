@@ -14,7 +14,6 @@
 <p align="center">
   <a href="https://github.com/Schmi7zz/Phormal">گیت‌هاب</a> ·
   <a href="https://t.me/SchmitzWS">کانال</a> ·
-  <a href="https://t.me/Schmi7zz">ارتباط</a> ·
   <a href="./README.md">🇬🇧 English</a>
 </p>
 
