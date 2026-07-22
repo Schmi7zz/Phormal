@@ -204,9 +204,9 @@ curl -fsSL https://raw.githubusercontent.com/Schmi7zz/Phormal/main/phormal.sh -o
 
 ## 🙌 Credits
 
-- **Author:** [Schmi7z](https://github.com/Schmi7zz)
+
 - **Channel:** [@SchmitzWS](https://t.me/SchmitzWS)
-- **Contact:** [@Schmi7zz](https://t.me/Schmi7zz)
+
 
 ## 📄 License
 
